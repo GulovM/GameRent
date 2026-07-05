@@ -293,7 +293,7 @@ export const api = {
     price_per_hour: number;
     security_deposit: number;
   }) {
-    return request<{ id: number }>("/api/v1/admin/accounts", {
+    return request<{ id: number; games_count?: number; sync_error?: string }>("/api/v1/admin/accounts", {
       method: "POST",
       body: JSON.stringify(payload)
     });
@@ -305,7 +305,7 @@ export const api = {
     });
   },
   adminSyncAccount(id: number) {
-    return request<{ message: string }>(`/api/v1/admin/accounts/${id}/sync`, { method: "POST" });
+    return request<{ message: string; games_count: number }>(`/api/v1/admin/accounts/${id}/sync`, { method: "POST" });
   },
   adminUsers() {
     return request<{ users: User[] }>("/api/v1/admin/users");

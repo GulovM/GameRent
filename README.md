@@ -238,6 +238,24 @@ GET http://localhost:5173/api/v1/games
 
 Frontend использует реальные backend endpoints. Для админского отключения аккаунта используется `PATCH /admin/accounts/{accountId}` со статусом отключения, потому что `DELETE /admin/accounts/{accountId}` в backend сейчас не реализован.
 
+Mock fallback в runtime-фронтенде не используется: если backend недоступен или БД возвращает пустой список, UI показывает ошибку или empty state, а не demo-data.
+
+## Логи в Docker
+
+API пишет логи в `LOGGER_FOLDER`. По умолчанию:
+
+```env
+LOGGER_FOLDER=out/logs
+```
+
+В Docker Compose папка проброшена так:
+
+```text
+./out:/app/out
+```
+
+Поэтому логи API из контейнера появляются локально в `out/logs`.
+
 ## Postman
 
 Создай переменные:
@@ -412,7 +430,7 @@ GET   {{apiUrl}}/admin/audit-logs
 }
 ```
 
-## Логи
+## Runtime logs
 
 Сообщение ниже не является ошибкой для локального запуска:
 

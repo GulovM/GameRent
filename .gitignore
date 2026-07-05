@@ -5,9 +5,19 @@ logs/
 bin/
 *.exe
 
-docs
-
 web/node_modules/
 web/dist/
 web/*.log
 web/*.tsbuildinfo
+
+# Codex local configuration
+.codex/
+
+# Claude Flow runtime data
+.claude-flow/data/
+.claude-flow/logs/
+
+# Environment variables
+.env
+.env.local
+.env.*.local

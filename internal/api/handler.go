@@ -1,32 +1,56 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"rent_game_accs/internal/account"
+	"rent_game_accs/internal/game"
 	pkg_http_request "rent_game_accs/internal/pkg/transport/http/request"
 	pkg_http_server "rent_game_accs/internal/pkg/transport/http/server"
 	"rent_game_accs/internal/rental"
+	repo_postgres "rent_game_accs/internal/repository/postgres"
 	shared_logger "rent_game_accs/internal/shared/logger"
 	shared_middleware "rent_game_accs/internal/shared/middleware"
 	shared_response "rent_game_accs/internal/shared/response"
 )
 
+type SteamSyncRepository interface {
+	GetAccountSyncDetails(ctx context.Context, accountID int64) (string, string, error)
+	SyncAccountGames(ctx context.Context, accountID int64, games []repo_postgres.AccountGameSyncInfo) error
+	BanAccount(ctx context.Context, accountID int64) error
+}
+
 type Handler struct {
 	pool          *pgxpool.Pool
 	rentalService *rental.Service
 	accountRepo   account.Repository
+	steamClient   game.SteamClient
+	steamSyncRepo SteamSyncRepository
 }
 
-func NewHandler(pool *pgxpool.Pool, rentalService *rental.Service, accountRepo account.Repository) *Handler {
-	return &Handler{pool: pool, rentalService: rentalService, accountRepo: accountRepo}
+func NewHandler(
+	pool *pgxpool.Pool,
+	rentalService *rental.Service,
+	accountRepo account.Repository,
+	steamClient game.SteamClient,
+	steamSyncRepo SteamSyncRepository,
+) *Handler {
+	return &Handler{
+		pool:          pool,
+		rentalService: rentalService,
+		accountRepo:   accountRepo,
+		steamClient:   steamClient,
+		steamSyncRepo: steamSyncRepo,
+	}
 }
 
 func (h *Handler) Routes(jwtSecret string, log *shared_logger.Logger) []pkg_http_server.Route {
@@ -396,7 +420,18 @@ func (h *Handler) AdminCreateAccount(w http.ResponseWriter, r *http.Request) {
 		shared_response.Error(w, http.StatusConflict, "CREATE_FAILED", err.Error())
 		return
 	}
-	shared_response.JSON(w, http.StatusCreated, map[string]any{"id": id})
+
+	gamesCount, syncErr := h.syncSteamLibrary(r.Context(), id)
+	if syncErr != nil {
+		shared_response.JSON(w, http.StatusCreated, map[string]any{
+			"id":          id,
+			"games_count": gamesCount,
+			"sync_error":  syncErr.Error(),
+		})
+		return
+	}
+
+	shared_response.JSON(w, http.StatusCreated, map[string]any{"id": id, "games_count": gamesCount})
 }
 
 func (h *Handler) AdminUpdateAccount(w http.ResponseWriter, r *http.Request) {
@@ -429,8 +464,49 @@ func (h *Handler) AdminSyncAccount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_, _ = h.pool.Exec(r.Context(), `UPDATE accounts SET library_synced_at=NOW(), updated_at=NOW() WHERE id=$1`, id)
-	shared_response.JSON(w, http.StatusOK, map[string]string{"message": "Account sync marked"})
+
+	gamesCount, err := h.syncSteamLibrary(r.Context(), id)
+	if err != nil {
+		shared_response.Error(w, http.StatusBadGateway, "STEAM_SYNC_FAILED", err.Error())
+		return
+	}
+
+	shared_response.JSON(w, http.StatusOK, map[string]any{"message": "Account library synced", "games_count": gamesCount})
+}
+
+func (h *Handler) syncSteamLibrary(ctx context.Context, accountID int64) (int, error) {
+	if h.steamClient == nil || h.steamSyncRepo == nil {
+		return 0, fmt.Errorf("steam synchronization is not configured")
+	}
+
+	login, steamID64, err := h.steamSyncRepo.GetAccountSyncDetails(ctx, accountID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to load Steam account details: %w", err)
+	}
+	if steamID64 == "" {
+		return 0, fmt.Errorf("account %d has empty steam_id64", accountID)
+	}
+
+	vacBanned, err := h.steamClient.CheckVACBans(ctx, steamID64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to check VAC bans for %s: %w", login, err)
+	}
+	if vacBanned {
+		if banErr := h.steamSyncRepo.BanAccount(ctx, accountID); banErr != nil {
+			return 0, fmt.Errorf("account is VAC banned and could not be disabled: %w", banErr)
+		}
+		return 0, fmt.Errorf("account is VAC banned and was disabled")
+	}
+
+	games, err := h.steamClient.GetOwnedGames(ctx, steamID64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch owned games for %s: %w", login, err)
+	}
+	if err := h.steamSyncRepo.SyncAccountGames(ctx, accountID, games); err != nil {
+		return 0, fmt.Errorf("failed to persist Steam library: %w", err)
+	}
+
+	return len(games), nil
 }
 
 func (h *Handler) AdminListUsers(w http.ResponseWriter, r *http.Request) {

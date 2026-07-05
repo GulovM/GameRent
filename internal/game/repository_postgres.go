@@ -64,8 +64,8 @@ func (r *PostgresRepository) GetGameByID(ctx context.Context, id int64) (*Game, 
 	db := database.GetTxOrPool(ctx, r.pool)
 
 	query := `SELECT 
-		id, name, COALESCE(steam_app_id, 0), short_description, header_image, 
-		release_date, developers, publishers, genres, created_at, updated_at 
+		id, name, COALESCE(steam_app_id, 0), COALESCE(short_description, ''), COALESCE(header_image, ''), 
+		release_date, COALESCE(developers, '[]'::jsonb), COALESCE(publishers, '[]'::jsonb), COALESCE(genres, '[]'::jsonb), created_at, updated_at 
 		FROM games WHERE id = $1`
 
 	var g Game
@@ -99,8 +99,8 @@ func (r *PostgresRepository) GetGameBySteamAppID(ctx context.Context, appID int)
 	db := database.GetTxOrPool(ctx, r.pool)
 
 	query := `SELECT 
-		id, name, COALESCE(steam_app_id, 0), short_description, header_image, 
-		release_date, developers, publishers, genres, created_at, updated_at 
+		id, name, COALESCE(steam_app_id, 0), COALESCE(short_description, ''), COALESCE(header_image, ''), 
+		release_date, COALESCE(developers, '[]'::jsonb), COALESCE(publishers, '[]'::jsonb), COALESCE(genres, '[]'::jsonb), created_at, updated_at 
 		FROM games WHERE steam_app_id = $1`
 
 	var g Game
@@ -168,14 +168,14 @@ func (r *PostgresRepository) ListGames(ctx context.Context, limit, offset int, s
 
 	if search != "" {
 		query := `SELECT 
-			id, name, COALESCE(steam_app_id, 0), short_description, header_image, 
-			release_date, developers, publishers, genres, created_at, updated_at 
+			id, name, COALESCE(steam_app_id, 0), COALESCE(short_description, ''), COALESCE(header_image, ''), 
+			release_date, COALESCE(developers, '[]'::jsonb), COALESCE(publishers, '[]'::jsonb), COALESCE(genres, '[]'::jsonb), created_at, updated_at 
 			FROM games WHERE name ILIKE $1 ORDER BY name ASC LIMIT $2 OFFSET $3`
 		rows, err = db.Query(ctx, query, "%"+search+"%", limit, offset)
 	} else {
 		query := `SELECT 
-			id, name, COALESCE(steam_app_id, 0), short_description, header_image, 
-			release_date, developers, publishers, genres, created_at, updated_at 
+			id, name, COALESCE(steam_app_id, 0), COALESCE(short_description, ''), COALESCE(header_image, ''), 
+			release_date, COALESCE(developers, '[]'::jsonb), COALESCE(publishers, '[]'::jsonb), COALESCE(genres, '[]'::jsonb), created_at, updated_at 
 			FROM games ORDER BY name ASC LIMIT $1 OFFSET $2`
 		rows, err = db.Query(ctx, query, limit, offset)
 	}

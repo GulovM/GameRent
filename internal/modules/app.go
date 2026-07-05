@@ -144,7 +144,7 @@ func Run() {
 	userHandler := user.NewHandler(userService, logger.Logger)
 	gameHandler := game.NewHandler(gameService, logger.Logger)
 	accountHandler := account.NewHandler(accountService, logger.Logger)
-	apiHandler := api.NewHandler(pool.Pool, rentalService, accountRepo)
+	apiHandler := api.NewHandler(pool.Pool, rentalService, accountRepo, steamClient, repo)
 
 	sLogger := &shared_logger.Logger{Logger: logger.Logger}
 	rateLimiter := shared_middleware.NewRateLimiter(5.0, 10.0)

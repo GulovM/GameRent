@@ -119,8 +119,8 @@ func (r *PostgresRepository) GetAccount(ctx context.Context, id int64) (*Account
 
 	query := `SELECT 
 		id, login, encrypted_password, status, steam_guard_enabled, 
-		inventory_verified, last_security_check, hourly_price, deposit_amount, 
-		profile_url, avatar_url, library_synced_at, created_at, updated_at, deleted_at, steam_id64
+		inventory_verified, COALESCE(last_security_check, '0001-01-01'::timestamp), hourly_price, deposit_amount, 
+		COALESCE(profile_url, ''), COALESCE(avatar_url, ''), COALESCE(library_synced_at, '0001-01-01'::timestamp), created_at, updated_at, deleted_at, steam_id64
 		FROM accounts WHERE id = $1 AND deleted_at IS NULL`
 
 	var a Account
@@ -175,8 +175,8 @@ func (r *PostgresRepository) GetAccountForUpdate(ctx context.Context, id int64) 
 
 	query := `SELECT 
 		id, login, encrypted_password, status, steam_guard_enabled, 
-		inventory_verified, last_security_check, hourly_price, deposit_amount, 
-		profile_url, avatar_url, library_synced_at, created_at, updated_at, deleted_at, steam_id64
+		inventory_verified, COALESCE(last_security_check, '0001-01-01'::timestamp), hourly_price, deposit_amount, 
+		COALESCE(profile_url, ''), COALESCE(avatar_url, ''), COALESCE(library_synced_at, '0001-01-01'::timestamp), created_at, updated_at, deleted_at, steam_id64
 		FROM accounts WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`
 
 	var a Account
@@ -228,8 +228,8 @@ func (r *PostgresRepository) GetAccountForUpdate(ctx context.Context, id int64) 
 
 func (r *PostgresRepository) getAccountGames(ctx context.Context, db database.DB, accountID int64) ([]AccountGame, error) {
 	query := `SELECT 
-		g.id, COALESCE(g.steam_app_id, 0), g.name, g.short_description, g.header_image, 
-		g.release_date, g.developers, g.publishers, g.genres, g.created_at, g.updated_at, 
+		g.id, COALESCE(g.steam_app_id, 0), g.name, COALESCE(g.short_description, ''), COALESCE(g.header_image, ''), 
+		g.release_date, COALESCE(g.developers, '[]'::jsonb), COALESCE(g.publishers, '[]'::jsonb), COALESCE(g.genres, '[]'::jsonb), g.created_at, g.updated_at, 
 		ag.playtime_minutes
 		FROM account_games ag
 		JOIN games g ON ag.game_id = g.id
@@ -363,8 +363,8 @@ func (r *PostgresRepository) SearchAccounts(ctx context.Context, limit, offset i
 
 	query := `SELECT 
 		id, login, encrypted_password, status, steam_guard_enabled, 
-		inventory_verified, last_security_check, hourly_price, deposit_amount, 
-		profile_url, avatar_url, library_synced_at, created_at, updated_at, deleted_at, steam_id64
+		inventory_verified, COALESCE(last_security_check, '0001-01-01'::timestamp), hourly_price, deposit_amount, 
+		COALESCE(profile_url, ''), COALESCE(avatar_url, ''), COALESCE(library_synced_at, '0001-01-01'::timestamp), created_at, updated_at, deleted_at, steam_id64
 		FROM accounts a
 		WHERE deleted_at IS NULL
 		AND ($1 = '' OR a.login ILIKE '%' || $1 || '%' OR a.steam_id64 ILIKE '%' || $1 || '%' OR EXISTS (
