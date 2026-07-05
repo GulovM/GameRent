@@ -1,0 +1,8 @@
+.env
+
+out/
+logs/
+bin/
+*.exe
+
+docs

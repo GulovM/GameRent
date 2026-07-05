@@ -1,0 +1,2482 @@
+openapi: 3.0.0
+info:
+  title: GameRent API
+  version: 1.0.0
+  description: >
+    REST API specification for the GameRent platform. Supports game account rentals,
+    user trust level management, reviews, notifications, admin operations, and payment webhooks.
+servers:
+  - url: /api/v1
+    description: Production API Server (v1)
+paths:
+  /auth/register:
+    post:
+      summary: Register a new user
+      description: Creates a new user profile and returns access and refresh tokens.
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User registered successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterResponseWrapped'
+        '409':
+          description: User already exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/login:
+    post:
+      summary: Login user
+      description: Authenticates user credentials and returns tokens.
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Logged in successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponseWrapped'
+        '401':
+          description: Unauthorized - Invalid email or password.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/logout:
+    post:
+      summary: Logout user
+      description: Logs out the user by revoking the refresh token.
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Logged out successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: Bad request - Invalid or already revoked token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/refresh:
+    post:
+      summary: Refresh tokens
+      description: Generates a new access token and refresh token rotation using a valid refresh token.
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Tokens refreshed successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshResponseWrapped'
+        '401':
+          description: Unauthorized - Expired or already revoked refresh token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/me:
+    get:
+      summary: Get current user
+      description: Retrieves profile details of the currently authenticated user.
+      tags:
+        - Authentication
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponseWrapped'
+        '401':
+          description: Unauthorized - Missing or invalid JWT.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: User profile not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /users/{id}:
+    get:
+      summary: Get user profile
+      description: Retrieves details of a specific user.
+      tags:
+        - Users
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: User profile retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: User not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    patch:
+      summary: Update user profile
+      description: Updates editable details (first name, last name) of a user.
+      tags:
+        - Users
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: User profile updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden - Cannot modify other users' profiles.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /me/rentals:
+    get:
+      summary: Get current user rentals
+      description: Retrieves rentals corresponding to the authenticated user.
+      tags:
+        - Users
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Rentals retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedRentalsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /me/payments:
+    get:
+      summary: Get current user payments
+      description: Retrieves payments history corresponding to the authenticated user.
+      tags:
+        - Users
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Payments retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedPaymentsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /me/notifications:
+    get:
+      summary: Get current user notifications
+      description: Retrieves notifications list corresponding to the authenticated user.
+      tags:
+        - Users
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Notifications retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedNotificationsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /accounts:
+    get:
+      summary: List available game accounts (catalog)
+      description: Retrieves a paginated list of available accounts, supports search, filtering, and sorting.
+      tags:
+        - Accounts
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: sort
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: game
+          in: query
+          schema:
+            type: string
+        - name: min_price
+          in: query
+          schema:
+            type: integer
+        - name: max_price
+          in: query
+          schema:
+            type: integer
+        - name: trust_level
+          in: query
+          schema:
+            type: string
+            enum: [Bronze, Silver, Gold, Diamond]
+      responses:
+        '200':
+          description: Accounts retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAccountsResponseWrapped'
+
+  /accounts/{accountId}:
+    get:
+      summary: Get game account by ID
+      description: Retrieves detailed information about a specific game account.
+      tags:
+        - Accounts
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Account details retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponseWrapped'
+        '400':
+          description: Invalid ID format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /accounts/{accountId}/availability:
+    get:
+      summary: Get account availability
+      description: Checks whether a specific game account is currently available for rent.
+      tags:
+        - Accounts
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Availability check completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountAvailabilityResponseWrapped'
+        '400':
+          description: Invalid ID format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /accounts/{id}/favorite:
+    post:
+      summary: Add account to favorites
+      description: Adds a game account to the user's favorites list.
+      tags:
+        - Accounts
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Added to favorites.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Remove account from favorites
+      description: Removes a game account from the user's favorites list.
+      tags:
+        - Accounts
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Removed from favorites.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /games:
+    get:
+      summary: List games
+      description: Retrieves a list of all games present in the catalog.
+      tags:
+        - Games
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Games catalog retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogResponseWrapped'
+
+  /games/{gameId}:
+    get:
+      summary: Get game details
+      description: Retrieves information about a single game by its ID.
+      tags:
+        - Games
+      parameters:
+        - name: gameId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Game details retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GameResponseWrapped'
+        '400':
+          description: Invalid ID format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Game not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /rentals:
+    post:
+      summary: Create a rental
+      description: Books a game account for renting and calculates costs.
+      tags:
+        - Rentals
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRentalRequest'
+      responses:
+        '201':
+          description: Rental created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RentalResponseWrapped'
+        '400':
+          description: Invalid rental duration.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden due to insufficient trust level.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Conflict - Account already rented or unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    get:
+      summary: List rentals
+      description: Retrieves a list of rentals, filtered by status.
+      tags:
+        - Rentals
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [Created, WaitingPayment, Active, Expired, Completed, Cancelled]
+      responses:
+        '200':
+          description: Rentals list retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedRentalsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /rentals/{rentalId}:
+    get:
+      summary: Get rental by ID
+      description: Retrieves details of a specific rental.
+      tags:
+        - Rentals
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: rentalId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Rental details retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RentalResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Rental not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /rentals/{rentalId}/cancel:
+    post:
+      summary: Cancel a rental
+      description: Cancels a rental in the "WaitingPayment" or "Created" state.
+      tags:
+        - Rentals
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: rentalId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Rental cancelled successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RentalResponseWrapped'
+        '400':
+          description: Cannot cancel rental in current state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /rentals/calculate:
+    post:
+      summary: Calculate rental cost
+      description: Estimates hourly, deposit, and total costs for a hypothetical rental duration.
+      tags:
+        - Rentals
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalculateRentalRequest'
+      responses:
+        '200':
+          description: Rental cost calculation details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalculateRentalResponseWrapped'
+        '400':
+          description: Invalid request parameter values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /rentals/{id}/extend:
+    post:
+      summary: Extend rental period
+      description: Extends the expiration date of an active rental if the account is not reserved by others.
+      tags:
+        - Rentals
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtendRentalRequest'
+      responses:
+        '200':
+          description: Rental period extended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RentalResponseWrapped'
+        '400':
+          description: Invalid extension duration.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Cannot extend because the account has been reserved or is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /payments:
+    post:
+      summary: Create payment
+      description: Initiates a payment process for a pending rental reservation.
+      tags:
+        - Payments
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+      responses:
+        '201':
+          description: Payment transaction initiated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponseWrapped'
+        '400':
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Conflict - Payment failed to initiate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    get:
+      summary: List payments
+      description: Retrieves a history of payment transactions.
+      tags:
+        - Payments
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Payments list retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedPaymentsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /payments/{paymentId}:
+    get:
+      summary: Get payment by ID
+      description: Retrieves details of a specific payment transaction.
+      tags:
+        - Payments
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: paymentId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Payment details retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Payment not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /payments/webhook:
+    post:
+      summary: Payment Webhook
+      description: Processes secure notifications from external payment providers.
+      tags:
+        - Payments
+      parameters:
+        - name: X-Payment-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: HMAC SHA-256 signature validating webhook authenticity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookRequest'
+      responses:
+        '200':
+          description: Webhook processed successfully. Returns game credentials if payment was success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponseWrapped'
+        '400':
+          description: Invalid request body or payload formats.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Webhook signature verification failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal webhook processor error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /reviews:
+    post:
+      summary: Submit a review
+      description: Allows a user to leave a review and rating for a rental experience.
+      tags:
+        - Reviews
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReviewRequest'
+      responses:
+        '201':
+          description: Review submitted successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewResponseWrapped'
+        '400':
+          description: Invalid review details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /accounts/{accountId}/reviews:
+    get:
+      summary: Get account reviews
+      description: Retrieves a paginated list of reviews left for a specific account.
+      tags:
+        - Reviews
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Account reviews list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedReviewsResponseWrapped'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /notifications:
+    get:
+      summary: List notifications
+      description: Retrieves a list of user system notifications.
+      tags:
+        - Notifications
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: unread_only
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Notifications list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedNotificationsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /notifications/{notificationId}/read:
+    patch:
+      summary: Mark notification as read
+      description: Marks a specific notification as read.
+      tags:
+        - Notifications
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: notificationId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Notification status updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Notification not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/accounts:
+    get:
+      summary: Admin List Accounts
+      description: Admin-only retrieval of all accounts regardless of status.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: List of accounts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAccountsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Create game account (Admin)
+      description: Adds a new steam account to the platform database.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminCreateAccountRequest'
+      responses:
+        '201':
+          description: Account registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponseWrapped'
+        '400':
+          description: Invalid data format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/accounts/{accountId}:
+    patch:
+      summary: Update game account (Admin)
+      description: Updates account settings, pricing, deposit, or changes the state.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminUpdateAccountRequest'
+      responses:
+        '200':
+          description: Account updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponseWrapped'
+        '400':
+          description: Invalid data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Delete game account (Admin)
+      description: Performs a soft delete or deletes the game account from the platform.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Account deleted successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/accounts/{accountId}/sync:
+    post:
+      summary: Sync Account with Steam (Admin)
+      description: Triggers a manual synchronization of games and playtimes from the Steam API.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Sync completed successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/users:
+    get:
+      summary: Admin list users
+      description: Retrieves a list of users for administration purposes.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Users list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedUsersResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/users/{userId}:
+    patch:
+      summary: Update user status/trust (Admin)
+      description: Adjusts a user's trust score, trust level, or blocks/unblocks a user profile.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminUpdateUserRequest'
+      responses:
+        '200':
+          description: User updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponseWrapped'
+        '400':
+          description: Invalid update values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: User not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/audit-logs:
+    get:
+      summary: Get audit logs (Admin)
+      description: Retrieves security and action logs for audit trails.
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: user_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: action
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Audit logs list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAuditLogsResponseWrapped'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    # Envelope schemas
+    SuccessResponse:
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          example: {}
+
+    ErrorResponse:
+      type: object
+      required:
+        - success
+        - error
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              example: The input parameters are invalid.
+
+    # Wrapped DTO Response schemas
+    RegisterResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/RegisterResponse'
+
+    LoginResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/LoginResponse'
+
+    RefreshResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/RefreshResponse'
+
+    UserResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/UserResponse'
+
+    PaginatedAccountsResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaginatedAccountsResponse'
+
+    AccountResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/AccountResponse'
+
+    AccountAvailabilityResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/AccountAvailabilityResponse'
+
+    CatalogResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/CatalogResponse'
+
+    GameResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/GameResponse'
+
+    RentalResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/RentalResponse'
+
+    PaginatedRentalsResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaginatedRentalsResponse'
+
+    CalculateRentalResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/CalculateRentalResponse'
+
+    PaymentResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaymentResponse'
+
+    PaginatedPaymentsResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaginatedPaymentsResponse'
+
+    WebhookResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/WebhookResponse'
+
+    ReviewResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/ReviewResponse'
+
+    PaginatedReviewsResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaginatedReviewsResponse'
+
+    PaginatedNotificationsResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaginatedNotificationsResponse'
+
+    NotificationResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/NotificationResponse'
+
+    PaginatedUsersResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaginatedUsersResponse'
+
+    PaginatedAuditLogsResponseWrapped:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/PaginatedAuditLogsResponse'
+
+    # Core DTO schemas
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: user@example.com
+        password:
+          type: string
+          minLength: 8
+          example: secretPass123!
+
+    RegisterResponse:
+      type: object
+      required:
+        - user
+        - access_token
+        - refresh_token
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+        access_token:
+          type: string
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          example: 8a4c28fe-bc57-4146-a496-e17f4d45d8b7
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: user@example.com
+        password:
+          type: string
+          example: secretPass123!
+
+    LoginResponse:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+      properties:
+        access_token:
+          type: string
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          example: 8a4c28fe-bc57-4146-a496-e17f4d45d8b7
+
+    RefreshRequest:
+      type: object
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+          example: 8a4c28fe-bc57-4146-a496-e17f4d45d8b7
+
+    RefreshResponse:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+      properties:
+        access_token:
+          type: string
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          example: 8a4c28fe-bc57-4146-a496-e17f4d45d8b7
+
+    UserResponse:
+      type: object
+      required:
+        - id
+        - email
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        email:
+          type: string
+          format: email
+          example: user@example.com
+        first_name:
+          type: string
+          example: John
+        last_name:
+          type: string
+          example: Doe
+        trust_score:
+          type: integer
+          example: 300
+        trust_level:
+          type: string
+          enum: [Bronze, Silver, Gold, Diamond]
+          example: Silver
+        is_blocked:
+          type: boolean
+          example: false
+        created_at:
+          type: string
+          format: date-time
+          example: 2026-07-05T11:52:55Z
+        updated_at:
+          type: string
+          format: date-time
+          example: 2026-07-05T11:52:55Z
+
+    UpdateUserRequest:
+      type: object
+      properties:
+        first_name:
+          type: string
+          maxLength: 50
+          example: John
+        last_name:
+          type: string
+          maxLength: 50
+          example: Doe
+
+    MoneyResponse:
+      type: object
+      required:
+        - amount
+        - currency
+      properties:
+        amount:
+          type: integer
+          format: int64
+          description: Price in lowest currency unit (e.g. cents)
+          example: 150
+        currency:
+          type: string
+          example: USD
+
+    AccountGameResponse:
+      type: object
+      required:
+        - game_id
+        - name
+        - steam_app_id
+        - playtime_minutes
+      properties:
+        game_id:
+          type: integer
+          format: int64
+          example: 5
+        name:
+          type: string
+          example: Counter-Strike 2
+        steam_app_id:
+          type: integer
+          example: 730
+        playtime_minutes:
+          type: integer
+          example: 1045
+
+    AccountResponse:
+      type: object
+      required:
+        - id
+        - steam_id64
+        - status
+        - price_per_hour
+        - security_deposit
+        - games
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 12
+        steam_id64:
+          type: string
+          example: "76561198000000000"
+        status:
+          type: string
+          enum: [Created, Verifying, Available, Reserved, Rented, Maintenance, Disabled]
+          example: Available
+        price_per_hour:
+          $ref: '#/components/schemas/MoneyResponse'
+        security_deposit:
+          $ref: '#/components/schemas/MoneyResponse'
+        games:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountGameResponse'
+
+    PaginationInfo:
+      type: object
+      required:
+        - page
+        - page_size
+        - total_items
+        - total_pages
+      properties:
+        page:
+          type: integer
+          example: 1
+        page_size:
+          type: integer
+          example: 20
+        total_items:
+          type: integer
+          format: int64
+          example: 15
+        total_pages:
+          type: integer
+          example: 1
+
+    PaginatedAccountsResponse:
+      type: object
+      required:
+        - accounts
+        - pagination
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    AccountAvailabilityResponse:
+      type: object
+      required:
+        - account_id
+        - available
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          example: 12
+        available:
+          type: boolean
+          example: true
+
+    GameResponse:
+      type: object
+      required:
+        - id
+        - steam_app_id
+        - name
+        - header_image
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 5
+        steam_app_id:
+          type: integer
+          example: 730
+        name:
+          type: string
+          example: Counter-Strike 2
+        header_image:
+          type: string
+          example: https://cdn.akamai.steamstatic.com/steam/apps/730/header.jpg
+
+    CatalogResponse:
+      type: object
+      required:
+        - games
+        - pagination
+      properties:
+        games:
+          type: array
+          items:
+            $ref: '#/components/schemas/GameResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    CreateRentalRequest:
+      type: object
+      required:
+        - account_id
+        - duration_hours
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          example: 12
+        duration_hours:
+          type: integer
+          minimum: 1
+          maximum: 720
+          example: 6
+
+    RentalResponse:
+      type: object
+      required:
+        - id
+        - account
+        - user
+        - started_at
+        - expires_at
+        - status
+        - total_price
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 45
+        account:
+          $ref: '#/components/schemas/AccountResponse'
+        user:
+          $ref: '#/components/schemas/UserResponse'
+        started_at:
+          type: string
+          format: date-time
+          example: 2026-07-05T12:00:00Z
+        expires_at:
+          type: string
+          format: date-time
+          example: 2026-07-05T18:00:00Z
+        status:
+          type: string
+          enum: [Created, WaitingPayment, Active, Expired, Completed, Cancelled]
+          example: WaitingPayment
+        total_price:
+          $ref: '#/components/schemas/MoneyResponse'
+
+    PaginatedRentalsResponse:
+      type: object
+      required:
+        - rentals
+        - pagination
+      properties:
+        rentals:
+          type: array
+          items:
+            $ref: '#/components/schemas/RentalResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    CalculateRentalRequest:
+      type: object
+      required:
+        - account_id
+        - duration_hours
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          example: 12
+        duration_hours:
+          type: integer
+          example: 6
+
+    CalculateRentalResponse:
+      type: object
+      required:
+        - price_per_hour
+        - security_deposit
+        - duration_hours
+        - total_price
+      properties:
+        price_per_hour:
+          $ref: '#/components/schemas/MoneyResponse'
+        security_deposit:
+          $ref: '#/components/schemas/MoneyResponse'
+        duration_hours:
+          type: integer
+          example: 6
+        total_price:
+          $ref: '#/components/schemas/MoneyResponse'
+
+    ExtendRentalRequest:
+      type: object
+      required:
+        - duration_hours
+      properties:
+        duration_hours:
+          type: integer
+          example: 3
+
+    CreatePaymentRequest:
+      type: object
+      required:
+        - rental_id
+      properties:
+        rental_id:
+          type: integer
+          format: int64
+          example: 45
+
+    PaymentResponse:
+      type: object
+      required:
+        - id
+        - amount
+        - currency
+        - status
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 88
+        amount:
+          type: integer
+          format: int64
+          example: 900
+        currency:
+          type: string
+          example: USD
+        status:
+          type: string
+          enum: [Created, Waiting, Completed, Failed]
+          example: Waiting
+        payment_url:
+          type: string
+          example: https://payment-gateway.example.com/checkout/88
+
+    PaginatedPaymentsResponse:
+      type: object
+      required:
+        - payments
+        - pagination
+      properties:
+        payments:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaymentResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    WebhookRequest:
+      type: object
+      required:
+        - payment_id
+        - rental_id
+        - external_transaction_id
+        - status
+      properties:
+        payment_id:
+          type: string
+          example: "88"
+        rental_id:
+          type: string
+          example: "45"
+        external_transaction_id:
+          type: string
+          example: tx_99887766
+        status:
+          type: string
+          enum: [success, failed]
+          example: success
+
+    CredentialsPayload:
+      type: object
+      required:
+        - login
+        - password
+        - steam_id64
+      properties:
+        login:
+          type: string
+          example: steam_user_123
+        password:
+          type: string
+          example: DecryptedSteamPassword!
+        steam_id64:
+          type: string
+          example: "76561198000000000"
+
+    WebhookResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+          example: Payment processed successfully.
+        credentials:
+          $ref: '#/components/schemas/CredentialsPayload'
+
+    CreateReviewRequest:
+      type: object
+      required:
+        - account_id
+        - rental_id
+        - rating
+        - comment
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          example: 12
+        rental_id:
+          type: integer
+          format: int64
+          example: 45
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 5
+          example: 5
+        comment:
+          type: string
+          example: Outstanding service, account is working perfectly.
+
+    ReviewResponse:
+      type: object
+      required:
+        - id
+        - account_id
+        - user_id
+        - rating
+        - comment
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 102
+        account_id:
+          type: integer
+          format: int64
+          example: 12
+        user_id:
+          type: integer
+          format: int64
+          example: 1
+        rating:
+          type: integer
+          example: 5
+        comment:
+          type: string
+          example: Outstanding service, account is working perfectly.
+        created_at:
+          type: string
+          format: date-time
+          example: 2026-07-05T13:00:00Z
+
+    PaginatedReviewsResponse:
+      type: object
+      required:
+        - reviews
+        - pagination
+      properties:
+        reviews:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    NotificationResponse:
+      type: object
+      required:
+        - id
+        - title
+        - message
+        - read
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 501
+        title:
+          type: string
+          example: Rental Started
+        message:
+          type: string
+          example: Your rental period has officially started.
+        read:
+          type: boolean
+          example: false
+        created_at:
+          type: string
+          format: date-time
+          example: 2026-07-05T12:00:00Z
+
+    PaginatedNotificationsResponse:
+      type: object
+      required:
+        - notifications
+        - pagination
+      properties:
+        notifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    PaginatedUsersResponse:
+      type: object
+      required:
+        - users
+        - pagination
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
+
+    AdminCreateAccountRequest:
+      type: object
+      required:
+        - steam_id64
+        - price_per_hour
+        - security_deposit
+        - steam_login
+        - steam_password
+      properties:
+        steam_id64:
+          type: string
+          example: "76561198000000000"
+        price_per_hour:
+          $ref: '#/components/schemas/MoneyResponse'
+        security_deposit:
+          $ref: '#/components/schemas/MoneyResponse'
+        steam_login:
+          type: string
+          example: steam_user_12
+        steam_password:
+          type: string
+          example: securepass123!
+
+    AdminUpdateAccountRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [Created, Verifying, Available, Reserved, Rented, Maintenance, Disabled]
+          example: Maintenance
+        price_per_hour:
+          $ref: '#/components/schemas/MoneyResponse'
+        security_deposit:
+          $ref: '#/components/schemas/MoneyResponse'
+
+    AdminUpdateUserRequest:
+      type: object
+      properties:
+        trust_score:
+          type: integer
+          example: 450
+        trust_level:
+          type: string
+          enum: [Bronze, Silver, Gold, Diamond]
+          example: Gold
+        is_blocked:
+          type: boolean
+          example: false
+
+    AuditLogResponse:
+      type: object
+      required:
+        - id
+        - user_id
+        - action
+        - details
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 9001
+        user_id:
+          type: integer
+          format: int64
+          example: 1
+        action:
+          type: string
+          example: USER_LOGIN
+        details:
+          type: string
+          example: "IP: 192.168.1.1"
+        created_at:
+          type: string
+          format: date-time
+          example: 2026-07-05T11:52:55Z
+
+    PaginatedAuditLogsResponse:
+      type: object
+      required:
+        - audit_logs
+        - pagination
+      properties:
+        audit_logs:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditLogResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationInfo'
