@@ -84,6 +84,11 @@ func Run() {
 		30*time.Second,
 		scheduler.NewExpiredCleanupWorker(repo, clk, logger.Logger),
 	)
+	bgScheduler.Register(
+		"waiting_payment_cleanup",
+		1*time.Minute,
+		scheduler.NewExpiredWaitingPaymentCleanupWorker(repo, clk, logger.Logger),
+	)
 
 	var steamClient game.SteamClient
 	steamKey := os.Getenv("STEAM_API_KEY")
@@ -129,14 +134,13 @@ func Run() {
 	gameRepo := game.NewPostgresRepository(pool.Pool)
 	accountRepo := account.NewPostgresRepository(pool.Pool, os.Getenv("ENCRYPTION_KEY"))
 	rentalRepo := rental.NewPostgresRepository(pool.Pool)
+	paymentRepo := payment.NewPostgresRepository(pool.Pool)
 
 	authService := auth.NewPostgresService(authRepo, txManager, jwtSecret, jwtTTL)
 	userService := user.NewPostgresService(userRepo)
 	gameService := game.NewPostgresService(gameRepo)
 	accountService := account.NewPostgresService(accountRepo)
-	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, txManager)
-
-	paymentRepo := payment.NewPostgresRepository(pool.Pool)
+	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
 	paymentService := payment.NewPaymentService(paymentRepo)
 	paymentHandler := payment.NewHandler(paymentService, logger.Logger)
 
@@ -144,7 +148,7 @@ func Run() {
 	userHandler := user.NewHandler(userService, logger.Logger)
 	gameHandler := game.NewHandler(gameService, logger.Logger)
 	accountHandler := account.NewHandler(accountService, logger.Logger)
-	apiHandler := api.NewHandler(pool.Pool, rentalService, accountRepo, steamClient, repo)
+	apiHandler := api.NewHandler(pool.Pool, rentalService, paymentService, accountRepo, steamClient, repo)
 
 	sLogger := &shared_logger.Logger{Logger: logger.Logger}
 	rateLimiter := shared_middleware.NewRateLimiter(5.0, 10.0)

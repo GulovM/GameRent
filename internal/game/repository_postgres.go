@@ -75,7 +75,7 @@ func (r *PostgresRepository) GetGameByID(ctx context.Context, id int64) (*Game, 
 		&g.ID, &g.Name, &g.SteamAppID, &g.ShortDescription, &g.HeaderImage,
 		&g.ReleaseDate, &devBytes, &pubBytes, &genBytes, &g.CreatedAt, &g.UpdatedAt,
 	)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrGameNotFound
 	}
 	if err != nil {
@@ -110,7 +110,7 @@ func (r *PostgresRepository) GetGameBySteamAppID(ctx context.Context, appID int)
 		&g.ID, &g.Name, &g.SteamAppID, &g.ShortDescription, &g.HeaderImage,
 		&g.ReleaseDate, &devBytes, &pubBytes, &genBytes, &g.CreatedAt, &g.UpdatedAt,
 	)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrGameNotFound
 	}
 	if err != nil {

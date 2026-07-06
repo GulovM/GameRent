@@ -43,7 +43,7 @@ func (r *PostgresRepository) GetUser(ctx context.Context, id int64) (*User, erro
 	query := `SELECT id, email, COALESCE(first_name, ''), COALESCE(last_name, ''), role, trust_score, is_blocked, balance, created_at, updated_at, deleted_at FROM users WHERE id = $1 AND deleted_at IS NULL`
 	var u User
 	err := db.QueryRow(ctx, query, id).Scan(&u.ID, &u.Email, &u.FirstName, &u.LastName, &u.Role, &u.TrustScore, &u.IsBlocked, &u.Balance, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
 	if err != nil {
@@ -57,7 +57,7 @@ func (r *PostgresRepository) GetUserByEmail(ctx context.Context, email string) (
 	query := `SELECT id, email, COALESCE(first_name, ''), COALESCE(last_name, ''), role, trust_score, is_blocked, balance, created_at, updated_at, deleted_at FROM users WHERE email = $1 AND deleted_at IS NULL`
 	var u User
 	err := db.QueryRow(ctx, query, email).Scan(&u.ID, &u.Email, &u.FirstName, &u.LastName, &u.Role, &u.TrustScore, &u.IsBlocked, &u.Balance, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
 	if err != nil {

@@ -401,11 +401,11 @@ Response
 1. Пользователь выбирает аккаунт.
 2. Проверяется доступность аккаунта.
 3. Начинается транзакция.
-4. Создаётся аренда.
-5. Создаётся запись платежа.
-6. Аккаунт переводится в состояние Reserved.
+4. Создаётся аренда со статусом `WAITING_PAYMENT`.
+5. Создаётся запись платежа со статусом `PENDING`.
+6. Аккаунт переводится из `AVAILABLE` в `RESERVED`.
 7. Транзакция фиксируется.
-8. Клиент получает ссылку на оплату.
+8. Клиент получает rental/payment данные для оплаты; Steam credentials в этом ответе не возвращаются.
 
 ---
 
@@ -443,9 +443,10 @@ Rental Service
 
 1. Пользователь оплачивает аренду.
 2. Платёжная система подтверждает платёж.
-3. Статус платежа обновляется.
-4. Rental Service получает уведомление.
-5. Запускается процесс активации аренды.
+3. `Payment Service` проверяет подпись webhook и запускает PostgreSQL transaction.
+4. Статус платежа обновляется `PENDING -> SUCCESS`.
+5. Rental и account активируются в той же transaction: `WAITING_PAYMENT -> ACTIVE`, `RESERVED -> RENTED`.
+6. Повтор webhook с тем же `external_transaction_id` для уже активированного состояния является идемпотентным no-op.
 
 ---
 
@@ -509,44 +510,67 @@ Client Login
 7. `Account Service` обновляет состояние арендуемого Steam-аккаунта в таблице `accounts` с `3` (`Reserved`) на `4` (`Rented`).
 8. `Security Service` регистрирует новое событие безопасности (`2` — `Rental Started`) с сохранением `IPAddress` и `User-Agent` клиента.
 9. `Transaction Manager` фиксирует (commit) транзакцию в PostgreSQL.
-10. `Notification Service` асинхронно отправляет информационное письмо владельцу аккаунта о старте сессии аренды, а клиент получает доступ к расшифрованным данным `SteamCredentials`.
+10. Webhook возвращает только статус обработки и не выдаёт `SteamCredentials`.
+11. Клиент отдельно запрашивает `GET /api/v1/me/rentals/{rentalId}/credentials`.
+12. Credentials возвращаются только владельцу аренды, если rental всё ещё `ACTIVE`, оплачена и не истекла.
+
+### 13.1 Create Rental -> Waiting Payment -> Webhook -> Active -> Credentials
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant RentalAPI as Rental Handler
+    participant DB as PostgreSQL
+    participant Provider as Payment Provider
+    participant PaymentAPI as Payment Webhook
+    participant CredentialsAPI as Credentials Endpoint
+
+    User->>RentalAPI: POST /api/v1/rentals
+    RentalAPI->>DB: tx: rental WAITING_PAYMENT, payment PENDING, account RESERVED
+    DB-->>RentalAPI: commit
+    RentalAPI-->>User: success/data rental, no credentials
+    Provider->>PaymentAPI: POST /api/v1/payments/webhook
+    PaymentAPI->>DB: tx: payment SUCCESS, rental ACTIVE, account RENTED
+    DB-->>PaymentAPI: commit
+    PaymentAPI-->>Provider: success/data status
+    User->>CredentialsAPI: GET /api/v1/me/rentals/{rentalId}/credentials
+    CredentialsAPI->>DB: check owner + ACTIVE + paid + not expired
+    DB-->>CredentialsAPI: encrypted credentials
+    CredentialsAPI-->>User: success/data credentials
+```
 
 ---
 
 ### 14. Rental Completion
 
-**Description** Сценарий завершения аренды по инициативе пользователя или при автоматическом истечении времени. Включает отзыв доступа и освобождение ресурсов.
+**Description** Реализованные терминальные сценарии: отмена неоплаченной аренды пользователем/owner flow и автоматическое истечение активной аренды. Включает отзыв доступа и освобождение ресурсов без refund/deposit ledger.
 
-**Flow** 1. Клиент отправляет запрос на эндпоинт `POST /rentals/{rentalId}/cancel` (или триггер срабатывает из фонового планировщика `Scheduler`).
+**Flow** 1. Клиент отправляет запрос на эндпоинт `POST /rentals/{rentalId}/cancel` для `WAITING_PAYMENT` rental или триггер срабатывает из фонового планировщика `Scheduler` для истёкшей `ACTIVE` rental.
 2. `Rental Handler` вызывает Use Case метод в `Rental Service`.
 3. `Rental Service` открывает транзакцию PostgreSQL.
-4. Статус аренды в таблице `rentals` меняется на `4` (`Completed`), фиксируется время в поле `actual_finished_at`.
-5. `Account Service` переводит статус Steam-аккаунта из состояния `4` (`Rented`) в состояние `2` (`Available`) для последующих бронирований.
-6. Сессионные токены доступа для данного периода аренды инвалидируются, закрывая клиенту легитимный доступ к отображению `SteamCredentials`.
-7. `Security Service` делает запись в таблицу `security_events` со статусом `3` (`Rental Finished`).
-8. `Audit Log` фиксирует системное изменение агрегата. Транзакция закрывается.
-9. `Rental Service` порождает доменное событие `RentalCompleted`, которое инициирует асинхронную цепочку проверки и возврата страхового депозита.
+4. Для cancel: `rentals.status WAITING_PAYMENT -> CANCELLED`, `payments.status PENDING -> FAILED`, `accounts.status RESERVED -> AVAILABLE`.
+5. Для expire: `rentals.status ACTIVE -> EXPIRED`, `accounts.status RENTED -> AVAILABLE`; `payments.status SUCCESS` не меняется.
+6. После `CANCELLED` или `EXPIRED` credentials endpoint больше не возвращает `SteamCredentials`.
+7. `Security Service`/audit фиксирует событие без credentials, токенов и Steam данных.
+8. Повторный cancel/expire является no-op и не создаёт duplicate event.
 
 ---
 
 ### 15. Deposit Release / Return
 
-**Description** Автоматический возврат денежного залога (Deposit) на баланс пользователя после закрытия аренды, если со стороны системы безопасности не было зафиксировано нарушений.
+**Description** Будущий процесс автоматического возврата денежного залога (Deposit). В текущем backend refund/deposit ledger не реализован, поэтому этот раздел описывает целевое расширение, а не исполняемый flow.
 
-**Flow** 1. Асинхронный обработчик событий перехватывает доменное событие `RentalCompleted` и вызывает `TrustService` совместно с `SecurityService`.
-2. `SecurityService` сканирует таблицу `security_events` на наличие критических инцидентов (`4` — `Suspicious Activity`, `6` — `Security Incident`) за время прошедшего периода аренды.
-3. При отсутствии зарегистрированных инцидентов и жалоб `TrustService` одобряет возврат депозита.
-4. `Payment Service` инициирует транзакцию возврата средств.
-5. В таблице `payments` создаётся запись с типом `2` (`Deposit Release`) и статусом `0` (`Created`).
-6. Система отправляет запрос во внешний шлюз платёжной системы (или переводит средства на внутренний `Balance` пользователя в MVP).
-7. После успешного перевода статус платежа обновляется до `2` (`Success`).
-8. `Notification Service` отправляет пользователю уведомление типа `3` (`Deposit Released`).
+**Current status** 1. Отдельные refund/deposit payment records не создаются.
+2. Payment `SUCCESS` после expiration не изменяется.
+3. Возврат депозита, ledger и отдельные notification events для deposit release остаются будущим расширением.
 
 ---
 
 ### 16. Submit Review
 
 **Description** Публикация отзыва и выставление оценки аккаунту после успешного окончания аренды. База данных жёстко контролирует инвариант «один отзыв на одну аренду».
+
+**Current limitation** В текущем rental lifecycle оплаченная аренда истекает в `EXPIRED`; отдельный переход `EXPIRED -> COMPLETED` не подключён к API/worker flow.
 
 **Flow** 1. Клиент отправляет POST-запрос на `/reviews` с указанием `rental_id`, `rating` (от 1 до 5) и текстового комментария.
 2. `Review Handler` пропускает данные через `validator.go` (проверка обязательных полей и диапазона оценки).

@@ -7,14 +7,7 @@ type WebhookRequest struct {
 	Status                string `json:"status"`
 }
 
-type CredentialsPayload struct {
-	Login     string `json:"login"`
-	Password  string `json:"password"`
-	SteamID64 string `json:"steam_id64"`
-}
-
 type WebhookResponse struct {
-	Status      string              `json:"status"`
-	Message     string              `json:"message,omitempty"`
-	Credentials *CredentialsPayload `json:"credentials,omitempty"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
 }

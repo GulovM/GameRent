@@ -10,8 +10,8 @@ GameRent - full-stack приложение для аренды игровых а
 - Хранение refresh token в БД только в виде SHA-256 хэша.
 - Каталог игр и игровых аккаунтов.
 - Поиск аккаунтов по названию игры, SteamID и логину.
-- Аренда аккаунта клиентом.
-- Создание платежа и обработка payment webhook.
+- Аренда аккаунта клиентом через lifecycle `WAITING_PAYMENT -> ACTIVE -> EXPIRED`.
+- Создание `PENDING` платежа и идемпотентная обработка payment webhook.
 - Отзывы, уведомления, admin endpoints.
 - Фоновая очистка истекших аренд.
 - Фоновая синхронизация Steam-библиотек.
@@ -332,6 +332,8 @@ POST {{apiUrl}}/rentals
 GET  {{apiUrl}}/rentals
 GET  {{apiUrl}}/me/rentals
 GET  {{apiUrl}}/rentals/{rentalId}
+GET  {{apiUrl}}/me/rentals/{rentalId}/credentials
+POST {{apiUrl}}/me/rentals/{rentalId}/pay-with-balance
 POST {{apiUrl}}/rentals/{rentalId}/cancel
 POST {{apiUrl}}/rentals/calculate
 POST {{apiUrl}}/rentals/{id}/extend
@@ -345,6 +347,14 @@ POST {{apiUrl}}/rentals/{id}/extend
   "duration_hours": 2
 }
 ```
+
+`POST /rentals` создаёт `WAITING_PAYMENT` rental, `PENDING` payment и переводит account в `RESERVED`. Steam credentials из create-rental не возвращаются.
+
+`POST /me/rentals/{rentalId}/pay-with-balance` позволяет владельцу `WAITING_PAYMENT` аренды оплатить существующий `PENDING` payment из `available_balance`. Backend сам вычисляет сумму из rental/payment state; credentials автоматически не возвращаются.
+
+Credentials выдаются только владельцу активной оплаченной неистёкшей аренды через `GET /me/rentals/{rentalId}/credentials`.
+
+Cancel endpoint работает для `WAITING_PAYMENT`: rental становится `CANCELLED`, payment `FAILED`, account возвращается в `AVAILABLE`. Истёкшие `ACTIVE` аренды закрываются scheduler cleanup как `EXPIRED`; `SUCCESS` payment при этом не меняется.
 
 ### Payments
 
@@ -369,6 +379,12 @@ X-Payment-Signature: <hmac_sha256_hex>
   "status": "success"
 }
 ```
+
+Успешный webhook переводит `payment PENDING -> SUCCESS`, `rental WAITING_PAYMENT -> ACTIVE`, `account RESERVED -> RENTED` в одной PostgreSQL transaction. Повтор webhook с тем же `external_transaction_id` для уже обработанного платежа является идемпотентным. Webhook не возвращает Steam credentials.
+
+Wallet payment использует тот же lifecycle `PENDING -> SUCCESS`, `WAITING_PAYMENT -> ACTIVE`, `RESERVED -> RENTED`, но без provider webhook: списывает `users.balance` атомарно внутри backend transaction и не возвращает credentials автоматически.
+
+Refund/deposit ledger пока не реализован.
 
 ### Reviews
 

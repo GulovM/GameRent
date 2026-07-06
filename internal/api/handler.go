@@ -6,14 +6,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"rent_game_accs/internal/account"
 	"rent_game_accs/internal/game"
+	"rent_game_accs/internal/payment"
 	pkg_http_request "rent_game_accs/internal/pkg/transport/http/request"
 	pkg_http_server "rent_game_accs/internal/pkg/transport/http/server"
 	"rent_game_accs/internal/rental"
@@ -30,33 +34,40 @@ type SteamSyncRepository interface {
 }
 
 type Handler struct {
-	pool          *pgxpool.Pool
-	rentalService *rental.Service
-	accountRepo   account.Repository
-	steamClient   game.SteamClient
-	steamSyncRepo SteamSyncRepository
+	pool           *pgxpool.Pool
+	rentalService  *rental.Service
+	paymentService payment.Service
+	accountRepo    account.Repository
+	steamClient    game.SteamClient
+	steamSyncRepo  SteamSyncRepository
 }
 
 func NewHandler(
 	pool *pgxpool.Pool,
 	rentalService *rental.Service,
+	paymentService payment.Service,
 	accountRepo account.Repository,
 	steamClient game.SteamClient,
 	steamSyncRepo SteamSyncRepository,
 ) *Handler {
 	return &Handler{
-		pool:          pool,
-		rentalService: rentalService,
-		accountRepo:   accountRepo,
-		steamClient:   steamClient,
-		steamSyncRepo: steamSyncRepo,
+		pool:           pool,
+		rentalService:  rentalService,
+		paymentService: paymentService,
+		accountRepo:    accountRepo,
+		steamClient:    steamClient,
+		steamSyncRepo:  steamSyncRepo,
 	}
 }
 
 func (h *Handler) Routes(jwtSecret string, log *shared_logger.Logger) []pkg_http_server.Route {
 	authMw := shared_middleware.Auth(jwtSecret, log)
 	return []pkg_http_server.Route{
+		pkg_http_server.NewRoute("GET", "/me/balance", wrap(h.GetMyBalance, authMw)),
+		pkg_http_server.NewRoute("GET", "/me/ledger", wrap(h.ListMyLedger, authMw)),
 		pkg_http_server.NewRoute("GET", "/me/rentals", wrap(h.ListMyRentals, authMw)),
+		pkg_http_server.NewRoute("GET", "/me/rentals/{rentalId}/credentials", wrap(h.GetMyRentalCredentials, authMw)),
+		pkg_http_server.NewRoute("POST", "/me/rentals/{rentalId}/pay-with-balance", wrap(h.PayRentalWithBalance, authMw)),
 		pkg_http_server.NewRoute("GET", "/me/payments", wrap(h.ListMyPayments, authMw)),
 		pkg_http_server.NewRoute("GET", "/me/notifications", wrap(h.ListMyNotifications, authMw)),
 		pkg_http_server.NewRoute("POST", "/rentals", wrap(h.CreateRental, authMw)),
@@ -78,6 +89,8 @@ func (h *Handler) Routes(jwtSecret string, log *shared_logger.Logger) []pkg_http
 		pkg_http_server.NewRoute("POST", "/admin/accounts", wrap(h.AdminCreateAccount, authMw)),
 		pkg_http_server.NewRoute("PATCH", "/admin/accounts/{accountId}", wrap(h.AdminUpdateAccount, authMw)),
 		pkg_http_server.NewRoute("POST", "/admin/accounts/{accountId}/sync", wrap(h.AdminSyncAccount, authMw)),
+		pkg_http_server.NewRoute("POST", "/admin/rentals/{rentalId}/deposit/release", wrap(h.AdminReleaseDeposit, authMw)),
+		pkg_http_server.NewRoute("POST", "/admin/rentals/{rentalId}/deposit/forfeit", wrap(h.AdminForfeitDeposit, authMw)),
 		pkg_http_server.NewRoute("GET", "/admin/users", wrap(h.AdminListUsers, authMw)),
 		pkg_http_server.NewRoute("PATCH", "/admin/users/{userId}", wrap(h.AdminUpdateUser, authMw)),
 		pkg_http_server.NewRoute("GET", "/admin/audit-logs", wrap(h.AdminAuditLogs, authMw)),
@@ -123,13 +136,27 @@ func (h *Handler) CreateRental(w http.ResponseWriter, r *http.Request) {
 		shared_response.Error(w, http.StatusConflict, "RENTAL_FAILED", err.Error())
 		return
 	}
-	_, _ = h.pool.Exec(r.Context(), `INSERT INTO payments (rental_id, user_id, payment_type, status, amount, currency) VALUES ($1, $2, 1, 1, $3, 'USD')`, rent.ID, userID, rent.RentalPrice.Amount+rent.DepositAmount.Amount)
 	shared_response.JSON(w, http.StatusCreated, rentalDTO(rent))
 }
 
 func (h *Handler) ListMyRentals(w http.ResponseWriter, r *http.Request) {
 	userID := shared_middleware.GetUserID(r.Context())
-	rows, err := h.pool.Query(r.Context(), `SELECT id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount FROM rentals WHERE user_id=$1 ORDER BY created_at DESC`, userID)
+	rows, err := h.pool.Query(r.Context(), `
+		SELECT
+			r.id,
+			r.user_id,
+			r.account_id,
+			r.status,
+			r.start_at,
+			r.end_at,
+			r.payment_expires_at,
+			r.rental_price,
+			r.deposit_amount,
+			COALESCE(d.status, 0)
+		FROM rentals r
+		LEFT JOIN deposit_holds d ON d.rental_id = r.id
+		WHERE r.user_id = $1
+		ORDER BY r.created_at DESC`, userID)
 	if err != nil {
 		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
@@ -138,13 +165,13 @@ func (h *Handler) ListMyRentals(w http.ResponseWriter, r *http.Request) {
 	var items []map[string]any
 	for rows.Next() {
 		var id, uid, accountID, price, deposit int64
-		var status int16
-		var start, end time.Time
-		if err := rows.Scan(&id, &uid, &accountID, &status, &start, &end, &price, &deposit); err != nil {
+		var status, depositHoldStatus int16
+		var start, end, paymentExpiresAt time.Time
+		if err := rows.Scan(&id, &uid, &accountID, &status, &start, &end, &paymentExpiresAt, &price, &deposit, &depositHoldStatus); err != nil {
 			shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 			return
 		}
-		items = append(items, rentalMap(id, uid, accountID, status, start, end, price, deposit))
+		items = append(items, rentalMap(id, uid, accountID, status, start, end, paymentExpiresAt, price, deposit, publicDepositStatus(deposit, depositHoldStatus)))
 	}
 	shared_response.JSON(w, http.StatusOK, map[string]any{"rentals": items})
 }
@@ -156,18 +183,181 @@ func (h *Handler) GetRental(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var uid, accountID, price, deposit int64
-	var status int16
-	var start, end time.Time
-	err := h.pool.QueryRow(r.Context(), `SELECT user_id, account_id, status, start_at, end_at, rental_price, deposit_amount FROM rentals WHERE id=$1`, id).Scan(&uid, &accountID, &status, &start, &end, &price, &deposit)
+	var status, depositHoldStatus int16
+	var start, end, paymentExpiresAt time.Time
+	err := h.pool.QueryRow(r.Context(), `
+		SELECT
+			r.user_id,
+			r.account_id,
+			r.status,
+			r.start_at,
+			r.end_at,
+			r.payment_expires_at,
+			r.rental_price,
+			r.deposit_amount,
+			COALESCE(d.status, 0)
+		FROM rentals r
+		LEFT JOIN deposit_holds d ON d.rental_id = r.id
+		WHERE r.id = $1`, id).Scan(&uid, &accountID, &status, &start, &end, &paymentExpiresAt, &price, &deposit, &depositHoldStatus)
 	if err != nil {
 		shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Rental not found")
 		return
 	}
-	if uid != userID && userID != 1 {
+	if uid != userID {
 		shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", "You can access only your rentals")
 		return
 	}
-	shared_response.JSON(w, http.StatusOK, rentalMap(id, uid, accountID, status, start, end, price, deposit))
+	shared_response.JSON(w, http.StatusOK, rentalMap(id, uid, accountID, status, start, end, paymentExpiresAt, price, deposit, publicDepositStatus(deposit, depositHoldStatus)))
+}
+
+func (h *Handler) GetMyBalance(w http.ResponseWriter, r *http.Request) {
+	userID := shared_middleware.GetUserID(r.Context())
+	balance, err := h.paymentService.GetUserBalance(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, payment.ErrFinancialUserNotFound) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Balance not found")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to load balance")
+		return
+	}
+	shared_response.JSON(w, http.StatusOK, map[string]any{
+		"available_balance": balance.AvailableBalance,
+		"currency":          balance.Currency,
+	})
+}
+
+func (h *Handler) ListMyLedger(w http.ResponseWriter, r *http.Request) {
+	userID := shared_middleware.GetUserID(r.Context())
+	page, pageSize, ok := ledgerPaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	ledgerPage, err := h.paymentService.ListUserLedger(r.Context(), userID, page, pageSize)
+	if err != nil {
+		if errors.Is(err, payment.ErrInvalidLedgerPagination) {
+			shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "page and page_size must be positive; page_size must be <= 100")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to load ledger")
+		return
+	}
+
+	totalPages := int(ledgerPage.TotalItems) / ledgerPage.PageSize
+	if int(ledgerPage.TotalItems)%ledgerPage.PageSize != 0 {
+		totalPages++
+	}
+	if ledgerPage.TotalItems == 0 {
+		totalPages = 0
+	}
+
+	items := make([]map[string]any, 0, len(ledgerPage.Entries))
+	for _, entry := range ledgerPage.Entries {
+		dto := map[string]any{
+			"id":           entry.ID,
+			"entry_type":   entry.EntryType,
+			"amount":       entry.Amount,
+			"currency":     entry.Currency,
+			"created_at":   entry.CreatedAt,
+			"display_type": entry.DisplayType,
+		}
+		if entry.RentalID != nil {
+			dto["rental_id"] = *entry.RentalID
+		}
+		if entry.PaymentID != nil {
+			dto["payment_id"] = *entry.PaymentID
+		}
+		items = append(items, dto)
+	}
+
+	shared_response.JSON(w, http.StatusOK, map[string]any{
+		"entries": items,
+		"pagination": map[string]any{
+			"page":        ledgerPage.Page,
+			"page_size":   ledgerPage.PageSize,
+			"total_items": ledgerPage.TotalItems,
+			"total_pages": totalPages,
+		},
+	})
+}
+
+type rentalCredentialsResponse struct {
+	Login    string `json:"login"`
+	Password string `json:"password"`
+}
+
+func (h *Handler) GetMyRentalCredentials(w http.ResponseWriter, r *http.Request) {
+	userID := shared_middleware.GetUserID(r.Context())
+	rentalID, ok := pathID(w, r, "rentalId")
+	if !ok {
+		return
+	}
+
+	creds, err := h.rentalService.GetRentalCredentials(r.Context(), userID, rentalID, time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, rental.ErrCredentialsNotAvailable) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Rental not found")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to load rental credentials")
+		return
+	}
+
+	metadata, _ := json.Marshal(map[string]any{
+		"event":     "rental_credentials_issued",
+		"rental_id": rentalID,
+		"user_id":   userID,
+	})
+	_, _ = h.pool.Exec(r.Context(), `
+		INSERT INTO security_events (
+			user_id, account_id, rental_id, event_type, ip_address, user_agent, success, metadata, created_at
+		) VALUES ($1, NULL, $2, 7, NULL, NULL, true, $3, NOW())`,
+		userID, rentalID, metadata,
+	)
+
+	shared_response.JSON(w, http.StatusOK, rentalCredentialsResponse{
+		Login:    creds.Login,
+		Password: creds.Password,
+	})
+}
+
+func (h *Handler) PayRentalWithBalance(w http.ResponseWriter, r *http.Request) {
+	userID := shared_middleware.GetUserID(r.Context())
+	rentalID, ok := pathID(w, r, "rentalId")
+	if !ok {
+		return
+	}
+
+	result, err := h.paymentService.PayRentalWithBalance(r.Context(), userID, rentalID, clientIPFromRequest(r), r.Header.Get("User-Agent"), time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, payment.ErrWalletPaymentNotFound) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Rental not found")
+			return
+		}
+		if errors.Is(err, payment.ErrWalletInsufficientBalance) {
+			shared_response.Error(w, http.StatusConflict, "PAYMENT_FAILED", "Insufficient balance")
+			return
+		}
+		if errors.Is(err, payment.ErrWalletPaymentExpired) || errors.Is(err, payment.ErrWalletPaymentNotAllowed) {
+			shared_response.Error(w, http.StatusConflict, "PAYMENT_FAILED", "Rental cannot be paid with balance")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to pay rental with balance")
+		return
+	}
+
+	shared_response.JSON(w, http.StatusOK, map[string]any{
+		"changed":          result.Changed,
+		"idempotent":       result.Idempotent,
+		"payment_id":       result.PaymentID,
+		"rental_id":        result.RentalID,
+		"account_id":       result.AccountID,
+		"payment_status":   result.PaymentStatus,
+		"rental_status":    result.RentalStatus,
+		"account_status":   result.AccountStatus,
+		"payment_provider": result.PaymentProvider,
+	})
 }
 
 func (h *Handler) CancelRental(w http.ResponseWriter, r *http.Request) {
@@ -176,8 +366,13 @@ func (h *Handler) CancelRental(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tag, err := h.pool.Exec(r.Context(), `UPDATE rentals SET status=5, cancellation_reason='cancelled by user', actual_finished_at=NOW(), updated_at=NOW() WHERE id=$1 AND user_id=$2 AND status IN (1,2)`, id, userID)
-	if err != nil || tag.RowsAffected() == 0 {
+
+	_, err := h.rentalService.CancelRental(r.Context(), userID, id, "cancelled by user", time.Now())
+	if err != nil {
+		if errors.Is(err, rental.ErrCannotCancel) || errors.Is(err, rental.ErrRentalNotFound) {
+			shared_response.Error(w, http.StatusConflict, "CANCEL_FAILED", "Rental cannot be cancelled")
+			return
+		}
 		shared_response.Error(w, http.StatusConflict, "CANCEL_FAILED", "Rental cannot be cancelled")
 		return
 	}
@@ -244,13 +439,16 @@ func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Rental not found")
 		return
 	}
+
 	var id int64
-	err = h.pool.QueryRow(r.Context(), `INSERT INTO payments (rental_id, user_id, payment_type, status, amount, currency) VALUES ($1,$2,1,1,$3,'USD') RETURNING id`, req.RentalID, userID, amount).Scan(&id)
+	var currency string
+	var status int16
+	err = h.pool.QueryRow(r.Context(), `SELECT id, amount, currency, status FROM payments WHERE rental_id=$1 AND user_id=$2`, req.RentalID, userID).Scan(&id, &amount, &currency, &status)
 	if err != nil {
-		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		shared_response.Error(w, http.StatusConflict, "PAYMENT_FAILED", "Payment record is unavailable for this rental")
 		return
 	}
-	shared_response.JSON(w, http.StatusCreated, map[string]any{"id": id, "rental_id": req.RentalID, "amount": amount, "currency": "USD", "status": "Waiting"})
+	shared_response.JSON(w, http.StatusOK, map[string]any{"id": id, "rental_id": req.RentalID, "amount": amount, "currency": currency, "status": status})
 }
 
 func (h *Handler) ListMyPayments(w http.ResponseWriter, r *http.Request) {
@@ -580,6 +778,95 @@ func (h *Handler) AdminAuditLogs(w http.ResponseWriter, r *http.Request) {
 	shared_response.JSON(w, http.StatusOK, map[string]any{"audit_logs": items})
 }
 
+type adminForfeitDepositRequest struct {
+	ReasonCode string `json:"reason_code"`
+}
+
+func (r *adminForfeitDepositRequest) Validate() error {
+	r.ReasonCode = strings.TrimSpace(r.ReasonCode)
+	if len(r.ReasonCode) == 0 || len(r.ReasonCode) > 64 {
+		return errText("reason_code must be between 1 and 64 characters")
+	}
+	for _, ch := range r.ReasonCode {
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch == '_' || ch == '-' {
+			continue
+		}
+		return errText("reason_code may contain only lowercase letters, digits, underscores and hyphens")
+	}
+	return nil
+}
+
+func (h *Handler) AdminReleaseDeposit(w http.ResponseWriter, r *http.Request) {
+	if !admin(w, r) {
+		return
+	}
+	rentalID, ok := pathID(w, r, "rentalId")
+	if !ok {
+		return
+	}
+	result, err := h.paymentService.ReleaseDeposit(r.Context(), shared_middleware.GetUserID(r.Context()), shared_middleware.GetUserRole(r.Context()), rentalID, time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, payment.ErrAdminRequired) {
+			shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", err.Error())
+			return
+		}
+		if errors.Is(err, payment.ErrDepositHoldNotFound) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+			return
+		}
+		if errors.Is(err, payment.ErrDepositSettlementNotAllowed) || errors.Is(err, payment.ErrDepositAlreadySettled) {
+			shared_response.Error(w, http.StatusConflict, "DEPOSIT_SETTLEMENT_FAILED", err.Error())
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		return
+	}
+	shared_response.JSON(w, http.StatusOK, map[string]any{"changed": result.Changed, "status": result.Status})
+}
+
+func (h *Handler) AdminForfeitDeposit(w http.ResponseWriter, r *http.Request) {
+	if !admin(w, r) {
+		return
+	}
+	rentalID, ok := pathID(w, r, "rentalId")
+	if !ok {
+		return
+	}
+	var req adminForfeitDepositRequest
+	if err := pkg_http_request.DecodeAndValidateRequest(r, &req); err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", err.Error())
+		return
+	}
+	result, err := h.paymentService.ForfeitDeposit(r.Context(), shared_middleware.GetUserID(r.Context()), shared_middleware.GetUserRole(r.Context()), rentalID, req.ReasonCode, time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, payment.ErrAdminRequired) {
+			shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", err.Error())
+			return
+		}
+		if errors.Is(err, payment.ErrInvalidReasonCode) {
+			shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", err.Error())
+			return
+		}
+		if errors.Is(err, payment.ErrDepositHoldNotFound) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+			return
+		}
+		if errors.Is(err, payment.ErrDepositSettlementNotAllowed) || errors.Is(err, payment.ErrDepositAlreadySettled) {
+			shared_response.Error(w, http.StatusConflict, "DEPOSIT_SETTLEMENT_FAILED", err.Error())
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		return
+	}
+	shared_response.JSON(w, http.StatusOK, map[string]any{"changed": result.Changed, "status": result.Status})
+}
+
 func admin(w http.ResponseWriter, r *http.Request) bool {
 	if !shared_middleware.IsAdmin(r.Context()) {
 		shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", "Admin access is required")
@@ -598,11 +885,86 @@ func pathID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
 }
 
 func rentalDTO(rent *rental.Rental) map[string]any {
-	return rentalMap(rent.ID, rent.UserID, rent.AccountID, int16(rent.Status), rent.Period.StartAt, rent.Period.EndAt, rent.RentalPrice.Amount, rent.DepositAmount.Amount)
+	return rentalMap(
+		rent.ID,
+		rent.UserID,
+		rent.AccountID,
+		int16(rent.Status),
+		rent.Period.StartAt,
+		rent.Period.EndAt,
+		rent.CreatedAt.Add(15*time.Minute),
+		rent.RentalPrice.Amount,
+		rent.DepositAmount.Amount,
+		publicDepositStatus(rent.DepositAmount.Amount, 0),
+	)
 }
 
-func rentalMap(id, userID, accountID int64, status int16, start, end time.Time, price, deposit int64) map[string]any {
-	return map[string]any{"id": id, "user_id": userID, "account_id": accountID, "status": status, "started_at": start, "expires_at": end, "rental_price": money(price), "security_deposit": money(deposit), "total_price": money(price + deposit)}
+func rentalMap(id, userID, accountID int64, status int16, start, end, paymentExpiresAt time.Time, price, deposit int64, depositStatus string) map[string]any {
+	return map[string]any{
+		"id":                 id,
+		"user_id":            userID,
+		"account_id":         accountID,
+		"status":             status,
+		"started_at":         start,
+		"expires_at":         end,
+		"payment_expires_at": paymentExpiresAt,
+		"rental_price":       money(price),
+		"security_deposit":   money(deposit),
+		"deposit_status":     depositStatus,
+		"total_price":        money(price + deposit),
+	}
+}
+
+func publicDepositStatus(depositAmount int64, holdStatus int16) string {
+	if depositAmount <= 0 {
+		return "NONE"
+	}
+	switch holdStatus {
+	case 1:
+		return "HELD"
+	case 2:
+		return "RELEASED"
+	case 3:
+		return "FORFEITED"
+	default:
+		return "NONE"
+	}
+}
+
+func ledgerPaginationParams(w http.ResponseWriter, r *http.Request) (int, int, bool) {
+	page := 1
+	pageSize := 20
+
+	if pageRaw := strings.TrimSpace(r.URL.Query().Get("page")); pageRaw != "" {
+		parsed, err := strconv.Atoi(pageRaw)
+		if err != nil || parsed <= 0 {
+			shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "page must be a positive integer")
+			return 0, 0, false
+		}
+		page = parsed
+	}
+
+	if pageSizeRaw := strings.TrimSpace(r.URL.Query().Get("page_size")); pageSizeRaw != "" {
+		parsed, err := strconv.Atoi(pageSizeRaw)
+		if err != nil || parsed <= 0 {
+			shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "page_size must be a positive integer")
+			return 0, 0, false
+		}
+		pageSize = parsed
+	}
+
+	return page, pageSize, true
+}
+
+func clientIPFromRequest(r *http.Request) string {
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		return strings.TrimSpace(strings.Split(ip, ",")[0])
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return strings.TrimSpace(ip)
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return strings.TrimSpace(ip)
 }
 
 func money(amount int64) map[string]any {

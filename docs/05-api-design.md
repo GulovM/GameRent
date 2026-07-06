@@ -81,7 +81,9 @@ application/json
 
 2026-07-04T18:30:00Z
 
-UUID используется во всех идентификаторах.
+Идентификаторы в текущей реализации используют PostgreSQL `BIGSERIAL` и передаются в API как JSON number / Go `int64` / TypeScript `number`.
+
+Path parameters (`{accountId}`, `{rentalId}`, `{paymentId}`, `{userId}`) ожидают десятичные integer ID, а не UUID.
 
 ---
 
@@ -90,12 +92,14 @@ UUID используется во всех идентификаторах.
 Успешный ответ:
 
 {
+    "success": true,
     "data": {}
 }
 
 Ошибки:
 
 {
+    "success": false,
     "error": {
         "code": "ACCOUNT_NOT_AVAILABLE",
         "message": "The account is currently unavailable."
@@ -215,11 +219,14 @@ trust_level
 ## Rental
 
 - id
-- account
-- user
+- user_id
+- account_id
 - started_at
 - expires_at
+- payment_expires_at
 - status
+- rental_price
+- security_deposit
 - total_price
 
 ---
@@ -227,9 +234,18 @@ trust_level
 ## Payment
 
 - id
+- rental_id
 - amount
 - currency
 - status
+- created_at
+
+---
+
+## RentalCredentials
+
+- login
+- password
 
 ---
 
@@ -277,6 +293,8 @@ GET /rentals
 
 GET /rentals/{rentalId}
 
+GET /me/rentals/{rentalId}/credentials
+
 POST /rentals/{rentalId}/cancel
 
 POST /rentals/calculate
@@ -292,6 +310,10 @@ POST /payments
 GET /payments
 
 GET /payments/{paymentId}
+
+POST /payments/webhook
+
+POST /me/rentals/{rentalId}/pay-with-balance
 
 ---
 
@@ -319,8 +341,6 @@ POST /admin/accounts
 
 PATCH /admin/accounts/{accountId}
 
-DELETE /admin/accounts/{accountId}
-
 POST /admin/accounts/{accountId}/sync
 
 GET /admin/users
@@ -328,6 +348,33 @@ GET /admin/users
 PATCH /admin/users/{userId}
 
 GET /admin/audit-logs
+
+---
+
+# 10.1 Rental and Payment Contract
+
+Фактический lifecycle аренды и платежа:
+
+1. `POST /rentals` создаёт `rental.status = WAITING_PAYMENT`, `payment.status = PENDING` и переводит account `AVAILABLE -> RESERVED` в одной PostgreSQL transaction.
+2. Успешный `POST /payments/webhook` переводит `payment PENDING -> SUCCESS`, `rental WAITING_PAYMENT -> ACTIVE`, `account RESERVED -> RENTED`.
+3. `POST /me/rentals/{rentalId}/pay-with-balance` для владельца rental подтверждает тот же существующий `PENDING` payment из внутреннего `users.balance`: `payment PENDING -> SUCCESS`, `rental WAITING_PAYMENT -> ACTIVE`, `account RESERVED -> RENTED`.
+4. `POST /rentals`, wallet payment и webhook не возвращают Steam credentials.
+5. Credentials доступны только владельцу активной оплаченной неистёкшей аренды через `GET /api/v1/me/rentals/{rentalId}/credentials`.
+6. `POST /rentals/{rentalId}/cancel` отменяет только `WAITING_PAYMENT` аренду: `rental -> CANCELLED`, `payment PENDING -> FAILED`, `account RESERVED -> AVAILABLE`.
+7. Expiration worker переводит истёкшую `ACTIVE` аренду в `EXPIRED`, освобождает account `RENTED -> AVAILABLE` и не изменяет `SUCCESS` payment.
+8. Waiting-payment cleanup переводит просроченную неоплаченную аренду `WAITING_PAYMENT -> EXPIRED`, payment `PENDING -> FAILED`, account `RESERVED -> AVAILABLE`.
+
+Для одного account база запрещает одновременно более одной аренды в статусе `WAITING_PAYMENT` или `ACTIVE`.
+
+Webhook idempotency:
+
+- повтор webhook с тем же `external_transaction_id` для уже `SUCCESS/ACTIVE/RENTED` состояния возвращает успешный ответ без повторной активации;
+- конфликтующий `external_transaction_id` не принимается;
+- webhook без `payment_id` и без `external_transaction_id` отклоняется;
+- первая успешная обработка требует `external_transaction_id`;
+- `provider` и `external_transaction_id` сохраняются в `payments` как provider metadata.
+
+Refund/deposit ledger в текущем backend не реализован. `security_deposit` хранится в rental/payment суммах, но отдельного ledger для refund/deposit release нет.
 
 ---
 

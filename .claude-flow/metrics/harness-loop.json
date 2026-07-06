@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-05T17:06:11.658Z",
+  "timestamp": "2026-07-06T13:33:21.828Z",
   "flywheel": {
     "ran": false,
     "reason": "opt-in required (RUFLO_HARNESS_LOOP=1)",
@@ -60,6 +60,9 @@
         "meanDelta": 0
       }
     ],
+    "cumulativeBenchmarkDelta": 0,
+    "cumulativeHumanRelevanceDelta": 0,
+    "humanEvalHash": null,
     "served": {
       "championHash": null,
       "config": null,

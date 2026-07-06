@@ -1059,7 +1059,7 @@ type AppError struct {
 * формат email;
 * длина строк;
 * диапазоны значений;
-* UUID;
+* integer path parameters (`BIGSERIAL` / `int64` IDs);
 * даты.
 
 Бизнес-правила валидатор не проверяет.
@@ -1603,21 +1603,23 @@ make run
 
 make test
 
-make lint
+make test-integration
 
-make migrate-up
+make up
 
-make migrate-down
+make infra-up
 
-make migrate-create
+make down
 
-make docker-up
-
-make docker-down
+make docker-build
 
 make fmt
 
 make clean
+
+make logs
+
+make ps
 ```
 
 Разработчик не должен вручную вводить длинные команды.

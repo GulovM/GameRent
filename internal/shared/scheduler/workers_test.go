@@ -13,15 +13,28 @@ import (
 
 type MockExpiredCleanupRepository struct {
 	GetExpiredRentalsFunc func(ctx context.Context, now time.Time) ([]repo.ExpiredRental, error)
-	ExpireRentalFunc      func(ctx context.Context, rentalID, accountID int64) error
+	ExpireRentalFunc      func(ctx context.Context, rentalID, accountID int64, now time.Time) (bool, error)
 }
 
 func (m *MockExpiredCleanupRepository) GetExpiredRentals(ctx context.Context, now time.Time) ([]repo.ExpiredRental, error) {
 	return m.GetExpiredRentalsFunc(ctx, now)
 }
 
-func (m *MockExpiredCleanupRepository) ExpireRental(ctx context.Context, rentalID, accountID int64) error {
-	return m.ExpireRentalFunc(ctx, rentalID, accountID)
+func (m *MockExpiredCleanupRepository) ExpireRental(ctx context.Context, rentalID, accountID int64, now time.Time) (bool, error) {
+	return m.ExpireRentalFunc(ctx, rentalID, accountID, now)
+}
+
+type MockWaitingPaymentCleanupRepository struct {
+	GetExpiredWaitingPaymentReservationsFunc func(ctx context.Context, now time.Time) ([]repo.ExpiredWaitingPaymentReservation, error)
+	ExpireWaitingPaymentReservationFunc      func(ctx context.Context, paymentID int64, now time.Time) (bool, error)
+}
+
+func (m *MockWaitingPaymentCleanupRepository) GetExpiredWaitingPaymentReservations(ctx context.Context, now time.Time) ([]repo.ExpiredWaitingPaymentReservation, error) {
+	return m.GetExpiredWaitingPaymentReservationsFunc(ctx, now)
+}
+
+func (m *MockWaitingPaymentCleanupRepository) ExpireWaitingPaymentReservation(ctx context.Context, paymentID int64, now time.Time) (bool, error) {
+	return m.ExpireWaitingPaymentReservationFunc(ctx, paymentID, now)
 }
 
 type MockSteamSyncRepository struct {
@@ -77,14 +90,17 @@ func TestExpiredCleanupWorker_Success(t *testing.T) {
 				{ID: rentalID, AccountID: accountID},
 			}, nil
 		},
-		ExpireRentalFunc: func(ctx context.Context, rID, aID int64) error {
+		ExpireRentalFunc: func(ctx context.Context, rID, aID int64, now time.Time) (bool, error) {
 			if rID != rentalID {
 				t.Errorf("expected rental ID %d, got %d", rentalID, rID)
 			}
 			if aID != accountID {
 				t.Errorf("expected account ID %d, got %d", accountID, aID)
 			}
-			return nil
+			if !now.Equal(mockTime) {
+				t.Errorf("expected time %v, got %v", mockTime, now)
+			}
+			return true, nil
 		},
 	}
 
@@ -107,6 +123,57 @@ func TestExpiredCleanupWorker_RepositoryError(t *testing.T) {
 	}
 
 	worker := NewExpiredCleanupWorker(mockRepo, clk, logger)
+	err := worker(context.Background())
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected error %v, got %v", expectedErr, err)
+	}
+}
+
+func TestExpiredWaitingPaymentCleanupWorker_Success(t *testing.T) {
+	mockTime := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewMockClock(mockTime)
+	logger := zap.NewNop()
+
+	paymentID := int64(301)
+	rentalID := int64(302)
+	accountID := int64(303)
+
+	mockRepo := &MockWaitingPaymentCleanupRepository{
+		GetExpiredWaitingPaymentReservationsFunc: func(ctx context.Context, now time.Time) ([]repo.ExpiredWaitingPaymentReservation, error) {
+			if !now.Equal(mockTime) {
+				t.Errorf("expected time %v, got %v", mockTime, now)
+			}
+			return []repo.ExpiredWaitingPaymentReservation{{PaymentID: paymentID, RentalID: rentalID, AccountID: accountID, UserID: 404}}, nil
+		},
+		ExpireWaitingPaymentReservationFunc: func(ctx context.Context, gotPaymentID int64, now time.Time) (bool, error) {
+			if gotPaymentID != paymentID {
+				t.Errorf("expected payment ID %d, got %d", paymentID, gotPaymentID)
+			}
+			if !now.Equal(mockTime) {
+				t.Errorf("expected time %v, got %v", mockTime, now)
+			}
+			return true, nil
+		},
+	}
+
+	worker := NewExpiredWaitingPaymentCleanupWorker(mockRepo, clk, logger)
+	if err := worker(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExpiredWaitingPaymentCleanupWorker_RepositoryError(t *testing.T) {
+	clk := clock.NewMockClock(time.Now())
+	logger := zap.NewNop()
+
+	expectedErr := errors.New("db error")
+	mockRepo := &MockWaitingPaymentCleanupRepository{
+		GetExpiredWaitingPaymentReservationsFunc: func(ctx context.Context, now time.Time) ([]repo.ExpiredWaitingPaymentReservation, error) {
+			return nil, expectedErr
+		},
+	}
+
+	worker := NewExpiredWaitingPaymentCleanupWorker(mockRepo, clk, logger)
 	err := worker(context.Background())
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected error %v, got %v", expectedErr, err)

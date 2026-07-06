@@ -543,10 +543,10 @@ WAITING_PAYMENT
     │
     ├──────────────► CANCELLED
     │
+    ├──────────────► EXPIRED
+    │
     ▼
 ACTIVE
-    │
-    ├──────────────► CANCELLED
     │
     ▼
 EXPIRED
@@ -554,6 +554,8 @@ EXPIRED
     ▼
 COMPLETED
 ```
+
+Текущий backend создаёт аренду сразу в `WAITING_PAYMENT`; `CREATED` и `COMPLETED` остаются доменными статусами, но не являются основным API happy-path для создания/закрытия аренды.
 
 ### Состояния
 
@@ -567,11 +569,15 @@ COMPLETED
 
 Ожидается успешная оплата.
 
+Account находится в статусе `RESERVED`, payment находится в статусе `PENDING`.
+
 ---
 
 **ACTIVE**
 
 Пользователь получил доступ к аккаунту.
+
+Доступ к credentials разрешён только владельцу этой активной, оплаченной и неистёкшей аренды через `GET /api/v1/me/rentals/{rentalId}/credentials`.
 
 ---
 
@@ -581,17 +587,36 @@ COMPLETED
 
 Выполняются завершающие операции.
 
+Credentials после перехода в `EXPIRED` не выдаются.
+
 ---
 
 **COMPLETED**
 
 Аренда полностью завершена.
 
+В текущем API/worker flow переход в `COMPLETED` не является реализованным закрытием оплаченной аренды; expiration использует `EXPIRED`.
+
 ---
 
 **CANCELLED**
 
-Аренда отменена до завершения.
+Аренда отменена до завершения оплаты.
+
+Реализованный cancel flow разрешён для `WAITING_PAYMENT` и не освобождает account из `ACTIVE`.
+
+---
+
+### Реализованные переходы Rental
+
+| From | To | Trigger | Side effects |
+| --- | --- | --- | --- |
+| `WAITING_PAYMENT` | `ACTIVE` | successful payment webhook | `payment PENDING -> SUCCESS`, `account RESERVED -> RENTED` |
+| `WAITING_PAYMENT` | `CANCELLED` | owner cancel endpoint | `payment PENDING -> FAILED`, `account RESERVED -> AVAILABLE` |
+| `WAITING_PAYMENT` | `EXPIRED` | waiting-payment cleanup | `payment PENDING -> FAILED`, `account RESERVED -> AVAILABLE` |
+| `ACTIVE` | `EXPIRED` | expired rental cleanup | `payment SUCCESS` сохраняется, `account RENTED -> AVAILABLE` |
+
+Повторные cancel/expire операции идемпотентны: состояние не меняется повторно и audit/security event не дублируется.
 
 ---
 
@@ -600,6 +625,8 @@ COMPLETED
 Запрещено:
 
 ACTIVE → WAITING_PAYMENT
+
+ACTIVE → CANCELLED через реализованный cancel endpoint
 
 COMPLETED → ACTIVE
 
@@ -642,6 +669,18 @@ AVAILABLE
     ▼
 DISABLED
 ```
+
+### Реализованные переходы Account
+
+| From | To | Trigger |
+| --- | --- | --- |
+| `AVAILABLE` | `RESERVED` | `POST /rentals` создал неоплаченную аренду |
+| `RESERVED` | `RENTED` | successful payment webhook активировал аренду |
+| `RESERVED` | `AVAILABLE` | cancel `WAITING_PAYMENT` или waiting-payment cleanup |
+| `RENTED` | `AVAILABLE` | expiration `ACTIVE -> EXPIRED` |
+| any allowed admin state | `MAINTENANCE` / `DISABLED` | admin status update or account ban flow |
+
+Account не должен становиться `AVAILABLE`, если для него существует валидная `ACTIVE` аренда. Для конкурирующих аренд база содержит partial unique index на `account_id` для rental statuses `WAITING_PAYMENT` и `ACTIVE`.
 
 ### CREATED
 
@@ -694,30 +733,15 @@ DISABLED
 ## 11.3 Payment State Machine
 
 ```
-CREATED
-
-↓
-
-PROCESSING
-
-↓
-
+PENDING
+    │
+    ├──────────────► FAILED
+    │
+    ▼
 SUCCESS
-
-↓
-
-REFUNDED
 ```
 
-или
-
-```
-PROCESSING
-
-↓
-
-FAILED
-```
+В текущем backend создание rental создаёт payment сразу в `PENDING`. Статусы refund/deposit ledger не реализованы.
 
 ---
 
@@ -727,9 +751,9 @@ FAILED
 
 ---
 
-### PROCESSING
+### PENDING
 
-Платёж находится в обработке.
+Платёж ожидает подтверждения от provider/webhook.
 
 ---
 
@@ -745,9 +769,16 @@ FAILED
 
 ---
 
-### REFUNDED
+### Реализованные переходы Payment
 
-Средства успешно возвращены пользователю.
+| From | To | Trigger | Notes |
+| --- | --- | --- | --- |
+| `PENDING` | `SUCCESS` | successful webhook | требует `external_transaction_id`; активирует rental |
+| `PENDING` | `FAILED` | cancel `WAITING_PAYMENT` | terminal для отменённой неоплаченной аренды |
+| `PENDING` | `FAILED` | waiting-payment cleanup | terminal для просроченной неоплаченной аренды |
+| `SUCCESS` | `SUCCESS` | repeated webhook with same `external_transaction_id` | идемпотентный no-op |
+
+`provider` и `external_transaction_id` используются для идемпотентности webhook. Отдельный refund/deposit ledger пока не реализован.
 
 ---
 
@@ -774,6 +805,8 @@ FAILED
 ## Account
 
 Аккаунт может иметь только одну активную аренду одновременно.
+
+В текущей схеме это усилено partial unique index: для одного `account_id` одновременно допускается не более одной rental со статусом `WAITING_PAYMENT` или `ACTIVE`.
 
 ---
 
@@ -825,6 +858,8 @@ Steam Guard должен быть включён.
 
 Активная аренда не может существовать без успешной оплаты.
 
+Credentials не возвращаются из `POST /rentals` или `POST /payments/webhook`; они выдаются только владельцу через `GET /api/v1/me/rentals/{rentalId}/credentials` и только пока rental остаётся `ACTIVE`.
+
 ---
 
 После завершения аренды пользователь обязан потерять доступ к аккаунту.
@@ -842,6 +877,8 @@ Steam Guard должен быть включён.
 ---
 
 Возврат не может превышать сумму первоначального платежа.
+
+Refund/deposit ledger пока не реализован в backend; это правило остаётся целевым ограничением для будущего ledger, а не текущим исполняемым flow.
 
 ---
 

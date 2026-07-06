@@ -14,10 +14,12 @@ web/*.tsbuildinfo
 .codex/
 
 # Claude Flow runtime data
-.claude-flow/data/
-.claude-flow/logs/
-
+.claude-flow
+.agents
+.swarm
 # Environment variables
 .env
 .env.local
 .env.*.local
+
+AGENTS.md

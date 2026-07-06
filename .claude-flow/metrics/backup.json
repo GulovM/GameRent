@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-07-05T17:04:11.650Z",
-  "backedUp": false,
-  "sizeBytes": 0,
-  "rotatedAway": 0,
-  "skipped": "better-sqlite3 unavailable"
+  "timestamp": "2026-07-06T17:53:28.517Z",
+  "backedUp": true,
+  "path": "D:\\Desktop\\Go\\humo\\RentGameAccs\\.swarm\\backups\\memory-2026-07-06T17-53-28-415Z.db",
+  "sizeBytes": 737280,
+  "rotatedAway": 0
 }

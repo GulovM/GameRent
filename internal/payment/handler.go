@@ -2,6 +2,7 @@ package payment
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -59,31 +60,30 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.service.ProcessWebhook(r.Context(), req, clientIP, userAgent)
 	if err != nil {
-		if err == ErrPaymentAlreadyProcessed {
-
-			h.log.Warn("payment already processed", zap.String("payment_id", req.PaymentID))
-			shared_response.JSON(w, http.StatusOK, WebhookResponse{
-				Status:  "success",
-				Message: "Payment already processed",
-			})
+		h.log.Error("failed to process payment webhook", zap.Error(err))
+		if errors.Is(err, ErrWebhookMissingIdentifier) || errors.Is(err, ErrWebhookMissingExternalTxID) {
+			shared_response.Error(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 			return
 		}
-
-		h.log.Error("failed to process payment webhook", zap.Error(err))
+		if errors.Is(err, ErrPaymentNotFound) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Payment not found")
+			return
+		}
+		if errors.Is(err, ErrWebhookNotSuccessful) || errors.Is(err, ErrWebhookInvalidTransition) || errors.Is(err, ErrWebhookExternalTxMismatch) {
+			shared_response.Error(w, http.StatusConflict, "PAYMENT_FAILED", err.Error())
+			return
+		}
 		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 
-	res := WebhookResponse{
-		Status: "success",
-		Credentials: &CredentialsPayload{
-			Login:     result.SteamLogin,
-			Password:  result.SteamPassword,
-			SteamID64: result.SteamID64,
-		},
+	if result.Idempotent {
+		h.log.Info("payment webhook replay processed idempotently", zap.String("payment_id", req.PaymentID))
 	}
-
-	shared_response.JSON(w, http.StatusOK, res)
+	shared_response.JSON(w, http.StatusOK, WebhookResponse{
+		Status:  "success",
+		Message: "Payment processed",
+	})
 }
 
 func getClientIP(r *http.Request) string {

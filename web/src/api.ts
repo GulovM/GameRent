@@ -64,9 +64,27 @@ export type Rental = {
   status: number;
   started_at: string;
   expires_at: string;
+  payment_expires_at?: string;
   rental_price: Money;
   security_deposit: Money;
+  deposit_status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | string;
   total_price: Money;
+};
+
+export type FinancialBalance = {
+  available_balance: number;
+  currency: string;
+};
+
+export type LedgerEntry = {
+  id: number;
+  entry_type: number;
+  amount: number;
+  currency: string;
+  rental_id?: number;
+  payment_id?: number;
+  created_at: string;
+  display_type: string;
 };
 
 export type Payment = {
@@ -76,6 +94,23 @@ export type Payment = {
   currency: string;
   status: number | string;
   created_at?: string;
+};
+
+export type RentalCredentials = {
+  login: string;
+  password: string;
+};
+
+export type WalletPaymentResponse = {
+  changed: boolean;
+  idempotent: boolean;
+  payment_id: number;
+  rental_id: number;
+  account_id: number;
+  payment_status: number;
+  rental_status: number;
+  account_status: number;
+  payment_provider: string;
 };
 
 export type NotificationItem = {
@@ -124,6 +159,22 @@ export type LoginPayload = {
 
 export type Query = Record<string, string | number | boolean | undefined | null>;
 
+export class ApiError extends Error {
+  status: number;
+  code: string;
+
+  constructor(message: string, status: number, code = "UNKNOWN_ERROR") {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return error instanceof ApiError;
+}
+
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 const ACCESS_KEY = "gamerent.access";
 const REFRESH_KEY = "gamerent.refresh";
@@ -167,7 +218,7 @@ async function request<T>(path: string, options: RequestInit = {}, query?: Query
 
   if (!response.ok || envelope.success === false) {
     const message = envelope.error?.message || `HTTP ${response.status}`;
-    throw new Error(message);
+    throw new ApiError(message, response.status, envelope.error?.code);
   }
 
   return envelope.data as T;
@@ -200,6 +251,12 @@ export const api = {
   },
   me() {
     return request<User>("/api/v1/auth/me");
+  },
+  myBalance() {
+    return request<FinancialBalance>("/api/v1/me/balance");
+  },
+  myLedger(query?: Query) {
+    return request<{ entries: LedgerEntry[]; pagination: Pagination }>("/api/v1/me/ledger", {}, query);
   },
   updateUser(id: number, payload: { first_name: string; last_name: string }) {
     return request<User>(`/api/v1/users/${id}`, {
@@ -241,6 +298,12 @@ export const api = {
   },
   rental(id: number) {
     return request<Rental>(`/api/v1/rentals/${id}`);
+  },
+  rentalCredentials(id: number) {
+    return request<RentalCredentials>(`/api/v1/me/rentals/${id}/credentials`);
+  },
+  payRentalWithBalance(id: number) {
+    return request<WalletPaymentResponse>(`/api/v1/me/rentals/${id}/pay-with-balance`, { method: "POST" });
   },
   cancelRental(id: number) {
     return request<{ message: string }>(`/api/v1/rentals/${id}/cancel`, { method: "POST" });

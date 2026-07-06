@@ -816,6 +816,11 @@ td select {
   border-radius: 8px;
 }
 
+.rental-row.selected {
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+
 .row-icon {
   display: inline-flex;
   align-items: center;
@@ -834,6 +839,84 @@ td select {
 
 .rental-row p {
   margin-bottom: 0;
+}
+
+.rental-meta,
+.detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.rental-detail-card {
+  margin-top: 20px;
+  padding: 22px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.wallet-payment-panel {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 18px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.wallet-payment-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.wallet-payment-state {
+  display: grid;
+  gap: 10px;
+}
+
+.wallet-payment-hint {
+  margin: 0;
+  color: var(--muted);
+}
+
+.rental-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.detail-item {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.detail-item span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.credentials-box {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 16px;
+  background: rgba(43, 179, 163, 0.08);
+  border: 1px solid rgba(43, 179, 163, 0.3);
+  border-radius: 8px;
+}
+
+.error-text {
+  color: #ffd8d8;
 }
 
 .split-workspace {
@@ -973,6 +1056,38 @@ td small {
   display: grid;
   align-content: start;
   gap: 14px;
+}
+
+.balance-panel-value {
+  margin-top: 16px;
+  font-size: 28px;
+  font-weight: 800;
+}
+
+.ledger-list {
+  display: grid;
+  gap: 12px;
+}
+
+.ledger-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ledger-row:last-child {
+  border-bottom: 0;
+}
+
+.ledger-row-side {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+  color: var(--muted);
+  text-align: right;
 }
 
 .profile-form label,
@@ -1326,6 +1441,14 @@ td small {
 
   .rental-row {
     display: flex;
+  }
+
+  .rental-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .wallet-payment-summary {
+    grid-template-columns: 1fr;
   }
 
   .row-actions,

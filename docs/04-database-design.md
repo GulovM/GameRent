@@ -556,6 +556,7 @@ INDEX(account_id)
 | end_at              | TIMESTAMP      | Окончание аренды         |
 | rental_price        | BIGINT         | Стоимость аренды         |
 | deposit_amount      | BIGINT         | Размер депозита          |
+| payment_expires_at  | TIMESTAMP      | Дедлайн оплаты           |
 | actual_finished_at  | TIMESTAMP NULL | Фактическое завершение   |
 | cancellation_reason | TEXT NULL      | Причина отмены           |
 | created_at          | TIMESTAMP      | Создание записи          |
@@ -603,12 +604,12 @@ CHECK(deposit_amount >= 0)
 ## Partial Unique Index
 
 ```sql
-CREATE UNIQUE INDEX uq_active_account_rental
+CREATE UNIQUE INDEX uq_rental_account_waiting_or_active
 ON rentals(account_id)
-WHERE status = 2;
+WHERE status IN (1, 2);
 ```
 
-Данный индекс гарантирует невозможность существования двух активных аренд одного аккаунта одновременно.
+Данный индекс гарантирует невозможность существования двух `WAITING_PAYMENT`/`ACTIVE` аренд одного аккаунта одновременно.
 
 ---
 
@@ -653,6 +654,7 @@ INDEX(end_at)
 | rental_id               | BIGINT         |
 | user_id                 | BIGINT         |
 | payment_type            | SMALLINT       |
+| provider                | TEXT           |
 | status                  | SMALLINT       |
 | amount                  | BIGINT         |
 | currency                | CHAR(3)        |
@@ -678,10 +680,11 @@ INDEX(end_at)
 | Value | Meaning    |
 | ----: | ---------- |
 |     0 | Created    |
-|     1 | Processing |
+|     1 | Pending    |
 |     2 | Success    |
 |     3 | Failed     |
-|     4 | Refunded   |
+
+В текущем rental lifecycle используются `Pending`, `Success` и `Failed`. Отдельный refund/deposit ledger пока не реализован.
 
 ---
 
@@ -691,6 +694,9 @@ INDEX(end_at)
 CHECK(amount > 0)
 
 CHECK(currency IN ('USD','EUR','RUB','TJS'))
+
+UNIQUE(provider, external_transaction_id)
+WHERE external_transaction_id IS NOT NULL
 ```
 
 ---
@@ -718,6 +724,8 @@ INDEX(status)
 
 INDEX(payment_type)
 ```
+
+`provider` и `external_transaction_id` используются для идемпотентной обработки payment webhook.
 
 ---
 

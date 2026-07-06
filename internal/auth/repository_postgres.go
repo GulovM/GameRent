@@ -49,7 +49,7 @@ func (r *PostgresRepository) GetUserByEmail(ctx context.Context, email string) (
 	query := `SELECT id, email, password_hash, COALESCE(first_name, ''), COALESCE(last_name, ''), role, email_verified, is_blocked, created_at, updated_at, deleted_at FROM users WHERE email = $1 AND deleted_at IS NULL`
 	var u User
 	err := db.QueryRow(ctx, query, email).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.FirstName, &u.LastName, &u.Role, &u.EmailVerified, &u.IsBlocked, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
 	if err != nil {
@@ -63,7 +63,7 @@ func (r *PostgresRepository) GetUserByID(ctx context.Context, id int64) (*User, 
 	query := `SELECT id, email, password_hash, COALESCE(first_name, ''), COALESCE(last_name, ''), role, email_verified, is_blocked, created_at, updated_at, deleted_at FROM users WHERE id = $1 AND deleted_at IS NULL`
 	var u User
 	err := db.QueryRow(ctx, query, id).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.FirstName, &u.LastName, &u.Role, &u.EmailVerified, &u.IsBlocked, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
 	if err != nil {
@@ -93,7 +93,7 @@ func (r *PostgresRepository) GetRefreshToken(ctx context.Context, tokenHash stri
 	query := `SELECT id, user_id, token_hash, expires_at, revoked_at, created_at FROM refresh_tokens WHERE token_hash = $1`
 	var token RefreshToken
 	err := db.QueryRow(ctx, query, tokenHash).Scan(&token.ID, &token.UserID, &token.TokenHash, &token.ExpiresAt, &token.RevokedAt, &token.CreatedAt)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRefreshTokenNotFound
 	}
 	if err != nil {

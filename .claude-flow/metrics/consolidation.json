@@ -1,16 +1,25 @@
 {
-  "timestamp": "2026-07-05T17:00:11.644Z",
+  "timestamp": "2026-07-06T18:53:28.376Z",
   "distillationEnabled": true,
-  "patternsConsolidated": 0,
-  "memoryCleaned": 0,
+  "patternsConsolidated": 6,
+  "memoryCleaned": 6,
   "duplicatesRemoved": 0,
-  "episodes": 0,
-  "patternEmbeddings": 0,
-  "causalEdges": 0,
+  "episodes": 6,
+  "patternEmbeddings": 6,
+  "causalEdges": 2,
   "promoted": 0,
-  "byProvenance": {},
-  "namespaces": [],
+  "byProvenance": {
+    "proxy:structural": 6
+  },
+  "namespaces": [
+    "gamerent/frontend-patterns",
+    "gamerent/go-patterns",
+    "gamerent/database-patterns",
+    "gamerent/decisions",
+    "gamerent/api-contracts",
+    "gamerent/domain-invariants",
+    "gamerent/security"
+  ],
   "dryRun": false,
-  "corrupt": false,
-  "skipped": "better-sqlite3 unavailable"
+  "corrupt": false
 }

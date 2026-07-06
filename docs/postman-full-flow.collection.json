@@ -1,0 +1,1559 @@
+{
+  "info": {
+    "_postman_id": "4d4deed2-40ef-43bd-a20f-f2ae4cc6f7a1",
+    "name": "GameRent Full Flow",
+    "description": "Полный сценарий для текущей реализации GameRent: регистрация, логин, каталог, admin-пополнение баланса, создание аренды, webhook-активация, получение Steam credentials. Важно: для happy-path нужен admin-шаг с пополнением balance, потому что публичного top-up endpoint сейчас нет.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080/api/v1"
+    },
+    {
+      "key": "userEmail",
+      "value": "user1@example.com"
+    },
+    {
+      "key": "userPassword",
+      "value": "Testpass123"
+    },
+    {
+      "key": "firstName",
+      "value": "Ivan"
+    },
+    {
+      "key": "lastName",
+      "value": "Petrov"
+    },
+    {
+      "key": "accessToken",
+      "value": ""
+    },
+    {
+      "key": "refreshToken",
+      "value": ""
+    },
+    {
+      "key": "userId",
+      "value": ""
+    },
+    {
+      "key": "adminEmail",
+      "value": "admin@example.com"
+    },
+    {
+      "key": "adminPassword",
+      "value": "Adminpass123"
+    },
+    {
+      "key": "adminAccessToken",
+      "value": ""
+    },
+    {
+      "key": "accountId",
+      "value": "1"
+    },
+    {
+      "key": "steamId64",
+      "value": "76561198000000000"
+    },
+    {
+      "key": "steamLogin",
+      "value": "steam_test_login"
+    },
+    {
+      "key": "steamPassword",
+      "value": "steam_test_password"
+    },
+    {
+      "key": "pricePerHour",
+      "value": "500"
+    },
+    {
+      "key": "securityDeposit",
+      "value": "1000"
+    },
+    {
+      "key": "durationHours",
+      "value": "4"
+    },
+    {
+      "key": "topupBalance",
+      "value": "100000"
+    },
+    {
+      "key": "rentalId",
+      "value": ""
+    },
+    {
+      "key": "paymentId",
+      "value": ""
+    },
+    {
+      "key": "externalTransactionId",
+      "value": "tx-1001"
+    },
+    {
+      "key": "paymentWebhookSecret",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Start Here - Full Program Path",
+      "description": "Основной сквозной сценарий работы программы. Иди сверху вниз: сначала логин админа и создание игрового аккаунта, потом регистрация арендатора, пополнение баланса, создание аренды, webhook-активация и получение credentials.",
+      "item": [
+        {
+          "name": "Step 1 - Admin Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{adminEmail}}\",\n  \"password\": \"{{adminPassword}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Админ нужен для добавления нового игрового аккаунта и пополнения баланса арендатору."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.access_token) {",
+                  "  pm.collectionVariables.set('adminAccessToken', json.data.access_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Step 2 - Admin Create Game Account",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"steam_id64\": \"{{steamId64}}\",\n  \"steam_login\": \"{{steamLogin}}\",\n  \"steam_password\": \"{{steamPassword}}\",\n  \"price_per_hour\": {{pricePerHour}},\n  \"security_deposit\": {{securityDeposit}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts"
+              ]
+            },
+            "description": "Создание нового игрового аккаунта. Сервер шифрует Steam-пароль, создаёт запись в accounts и пытается синхронизировать библиотеку."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.id) {",
+                  "  pm.collectionVariables.set('accountId', String(json.data.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Step 3 - Admin Sync Account Library",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts/{{accountId}}/sync",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts",
+                "{{accountId}}",
+                "sync"
+              ]
+            },
+            "description": "Явная синхронизация библиотеки Steam. Полезно, если при создании аккаунта сервер вернул sync_error."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 4 - Register Rent User",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{userEmail}}\",\n  \"password\": \"{{userPassword}}\",\n  \"first_name\": \"{{firstName}}\",\n  \"last_name\": \"{{lastName}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "register"
+              ]
+            },
+            "description": "Регистрация арендатора. В текущей реализации email сразу считается подтверждённым."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data) {",
+                  "  if (json.data.access_token) pm.collectionVariables.set('accessToken', json.data.access_token);",
+                  "  if (json.data.refresh_token) pm.collectionVariables.set('refreshToken', json.data.refresh_token);",
+                  "  if (json.data.user && json.data.user.id) pm.collectionVariables.set('userId', String(json.data.user.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Step 5 - Admin Top Up User Balance",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"balance\": {{topupBalance}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/admin/users/{{userId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "users",
+                "{{userId}}"
+              ]
+            },
+            "description": "Обязательный шаг. Без положительного balance пользователь не сможет создать rental."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 6 - Check Public Account Availability",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/accounts/{{accountId}}/availability",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "accounts",
+                "{{accountId}}",
+                "availability"
+              ]
+            },
+            "description": "Публичная проверка, доступен ли игровой аккаунт для аренды."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 7 - Calculate Rental",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": {{accountId}},\n  \"duration_hours\": {{durationHours}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/rentals/calculate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "rentals",
+                "calculate"
+              ]
+            },
+            "description": "Расчёт цены аренды и депозита перед фактическим созданием rental."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 8 - Create Rental",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": {{accountId}},\n  \"duration_hours\": {{durationHours}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/rentals",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "rentals"
+              ]
+            },
+            "description": "Создаёт rental в статусе WaitingPayment. Одновременно создаётся pending payment, а аккаунт резервируется."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.id) {",
+                  "  pm.collectionVariables.set('rentalId', String(json.data.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Step 9 - Load Payment For Rental",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/payments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "payments"
+              ]
+            },
+            "description": "Находит payment, который был автоматически создан при POST /rentals, и сохраняет paymentId."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && Array.isArray(json.data.payments)) {",
+                  "  var rentalId = pm.collectionVariables.get('rentalId');",
+                  "  var found = json.data.payments.find(function (p) { return String(p.rental_id) === String(rentalId); });",
+                  "  if (found && found.id) pm.collectionVariables.set('paymentId', String(found.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Step 10 - Payment Webhook Success",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Payment-Signature",
+                "value": "{{paymentSignature}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{{webhookPayload}}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/payments/webhook",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "payments",
+                "webhook"
+              ]
+            },
+            "description": "Активирует payment, rental и account. После этого rental становится ACTIVE, а аккаунт уходит в RENTED."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var secret = pm.collectionVariables.get('paymentWebhookSecret');",
+                  "var payload = JSON.stringify({",
+                  "  payment_id: pm.collectionVariables.get('paymentId'),",
+                  "  rental_id: pm.collectionVariables.get('rentalId'),",
+                  "  external_transaction_id: pm.collectionVariables.get('externalTransactionId'),",
+                  "  status: 'success'",
+                  "});",
+                  "pm.variables.set('webhookPayload', payload);",
+                  "if (secret) {",
+                  "  var sig = CryptoJS.HmacSHA256(payload, secret).toString(CryptoJS.enc.Hex);",
+                  "  pm.variables.set('paymentSignature', sig);",
+                  "} else {",
+                  "  pm.variables.set('paymentSignature', '');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Step 11 - Get Rental Credentials",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/me/rentals/{{rentalId}}/credentials",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "me",
+                "rentals",
+                "{{rentalId}}",
+                "credentials"
+              ]
+            },
+            "description": "Главная точка, через которую пользователь вытаскивает данные доступа к игровому аккаунту. Работает только для owner + ACTIVE rental."
+          },
+          "response": []
+        },
+        {
+          "name": "Step 12 - Replay Webhook Idempotently",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Payment-Signature",
+                "value": "{{paymentSignature}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{{webhookPayload}}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/payments/webhook",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "payments",
+                "webhook"
+              ]
+            },
+            "description": "Проверка идемпотентности webhook: повтор того же external_transaction_id не должен ломать состояние."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "1. Auth",
+      "item": [
+        {
+          "name": "Register User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('register status is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data) {",
+                  "  if (json.data.access_token) pm.collectionVariables.set('accessToken', json.data.access_token);",
+                  "  if (json.data.refresh_token) pm.collectionVariables.set('refreshToken', json.data.refresh_token);",
+                  "  if (json.data.user && json.data.user.id) pm.collectionVariables.set('userId', String(json.data.user.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{userEmail}}\",\n  \"password\": \"{{userPassword}}\",\n  \"first_name\": \"{{firstName}}\",\n  \"last_name\": \"{{lastName}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "register"
+              ]
+            },
+            "description": "Создаёт RENT-пользователя, сразу возвращает access/refresh token. Если email уже существует, будет 409."
+          },
+          "response": []
+        },
+        {
+          "name": "Login User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('login status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data) {",
+                  "  if (json.data.access_token) pm.collectionVariables.set('accessToken', json.data.access_token);",
+                  "  if (json.data.refresh_token) pm.collectionVariables.set('refreshToken', json.data.refresh_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{userEmail}}\",\n  \"password\": \"{{userPassword}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Refresh Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('refresh status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data) {",
+                  "  if (json.data.access_token) pm.collectionVariables.set('accessToken', json.data.access_token);",
+                  "  if (json.data.refresh_token) pm.collectionVariables.set('refreshToken', json.data.refresh_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refreshToken}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "refresh"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Auth Me",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "me"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. Catalog",
+      "item": [
+        {
+          "name": "List Games",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/games?page=1&page_size=20&search=",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "games"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "page_size",
+                  "value": "20"
+                },
+                {
+                  "key": "search",
+                  "value": ""
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List Accounts",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/accounts?page=1&page_size=20&status=Available",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "accounts"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "page_size",
+                  "value": "20"
+                },
+                {
+                  "key": "status",
+                  "value": "Available"
+                }
+              ]
+            },
+            "description": "Выбери account_id из ответа и запиши его в collection variable accountId, если не используешь id=1."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Account Details",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/accounts/{{accountId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "accounts",
+                "{{accountId}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Check Account Availability",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/accounts/{{accountId}}/availability",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "accounts",
+                "{{accountId}}",
+                "availability"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Calculate Rental",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": {{accountId}},\n  \"duration_hours\": {{durationHours}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/rentals/calculate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "rentals",
+                "calculate"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Admin Prerequisites",
+      "item": [
+        {
+          "name": "Admin Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('admin login status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.access_token) {",
+                  "  pm.collectionVariables.set('adminAccessToken', json.data.access_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{adminEmail}}\",\n  \"password\": \"{{adminPassword}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Этот пользователь должен иметь роль ADMIN. Обычно это зависит от ADMIN_EMAILS на сервере."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin Create Game Account",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('admin create account status is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.id) {",
+                  "  pm.collectionVariables.set('accountId', String(json.data.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"steam_id64\": \"{{steamId64}}\",\n  \"steam_login\": \"{{steamLogin}}\",\n  \"steam_password\": \"{{steamPassword}}\",\n  \"price_per_hour\": {{pricePerHour}},\n  \"security_deposit\": {{securityDeposit}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts"
+              ]
+            },
+            "description": "Главная admin-ручка для добавления нового игрового аккаунта. Пароль Steam шифруется, запись создаётся в таблице accounts, затем сервер пытается синхронизировать библиотеку Steam и возвращает id нового аккаунта."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin List Accounts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Admin Sync Account Library",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts/{{accountId}}/sync",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts",
+                "{{accountId}}",
+                "sync"
+              ]
+            },
+            "description": "Принудительная синхронизация библиотеки Steam для уже созданного аккаунта."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin List Users",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/admin/users",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "users"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Admin Top Up User Balance",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"balance\": {{topupBalance}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/admin/users/{{userId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "users",
+                "{{userId}}"
+              ]
+            },
+            "description": "Обязательный шаг для happy-path. Без положительного balance POST /rentals вернёт insufficient balance."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3A. Only Admin Account Flow",
+      "description": "Короткая ветка только для администратора: залогиниться, создать новый игровой аккаунт, проверить его наличие и при необходимости пересинхронизировать библиотеку Steam.",
+      "item": [
+        {
+          "name": "Admin Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{adminEmail}}\",\n  \"password\": \"{{adminPassword}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.access_token) {",
+                  "  pm.collectionVariables.set('adminAccessToken', json.data.access_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Create Game Account",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"steam_id64\": \"{{steamId64}}\",\n  \"steam_login\": \"{{steamLogin}}\",\n  \"steam_password\": \"{{steamPassword}}\",\n  \"price_per_hour\": {{pricePerHour}},\n  \"security_deposit\": {{securityDeposit}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.id) {",
+                  "  pm.collectionVariables.set('accountId', String(json.data.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "List Accounts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Sync Account Library",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminAccessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/admin/accounts/{{accountId}}/sync",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "accounts",
+                "{{accountId}}",
+                "sync"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Rental Flow",
+      "item": [
+        {
+          "name": "Create Rental",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('create rental status is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && json.data.id) {",
+                  "  pm.collectionVariables.set('rentalId', String(json.data.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": {{accountId}},\n  \"duration_hours\": {{durationHours}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/rentals",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "rentals"
+              ]
+            },
+            "description": "Создаёт rental в статусе WaitingPayment и pending payment внутри транзакции. Credentials здесь не возвращаются."
+          },
+          "response": []
+        },
+        {
+          "name": "List My Rentals",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/me/rentals",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "me",
+                "rentals"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Rental",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/rentals/{{rentalId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "rentals",
+                "{{rentalId}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List My Payments",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('list payments status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "if (json && json.success && json.data && Array.isArray(json.data.payments)) {",
+                  "  var rentalId = pm.collectionVariables.get('rentalId');",
+                  "  var found = json.data.payments.find(function (p) { return String(p.rental_id) === String(rentalId); });",
+                  "  if (found && found.id) pm.collectionVariables.set('paymentId', String(found.id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/payments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "payments"
+              ]
+            },
+            "description": "После Create Rental вытаскивает paymentId для текущего rental и сохраняет его в collection variable."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Payment",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/payments/{{paymentId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "payments",
+                "{{paymentId}}"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "5. Activation And Credentials",
+      "item": [
+        {
+          "name": "Payment Webhook Success",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var secret = pm.collectionVariables.get('paymentWebhookSecret');",
+                  "var payload = JSON.stringify({",
+                  "  payment_id: pm.collectionVariables.get('paymentId'),",
+                  "  rental_id: pm.collectionVariables.get('rentalId'),",
+                  "  external_transaction_id: pm.collectionVariables.get('externalTransactionId'),",
+                  "  status: 'success'",
+                  "});",
+                  "pm.variables.set('webhookPayload', payload);",
+                  "if (secret) {",
+                  "  var sig = CryptoJS.HmacSHA256(payload, secret).toString(CryptoJS.enc.Hex);",
+                  "  pm.variables.set('paymentSignature', sig);",
+                  "} else {",
+                  "  pm.variables.set('paymentSignature', '');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Payment-Signature",
+                "value": "{{paymentSignature}}",
+                "disabled": false
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{{webhookPayload}}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/payments/webhook",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "payments",
+                "webhook"
+              ]
+            },
+            "description": "Активирует payment/rental/account. Если paymentWebhookSecret пустой, коллекция всё равно сработает с текущей реализацией сервиса."
+          },
+          "response": []
+        },
+        {
+          "name": "Replay Same Webhook Idempotently",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Payment-Signature",
+                "value": "{{paymentSignature}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{{webhookPayload}}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/payments/webhook",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "payments",
+                "webhook"
+              ]
+            },
+            "description": "Повтор того же webhook должен пройти идемпотентно."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Rental Credentials",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/me/rentals/{{rentalId}}/credentials",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "me",
+                "rentals",
+                "{{rentalId}}",
+                "credentials"
+              ]
+            },
+            "description": "Это главный owner-only endpoint для вытаскивания данных доступа к арендованному игровому аккаунту. Сработает только если rental ACTIVE, payment успешен, rental не истекла и текущий пользователь является владельцем."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Notifications",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notifications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "notifications"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6. Optional Negative Checks",
+      "item": [
+        {
+          "name": "Cancel Rental Before Payment Only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/rentals/{{rentalId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "rentals",
+                "{{rentalId}}",
+                "cancel"
+              ]
+            },
+            "description": "Нормально работает только для WAITING_PAYMENT. После webhook-активации ожидается конфликт."
+          },
+          "response": []
+        },
+        {
+          "name": "Extend Active Rental",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{accessToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"duration_hours\": 2\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/rentals/{{rentalId}}/extend",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "rentals",
+                "{{rentalId}}",
+                "extend"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

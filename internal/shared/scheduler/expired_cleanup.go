@@ -12,7 +12,7 @@ import (
 
 type ExpiredCleanupRepository interface {
 	GetExpiredRentals(ctx context.Context, now time.Time) ([]repo.ExpiredRental, error)
-	ExpireRental(ctx context.Context, rentalID, accountID int64) error
+	ExpireRental(ctx context.Context, rentalID, accountID int64, now time.Time) (bool, error)
 }
 
 func NewExpiredCleanupWorker(
@@ -42,11 +42,17 @@ func NewExpiredCleanupWorker(
 				zap.Int64("account_id", rental.AccountID),
 			)
 
-			err := r.ExpireRental(ctx, rental.ID, rental.AccountID)
+			changed, err := r.ExpireRental(ctx, rental.ID, rental.AccountID, now)
 			if err != nil {
 				log.Error("failed to expire rental",
 					zap.Int64("rental_id", rental.ID),
 					zap.Error(err),
+				)
+				continue
+			}
+			if !changed {
+				log.Info("expired rental already processed",
+					zap.Int64("rental_id", rental.ID),
 				)
 				continue
 			}

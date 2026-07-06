@@ -134,7 +134,7 @@ func (r *PostgresRepository) GetAccount(ctx context.Context, id int64) (*Account
 		&a.InventoryVerified, &a.LastSecurityCheck, &hourlyPriceVal, &depositAmountVal,
 		&a.ProfileURL, &a.AvatarURL, &a.LibrarySyncedAt, &a.CreatedAt, &a.UpdatedAt, &a.DeletedAt, &steamID64,
 	)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrAccountNotFound
 	}
 	if err != nil {
@@ -190,7 +190,7 @@ func (r *PostgresRepository) GetAccountForUpdate(ctx context.Context, id int64) 
 		&a.InventoryVerified, &a.LastSecurityCheck, &hourlyPriceVal, &depositAmountVal,
 		&a.ProfileURL, &a.AvatarURL, &a.LibrarySyncedAt, &a.CreatedAt, &a.UpdatedAt, &a.DeletedAt, &steamID64,
 	)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrAccountNotFound
 	}
 	if err != nil {
@@ -288,7 +288,7 @@ func (r *PostgresRepository) SyncAccountGames(ctx context.Context, accountID int
 	for _, ag := range games {
 		var existID int64
 		err := db.QueryRow(ctx, `SELECT id FROM games WHERE id = $1`, ag.Game.ID).Scan(&existID)
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			devBytes, _ := json.Marshal(ag.Game.Developers)
 			pubBytes, _ := json.Marshal(ag.Game.Publishers)
 			genBytes, _ := json.Marshal(ag.Game.Genres)
