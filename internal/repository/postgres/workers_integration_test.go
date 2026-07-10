@@ -76,7 +76,7 @@ func setupWorkersTestDB(t *testing.T) (*pkg_postgres_pool.ConnectionPool, databa
 		t.Fatalf("failed to run migrations: %v", err)
 	}
 
-	_, _ = poolConn.Pool.Exec(ctx, "TRUNCATE financial_ledger_entries, deposit_holds")
+	_, _ = poolConn.Pool.Exec(ctx, "TRUNCATE refunds, financial_ledger_entries, deposit_holds")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM payments")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM security_events")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM audit_logs")

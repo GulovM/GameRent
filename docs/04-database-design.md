@@ -633,16 +633,9 @@ INDEX(end_at)
 
 ## Purpose
 
-Хранит все финансовые операции системы.
+Хранит одну платёжную запись на аренду и её provider metadata.
 
-Одна аренда может иметь несколько платежей.
-
-Например:
-
-* оплата аренды;
-* удержание депозита;
-* возврат депозита;
-* полный возврат средств.
+Фактические денежные факты и settlement-операции отдельно фиксируются в `financial_ledger_entries`, `deposit_holds` и `refunds`. Изменения доступного внутреннего баланса пользователя отражаются в `users.balance` и сопровождаются append-only ledger entries.
 
 ---
 
@@ -664,17 +657,6 @@ INDEX(end_at)
 
 ---
 
-## Payment Types
-
-| Value | Meaning         |
-| ----: | --------------- |
-|     0 | Rental Payment  |
-|     1 | Deposit Hold    |
-|     2 | Deposit Release |
-|     3 | Refund          |
-
----
-
 ## Status
 
 | Value | Meaning    |
@@ -684,7 +666,7 @@ INDEX(end_at)
 |     2 | Success    |
 |     3 | Failed     |
 
-В текущем rental lifecycle используются `Pending`, `Success` и `Failed`. Отдельный refund/deposit ledger пока не реализован.
+В текущем rental lifecycle используются только `Pending`, `Success` и `Failed`. Wallet refund не создаёт отдельный `payment.status = REFUNDED`: refund фиксируется в `refunds` и immutable ledger.
 
 ---
 
@@ -722,10 +704,186 @@ INDEX(user_id)
 
 INDEX(status)
 
-INDEX(payment_type)
+UNIQUE(rental_id)
 ```
 
-`provider` и `external_transaction_id` используются для идемпотентной обработки payment webhook.
+`provider` и `external_transaction_id` используются для идемпотентной обработки provider webhook. Для wallet payment `provider = balance`, а `external_transaction_id` не подменяется фиктивным provider ID.
+
+---
+
+# 12.1 Table: financial_ledger_entries
+
+## Purpose
+
+Append-only журнал финансовых фактов.
+
+Используется для:
+
+* `PROVIDER_PAYMENT_RECEIVED`;
+* `DEPOSIT_HELD`;
+* `DEPOSIT_RELEASED_TO_BALANCE`;
+* `DEPOSIT_FORFEITED`;
+* `BALANCE_DEBIT`;
+* `BALANCE_REFUND_CREDIT`;
+* `DEPOSIT_REFUND_CREDIT`.
+
+Все суммы хранятся в integer minor units (`BIGINT`). `float32/float64` для денег не используются.
+
+## Columns
+
+| Column                  | Type      |
+| ----------------------- | --------- |
+| id                      | BIGSERIAL |
+| entry_type              | SMALLINT  |
+| user_id                 | BIGINT    |
+| rental_id               | BIGINT    |
+| payment_id              | BIGINT    |
+| account_id              | BIGINT    |
+| amount                  | BIGINT    |
+| currency                | CHAR(3)   |
+| provider                | TEXT NULL |
+| external_transaction_id | TEXT NULL |
+| idempotency_key         | TEXT      |
+| correlation_id          | TEXT NULL |
+| metadata                | JSONB     |
+| created_at              | TIMESTAMP |
+
+## Constraints and indexes
+
+```sql
+CHECK(amount > 0)
+
+UNIQUE(idempotency_key)
+
+INDEX(user_id, created_at DESC)
+INDEX(rental_id, created_at)
+INDEX(payment_id)
+INDEX(provider, external_transaction_id)
+INDEX(correlation_id)
+INDEX(entry_type, created_at)
+```
+
+`financial_ledger_entries` защищена trigger-функцией append-only: `UPDATE` и `DELETE` запрещены на уровне PostgreSQL.
+
+---
+
+# 12.2 Table: deposit_holds
+
+## Purpose
+
+Хранит состояние удержанного депозита по аренде.
+
+`deposit_holds` создаётся только если `deposit_amount > 0`. Для нулевого депозита запись не создаётся.
+
+## Status
+
+| Value | Meaning   |
+| ----: | --------- |
+|     1 | HELD      |
+|     2 | RELEASED  |
+|     3 | FORFEITED |
+|     4 | REFUNDED  |
+
+`REFUNDED` является terminal state и взаимоисключающим с `RELEASED` и `FORFEITED`.
+
+## Columns
+
+| Column         | Type           |
+| -------------- | -------------- |
+| id             | BIGSERIAL      |
+| rental_id      | BIGINT         |
+| user_id        | BIGINT         |
+| payment_id     | BIGINT NULL    |
+| amount         | BIGINT         |
+| currency       | CHAR(3)        |
+| status         | SMALLINT       |
+| held_at        | TIMESTAMP NULL |
+| released_at    | TIMESTAMP NULL |
+| forfeited_at   | TIMESTAMP NULL |
+| refunded_at    | TIMESTAMP NULL |
+| refund_id      | BIGINT NULL    |
+| idempotency_key | TEXT          |
+| created_at     | TIMESTAMP      |
+| updated_at     | TIMESTAMP      |
+
+## Constraints and indexes
+
+```sql
+UNIQUE(rental_id)
+UNIQUE(idempotency_key)
+
+INDEX(user_id, status)
+INDEX(status, updated_at)
+INDEX(payment_id)
+INDEX(refund_id)
+```
+
+---
+
+# 12.3 Table: refunds
+
+## Purpose
+
+Хранит refund aggregate для уже обработанных wallet refund requests.
+
+На текущем этапе реализован только full refund для wallet-paid rentals по admin/system flow.
+
+## Columns
+
+| Column               | Type           |
+| -------------------- | -------------- |
+| id                   | BIGSERIAL      |
+| payment_id           | BIGINT         |
+| rental_id            | BIGINT         |
+| user_id              | BIGINT         |
+| account_id           | BIGINT NULL    |
+| source_type          | SMALLINT       |
+| refund_kind          | SMALLINT       |
+| status               | SMALLINT       |
+| reason_code          | TEXT           |
+| requested_by_user_id | BIGINT NULL    |
+| requested_by_role    | TEXT           |
+| amount_principal     | BIGINT         |
+| amount_deposit       | BIGINT         |
+| amount_total         | BIGINT         |
+| currency             | CHAR(3)        |
+| idempotency_key      | TEXT           |
+| correlation_id       | TEXT NULL      |
+| metadata             | JSONB          |
+| processed_at         | TIMESTAMP NULL |
+| created_at           | TIMESTAMP      |
+| updated_at           | TIMESTAMP      |
+
+## Status
+
+| Value | Meaning   |
+| ----: | --------- |
+|     1 | REQUESTED |
+|     2 | COMPLETED |
+|     3 | FAILED    |
+
+## Constraints and indexes
+
+```sql
+CHECK(amount_principal >= 0)
+CHECK(amount_deposit >= 0)
+CHECK(amount_total > 0)
+CHECK(amount_total = amount_principal + amount_deposit)
+
+UNIQUE(idempotency_key)
+
+INDEX(user_id, created_at DESC)
+INDEX(payment_id, created_at DESC)
+INDEX(rental_id, created_at DESC)
+INDEX(status, updated_at)
+```
+
+Current scope limitations:
+
+* provider refund ещё не реализован;
+* partial refund ещё не реализован;
+* self-service refund ещё не реализован;
+* public refund history API ещё не реализован.
 
 ---
 

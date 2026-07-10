@@ -1,16 +1,57 @@
-import { Activity, Check, Edit3, Gamepad2, Gauge, Plus, RefreshCcw, ShieldCheck, ToggleLeft, ToggleRight, UserCog, UsersRound, X } from "lucide-react";
+import {
+  Activity,
+  AlertTriangle,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Edit3,
+  Gamepad2,
+  Gauge,
+  Plus,
+  RefreshCcw,
+  RotateCcw,
+  ShieldCheck,
+  ToggleLeft,
+  ToggleRight,
+  UserCog,
+  UsersRound,
+  Wallet,
+  X
+} from "lucide-react";
 import { type FormEvent, useState } from "react";
 import type { ReactNode } from "react";
-import type { Account, AuditLog, User } from "../../api";
+import {
+  isApiError,
+  type Account,
+  type AdminRentalFilters,
+  type AdminRentalRefundSummary,
+  type AdminRentalSummary,
+  type AdminWalletRefundResponse,
+  type AuditLog,
+  type Pagination,
+  type RefundReasonCodeOption,
+  type User
+} from "../../api";
 import { DataTable } from "../../components/DataTable";
 import { Kpi } from "../../components/Kpi";
+import { refundStatusClass, refundStatusLabel } from "../refunds/refundStatus";
+import { getRentalStatusClass, rentalStatusLabels, RENTAL_STATUS_COMPLETED, RENTAL_STATUS_EXPIRED } from "../rentals/rentalStatus";
+import { getPaymentStatusClass, paymentStatusLabel, PAYMENT_STATUS_SUCCESS } from "../payments/paymentStatus";
 import type { AdminAccountPatch, AdminTab } from "../../types/app";
 import { accountStatusLabels, accountStatusNumbers, gameNames } from "../../utils/accounts";
 import { money } from "../../utils/format";
 
 type AdminViewProps = {
   accounts: Account[];
+  adminRentalFilters: AdminRentalFilters;
+  adminRentals: AdminRentalRefundSummary[];
+  adminRentalsError: string | null;
+  adminRentalsLoading: boolean;
+  adminRentalsPagination: Pagination | null;
+  adminRentalsSummary: AdminRentalSummary | null;
   auditLogs: AuditLog[];
+  onAdminRentalFiltersChange: (filters: AdminRentalFilters) => Promise<void>;
+  onAdminRentalFiltersReset: () => Promise<void>;
   onCreateAccount: (payload: {
     steam_id64: string;
     steam_login: string;
@@ -18,22 +59,38 @@ type AdminViewProps = {
     price_per_hour: number;
     security_deposit: number;
   }) => Promise<void>;
+  onNextRefundPage: () => Promise<void>;
+  onPrevRefundPage: () => Promise<void>;
   onSync: (account: Account) => Promise<void>;
   onToggleAccount: (account: Account) => Promise<void>;
   onUpdateAccount: (account: Account, patch: AdminAccountPatch) => Promise<void>;
   onUpdateUser: (targetUser: User, patch: { trust_score?: number; is_blocked?: boolean; balance?: number; role?: string }) => Promise<void>;
+  onWalletRefund: (rentalId: number, reasonCode: string) => Promise<AdminWalletRefundResponse>;
+  refundReasonOptions: RefundReasonCodeOption[];
   user: User | null;
   users: User[];
 };
 
 export function AdminView({
   accounts,
+  adminRentalFilters,
+  adminRentals,
+  adminRentalsError,
+  adminRentalsLoading,
+  adminRentalsPagination,
+  adminRentalsSummary,
   auditLogs,
+  onAdminRentalFiltersChange,
+  onAdminRentalFiltersReset,
   onCreateAccount,
+  onNextRefundPage,
+  onPrevRefundPage,
   onSync,
   onToggleAccount,
   onUpdateAccount,
   onUpdateUser,
+  onWalletRefund,
+  refundReasonOptions,
   user,
   users
 }: AdminViewProps) {
@@ -45,23 +102,24 @@ export function AdminView({
     return (
       <section className="workspace empty-state">
         <ShieldCheck size={42} />
-        <h2>Нужна роль ADMIN</h2>
-        <p>Административные операции доступны только пользователю с ролью ADMIN.</p>
+        <h2>ADMIN role required</h2>
+        <p>Administrative tools are available only to users with ADMIN role.</p>
       </section>
     );
   }
 
   const tabs: Array<{ id: AdminTab; label: string; icon: ReactNode }> = [
-    { id: "overview", label: "Обзор", icon: <Gauge size={18} /> },
-    { id: "accounts", label: "Аккаунты", icon: <Gamepad2 size={18} /> },
-    { id: "users", label: "Пользователи", icon: <UsersRound size={18} /> },
-    { id: "audit", label: "Аудит", icon: <Activity size={18} /> }
+    { id: "overview", label: "Overview", icon: <Gauge size={18} /> },
+    { id: "accounts", label: "Accounts", icon: <Gamepad2 size={18} /> },
+    { id: "refunds", label: "Refunds", icon: <Wallet size={18} /> },
+    { id: "users", label: "Users", icon: <UsersRound size={18} /> },
+    { id: "audit", label: "Audit", icon: <Activity size={18} /> }
   ];
 
   return (
     <section className="admin-layout">
       <aside className="admin-sidebar">
-        <h2>Админ-панель</h2>
+        <h2>Admin console</h2>
         {tabs.map((item) => (
           <button className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)} type="button">
             {item.icon}
@@ -75,17 +133,17 @@ export function AdminView({
           <div>
             <span className="eyebrow">Operations</span>
             <h2>{tabs.find((item) => item.id === tab)?.label}</h2>
-            <p>Отдельный рабочий интерфейс администратора: аккаунты, пользователи и журнал действий.</p>
+            <p>Dedicated admin workflows for accounts, users, wallet refunds and audit review.</p>
           </div>
           {tab === "accounts" && (
             <button className="primary-button" onClick={() => setCreateOpen(true)} type="button">
               <Plus size={18} />
-              Добавить аккаунт
+              Add account
             </button>
           )}
         </div>
 
-        {tab === "overview" && <AdminOverview accounts={accounts} auditLogs={auditLogs} users={users} />}
+        {tab === "overview" && <AdminOverview accounts={accounts} auditLogs={auditLogs} refundCandidates={adminRentalsSummary?.eligible_wallet_refund_count ?? 0} users={users} />}
         {tab === "accounts" && (
           <AdminAccountsTable
             accounts={accounts}
@@ -93,6 +151,21 @@ export function AdminView({
             onEdit={setEditingAccount}
             onSync={onSync}
             onToggle={onToggleAccount}
+          />
+        )}
+        {tab === "refunds" && (
+          <AdminRefundsSection
+            error={adminRentalsError}
+            filters={adminRentalFilters}
+            loading={adminRentalsLoading}
+            onFiltersChange={onAdminRentalFiltersChange}
+            onNextPage={onNextRefundPage}
+            onPrevPage={onPrevRefundPage}
+            onResetFilters={onAdminRentalFiltersReset}
+            onWalletRefund={onWalletRefund}
+            pagination={adminRentalsPagination}
+            refundReasonOptions={refundReasonOptions}
+            rentals={adminRentals}
           />
         )}
         {tab === "users" && <AdminUsersTable onUpdateUser={onUpdateUser} users={users} />}
@@ -122,17 +195,418 @@ export function AdminView({
   );
 }
 
-function AdminOverview({ accounts, auditLogs, users }: { accounts: Account[]; auditLogs: AuditLog[]; users: User[] }) {
+function canRenderRefundAction(rental: AdminRentalRefundSummary) {
+  return (
+    rental.payment_provider === "balance" &&
+    rental.payment_status === PAYMENT_STATUS_SUCCESS &&
+    (rental.status === RENTAL_STATUS_EXPIRED || rental.status === RENTAL_STATUS_COMPLETED) &&
+    rental.refund_status !== "COMPLETED"
+  );
+}
+
+function AdminOverview({
+  accounts,
+  auditLogs,
+  refundCandidates,
+  users
+}: {
+  accounts: Account[];
+  auditLogs: AuditLog[];
+  refundCandidates: number;
+  users: User[];
+}) {
   return (
     <>
       <div className="kpi-grid">
-        <Kpi icon={<Gamepad2 size={22} />} label="Всего аккаунтов" value={accounts.length} />
-        <Kpi icon={<Check size={22} />} label="Доступно" value={accounts.filter((item) => item.status === "Available").length} />
-        <Kpi icon={<ToggleLeft size={22} />} label="Отключено" value={accounts.filter((item) => item.status === "Disabled").length} />
-        <Kpi icon={<UsersRound size={22} />} label="Пользователи" value={users.length} />
+        <Kpi icon={<Gamepad2 size={22} />} label="Total accounts" value={accounts.length} />
+        <Kpi icon={<Check size={22} />} label="Available" value={accounts.filter((item) => item.status === "Available").length} />
+        <Kpi icon={<Wallet size={22} />} label="Refund candidates" value={refundCandidates} />
+        <Kpi icon={<UsersRound size={22} />} label="Users" value={users.length} />
       </div>
       <AuditLogList auditLogs={auditLogs.slice(0, 8)} compact />
     </>
+  );
+}
+
+const rentalStatusFilterOptions = ["WAITING_PAYMENT", "ACTIVE", "EXPIRED", "CANCELLED", "COMPLETED"] as const;
+const paymentStatusFilterOptions = ["PENDING", "SUCCESS", "FAILED"] as const;
+const paymentProviderFilterOptions = ["balance", "internal"] as const;
+const depositStatusFilterOptions = ["NONE", "HELD", "RELEASED", "FORFEITED", "REFUNDED"] as const;
+const refundStatusFilterOptions = ["NONE", "REQUESTED", "COMPLETED", "FAILED"] as const;
+
+function AdminRefundsSection({
+  error,
+  filters,
+  loading,
+  onFiltersChange,
+  onNextPage,
+  onPrevPage,
+  onResetFilters,
+  onWalletRefund,
+  pagination,
+  refundReasonOptions,
+  rentals
+}: {
+  error: string | null;
+  filters: AdminRentalFilters;
+  loading: boolean;
+  onFiltersChange: (filters: AdminRentalFilters) => Promise<void>;
+  onNextPage: () => Promise<void>;
+  onPrevPage: () => Promise<void>;
+  onResetFilters: () => Promise<void>;
+  onWalletRefund: (rentalId: number, reasonCode: string) => Promise<AdminWalletRefundResponse>;
+  pagination: Pagination | null;
+  refundReasonOptions: RefundReasonCodeOption[];
+  rentals: AdminRentalRefundSummary[];
+}) {
+  const [confirmRentalId, setConfirmRentalId] = useState<number | null>(null);
+  const [reasonByRental, setReasonByRental] = useState<Record<number, string>>({});
+  const [submittingRentalId, setSubmittingRentalId] = useState<number | null>(null);
+  const [feedback, setFeedback] = useState<{ type: "ok" | "error"; message: string } | null>(null);
+
+  const currentPage = pagination?.page ?? 1;
+  const totalPages = pagination?.total_pages ?? 0;
+
+  function selectedReason(rentalId: number) {
+    return reasonByRental[rentalId] ?? refundReasonOptions[0]?.code ?? "";
+  }
+
+  function canRefund(rental: AdminRentalRefundSummary) {
+    return (
+      rental.payment_provider === "balance" &&
+      rental.payment_status === PAYMENT_STATUS_SUCCESS &&
+      (rental.status === RENTAL_STATUS_EXPIRED || rental.status === RENTAL_STATUS_COMPLETED) &&
+      rental.refund_status !== "COMPLETED"
+    );
+  }
+
+  function refundableDepositAmount(rental: AdminRentalRefundSummary) {
+    return rental.deposit_status === "HELD" ? rental.security_deposit.amount : 0;
+  }
+
+  function refundBlockedReason(rental: AdminRentalRefundSummary) {
+    if (rental.refund_status === "COMPLETED") {
+      return "Refund already completed.";
+    }
+    if (rental.payment_provider !== "balance") {
+      return "Provider-paid rentals are excluded from this flow.";
+    }
+    if (rental.payment_status !== PAYMENT_STATUS_SUCCESS) {
+      return "Payment must be SUCCESS before refund.";
+    }
+    if (rental.status !== RENTAL_STATUS_EXPIRED && rental.status !== RENTAL_STATUS_COMPLETED) {
+      return "Rental must be EXPIRED or COMPLETED.";
+    }
+    return "Refund is unavailable for this rental.";
+  }
+
+  function updateFilters(patch: Partial<AdminRentalFilters>) {
+    void onFiltersChange({
+      ...filters,
+      ...patch
+    });
+  }
+
+  async function submitRefund(rental: AdminRentalRefundSummary) {
+    if (submittingRentalId === rental.id || !canRefund(rental) || !selectedReason(rental.id)) {
+      return;
+    }
+
+    setSubmittingRentalId(rental.id);
+    setFeedback(null);
+
+    try {
+      const result = await onWalletRefund(rental.id, selectedReason(rental.id));
+      setConfirmRentalId((current) => (current === rental.id ? null : current));
+      setFeedback({
+        type: "ok",
+        message: result.idempotent
+          ? `Refund for rental #${rental.id} was already completed.`
+          : `Refund completed for rental #${rental.id}: ${money(result.total_amount)} credited.`
+      });
+    } catch (error) {
+      if (isApiError(error)) {
+        if (error.status === 401 || error.status === 403) {
+          setFeedback({ type: "error", message: "Admin session is unavailable or permission was denied." });
+        } else if (error.status === 404 || error.status === 409) {
+          setFeedback({ type: "error", message: "Rental is no longer eligible. Data was refreshed from backend state." });
+        } else {
+          setFeedback({ type: "error", message: "Refund request failed. Retry after the network recovers." });
+        }
+        return;
+      }
+      setFeedback({ type: "error", message: "Refund request failed. Retry after the network recovers." });
+    } finally {
+      setSubmittingRentalId((current) => (current === rental.id ? null : current));
+    }
+  }
+
+  return (
+    <section className="profile-form admin-refund-panel">
+      <div className="section-heading">
+        <div>
+          <h2>Wallet refunds</h2>
+          <p>Read-only rental summary plus one controlled refund action for eligible balance-paid rentals.</p>
+        </div>
+        <div className="row-actions">
+          <button className="secondary-button" disabled={loading || currentPage <= 1} onClick={() => void onPrevPage()} type="button">
+            <ChevronLeft size={18} />
+            Prev
+          </button>
+          <button className="secondary-button" disabled={loading || totalPages === 0 || currentPage >= totalPages} onClick={() => void onNextPage()} type="button">
+            Next
+            <ChevronRight size={18} />
+          </button>
+        </div>
+      </div>
+
+      <div className="admin-filter-panel" data-testid="admin-rentals-filters">
+        <label>
+          <span>Rental status</span>
+          <select aria-label="Rental status filter" onChange={(event) => updateFilters({ rental_status: event.target.value as AdminRentalFilters["rental_status"] })} value={filters.rental_status ?? ""}>
+            <option value="">All</option>
+            {rentalStatusFilterOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Payment status</span>
+          <select aria-label="Payment status filter" onChange={(event) => updateFilters({ payment_status: event.target.value as AdminRentalFilters["payment_status"] })} value={filters.payment_status ?? ""}>
+            <option value="">All</option>
+            {paymentStatusFilterOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Provider</span>
+          <select aria-label="Payment provider filter" onChange={(event) => updateFilters({ payment_provider: event.target.value as AdminRentalFilters["payment_provider"] })} value={filters.payment_provider ?? ""}>
+            <option value="">All</option>
+            {paymentProviderFilterOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Deposit</span>
+          <select aria-label="Deposit status filter" onChange={(event) => updateFilters({ deposit_status: event.target.value as AdminRentalFilters["deposit_status"] })} value={filters.deposit_status ?? ""}>
+            <option value="">All</option>
+            {depositStatusFilterOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Refund</span>
+          <select aria-label="Refund status filter" onChange={(event) => updateFilters({ refund_status: event.target.value as AdminRentalFilters["refund_status"] })} value={filters.refund_status ?? ""}>
+            <option value="">All</option>
+            {refundStatusFilterOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Eligible</span>
+          <select
+            aria-label="Eligible wallet refund filter"
+            onChange={(event) =>
+              updateFilters({
+                eligible_wallet_refund: event.target.value === "" ? undefined : event.target.value === "true"
+              })
+            }
+            value={filters.eligible_wallet_refund === undefined ? "" : String(filters.eligible_wallet_refund)}
+          >
+            <option value="">All</option>
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+        </label>
+        <label>
+          <span>User ID</span>
+          <input
+            aria-label="User ID filter"
+            inputMode="numeric"
+            min={1}
+            onChange={(event) => updateFilters({ user_id: event.target.value ? Number(event.target.value) : undefined })}
+            type="number"
+            value={filters.user_id ?? ""}
+          />
+        </label>
+        <label>
+          <span>Rental ID</span>
+          <input
+            aria-label="Rental ID filter"
+            inputMode="numeric"
+            min={1}
+            onChange={(event) => updateFilters({ rental_id: event.target.value ? Number(event.target.value) : undefined })}
+            type="number"
+            value={filters.rental_id ?? ""}
+          />
+        </label>
+        <button className="secondary-button" onClick={() => void onResetFilters()} type="button">
+          Reset filters
+        </button>
+      </div>
+
+      {feedback && <div className={`admin-refund-feedback ${feedback.type}`}>{feedback.message}</div>}
+      {error && <div className="admin-refund-feedback error">{error}</div>}
+
+      {loading ? (
+        <div className="empty-inline">
+          <RotateCcw size={24} />
+          <span>Loading admin refund data...</span>
+        </div>
+      ) : rentals.length === 0 ? (
+        <div className="empty-inline">
+          <Wallet size={24} />
+          <strong>No rentals match the current filters</strong>
+          <span>Adjust the filters or reset them to inspect more rentals.</span>
+        </div>
+      ) : (
+        <div className="admin-refund-list">
+          {rentals.map((rental) => {
+            const eligible = canRefund(rental);
+            const confirming = confirmRentalId === rental.id;
+            const submitting = submittingRentalId === rental.id;
+            const depositRefund = refundableDepositAmount(rental);
+            const totalRefund = rental.rental_price.amount + depositRefund;
+
+            return (
+              <article className="admin-refund-card" key={rental.id}>
+                <div className="admin-refund-card-top">
+                  <div>
+                    <strong>Rental #{rental.id}</strong>
+                    <div className="rental-meta">
+                      <span>User #{rental.user_id}</span>
+                      <span>Account #{rental.account_id}</span>
+                      {rental.payment_id && <span>Payment #{rental.payment_id}</span>}
+                    </div>
+                  </div>
+                  <div className="rental-meta">
+                    <span className={`status-pill ${getRentalStatusClass(rental.status)}`}>{rentalStatusLabels[rental.status] ?? rental.status}</span>
+                    <span className={`status-pill ${getPaymentStatusClass(rental.payment_status)}`}>{paymentStatusLabel(rental.payment_status)}</span>
+                    <span className={`status-pill ${refundStatusClass(rental.refund_status)}`}>{refundStatusLabel(rental.refund_status)}</span>
+                  </div>
+                </div>
+
+                <div className="admin-refund-grid">
+                  <div className="detail-item">
+                    <span>Payment method</span>
+                    <strong>{rental.payment_provider || "unknown"}</strong>
+                  </div>
+                  <div className="detail-item">
+                    <span>Rental price</span>
+                    <strong>{money(rental.rental_price)}</strong>
+                  </div>
+                  <div className="detail-item">
+                    <span>Deposit amount</span>
+                    <strong>{money(rental.security_deposit)}</strong>
+                  </div>
+                  <div className="detail-item">
+                    <span>Deposit status</span>
+                    <strong>{rental.deposit_status}</strong>
+                  </div>
+                  <div className="detail-item">
+                    <span>Refund summary</span>
+                    <strong>{rental.has_refund ? money(rental.refund_total_amount) : "No refund"}</strong>
+                  </div>
+                  <div className="detail-item">
+                    <span>Processed at</span>
+                    <strong>{rental.processed_at ? new Date(rental.processed_at).toLocaleString() : "Not processed"}</strong>
+                  </div>
+                </div>
+
+                {eligible ? (
+                  <>
+                    <div className="admin-refund-actions">
+                      <label className="admin-refund-reason">
+                        <span>Reason code</span>
+                        <select
+                          disabled={submitting || refundReasonOptions.length === 0}
+                          onChange={(event) => {
+                            setReasonByRental((current) => ({ ...current, [rental.id]: event.target.value }));
+                          }}
+                          value={selectedReason(rental.id)}
+                        >
+                          {refundReasonOptions.map((option) => (
+                            <option key={option.code} value={option.code}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        className="secondary-button"
+                        disabled={submitting || refundReasonOptions.length === 0}
+                        onClick={() => {
+                          setFeedback(null);
+                          setConfirmRentalId((current) => (current === rental.id ? null : rental.id));
+                        }}
+                        type="button"
+                      >
+                        <AlertTriangle size={16} />
+                        Review refund
+                      </button>
+                    </div>
+
+                    {confirming && (
+                      <div className="admin-refund-confirm">
+                        <div className="admin-refund-confirm-grid">
+                          <span>
+                            Principal <strong>{money(rental.rental_price)}</strong>
+                          </span>
+                          <span>
+                            Deposit <strong>{money({ amount: depositRefund, currency: rental.security_deposit.currency })}</strong>
+                          </span>
+                          <span>
+                            Total <strong>{money({ amount: totalRefund, currency: rental.total_price.currency })}</strong>
+                          </span>
+                          <span>
+                            Reason <strong>{selectedReason(rental.id)}</strong>
+                          </span>
+                        </div>
+                        <div className="row-actions">
+                          <button className="secondary-button" disabled={submitting} onClick={() => setConfirmRentalId(null)} type="button">
+                            Cancel
+                          </button>
+                          <button className="danger-button" disabled={submitting} onClick={() => void submitRefund(rental)} type="button">
+                            <Wallet size={16} />
+                            {submitting ? "Refunding..." : "Confirm refund"}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {refundReasonOptions.length === 0 && <div className="admin-refund-hint">Refund reason codes are unavailable. Refresh admin data.</div>}
+                  </>
+                ) : (
+                  <div className="admin-refund-hint">{refundBlockedReason(rental)}</div>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="profile-stats">
+        <span>
+          Page <strong>{currentPage}</strong>
+        </span>
+        <span>
+          Rentals <strong>{pagination?.total_items ?? 0}</strong>
+        </span>
+      </div>
+    </section>
   );
 }
 
@@ -156,14 +630,14 @@ function AdminAccountsTable({
     try {
       await action(account);
     } catch {
-      // The parent handler already shows a toast. Keep the row interactive after the request settles.
+      // Parent handler already reports the failure.
     } finally {
       setBusyAccountId(null);
     }
   }
 
   return (
-    <DataTable empty="Аккаунтов нет" columns={["SteamID", "Библиотека", "Цена", "Статус", "Действия"]}>
+    <DataTable empty="No accounts" columns={["SteamID", "Library", "Price", "Status", "Actions"]}>
       {accounts.length > 0 ? (
         accounts.map((account) => {
           const disabled = account.status === "Disabled";
@@ -173,7 +647,7 @@ function AdminAccountsTable({
             <tr key={account.id}>
               <td>{account.steam_id64}</td>
               <td>{gameNames(account, 2)}</td>
-              <td>{money(account.price_per_hour)}/ч</td>
+              <td>{money(account.price_per_hour)}/h</td>
               <td>
                 <span className={disabled ? "status-pill danger" : "status-pill green"}>{accountStatusLabels[account.status] ?? account.status}</span>
               </td>
@@ -181,11 +655,11 @@ function AdminAccountsTable({
                 <div className="table-actions">
                   <button className="secondary-button icon-label" disabled={busy} onClick={() => onEdit(account)} type="button">
                     <Edit3 size={16} />
-                    Изменить
+                    Edit
                   </button>
                   <button className="secondary-button icon-label" disabled={busy} onClick={() => runAccountAction(account, onSync)} type="button">
                     <RefreshCcw size={16} />
-                    {busy ? "Обновление..." : "Sync"}
+                    {busy ? "Syncing..." : "Sync"}
                   </button>
                   <button
                     className={disabled ? "success-button icon-label" : "danger-button icon-label"}
@@ -194,7 +668,7 @@ function AdminAccountsTable({
                     type="button"
                   >
                     {disabled ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
-                    {disabled ? "Включить" : "Отключить"}
+                    {disabled ? "Enable" : "Disable"}
                   </button>
                 </div>
               </td>
@@ -206,7 +680,7 @@ function AdminAccountsTable({
           <td colSpan={5}>
             <button className="primary-button" onClick={onCreate} type="button">
               <Plus size={18} />
-              Добавить первый аккаунт
+              Add first account
             </button>
           </td>
         </tr>
@@ -223,7 +697,7 @@ function AdminUsersTable({
   users: User[];
 }) {
   return (
-    <DataTable empty="Пользователей нет" columns={["ID", "Пользователь", "Роль", "Доверие", "Баланс", "Действия"]}>
+    <DataTable empty="No users" columns={["ID", "User", "Role", "Trust", "Balance", "Actions"]}>
       {users.map((item) => (
         <AdminUserRow key={item.id} onUpdateUser={onUpdateUser} user={item} />
       ))}
@@ -248,7 +722,7 @@ function AdminUserRow({
     try {
       await onUpdateUser(user, { trust_score: Number(trust), balance: Number(balance), role });
     } catch {
-      // Toast is emitted by the parent handler.
+      // Parent handler already reports the failure.
     } finally {
       setBusy(false);
     }
@@ -259,7 +733,7 @@ function AdminUserRow({
     try {
       await onUpdateUser(user, { is_blocked: !user.is_blocked });
     } catch {
-      // Toast is emitted by the parent handler.
+      // Parent handler already reports the failure.
     } finally {
       setBusy(false);
     }
@@ -276,8 +750,8 @@ function AdminUserRow({
       </td>
       <td>
         <select value={role} onChange={(event) => setRole(event.target.value)}>
-          <option value="RENT">Клиент</option>
-          <option value="ADMIN">Админ</option>
+          <option value="RENT">Customer</option>
+          <option value="ADMIN">Admin</option>
         </select>
       </td>
       <td>
@@ -290,11 +764,11 @@ function AdminUserRow({
         <div className="table-actions">
           <button className="secondary-button icon-label" disabled={busy} onClick={save} type="button">
             <Check size={16} />
-            Сохранить
+            Save
           </button>
           <button className={user.is_blocked ? "success-button icon-label" : "danger-button icon-label"} disabled={busy} onClick={toggleBlock} type="button">
             <UserCog size={16} />
-            {user.is_blocked ? "Разблокировать" : "Заблокировать"}
+            {user.is_blocked ? "Unblock" : "Block"}
           </button>
         </div>
       </td>
@@ -319,7 +793,7 @@ function AuditLogList({ auditLogs, compact = false }: { auditLogs: AuditLog[]; c
       ) : (
         <div className="empty-inline compact">
           <Activity size={24} />
-          <strong>Событий пока нет</strong>
+          <strong>No audit events yet</strong>
         </div>
       )}
     </div>
@@ -360,7 +834,7 @@ function AccountCreateDialog({
         security_deposit: Number(deposit)
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Не удалось создать аккаунт");
+      setError(err instanceof Error ? err.message : "Failed to create account");
     } finally {
       setBusy(false);
     }
@@ -369,38 +843,38 @@ function AccountCreateDialog({
   return (
     <div className="dialog-backdrop">
       <form className="auth-dialog wide-dialog" onSubmit={submit}>
-        <button className="ghost icon-button close-button" onClick={onClose} title="Закрыть" type="button">
+        <button className="ghost icon-button close-button" onClick={onClose} title="Close" type="button">
           <X size={20} />
         </button>
         <Plus size={28} />
-        <h2>Добавить аккаунт</h2>
+        <h2>Add account</h2>
         <label>
           SteamID64
           <input onChange={(event) => setSteamId(event.target.value)} required value={steamId} />
         </label>
         <div className="two-fields">
           <label>
-            Логин Steam
+            Steam login
             <input onChange={(event) => setLogin(event.target.value)} required value={login} />
           </label>
           <label>
-            Пароль Steam
+            Steam password
             <input onChange={(event) => setPassword(event.target.value)} required type="password" value={password} />
           </label>
         </div>
         <div className="two-fields">
           <label>
-            Цена за час
+            Hourly price
             <input min="1" onChange={(event) => setPrice(event.target.value)} required type="number" value={price} />
           </label>
           <label>
-            Депозит
+            Deposit
             <input min="0" onChange={(event) => setDeposit(event.target.value)} required type="number" value={deposit} />
           </label>
         </div>
         {error && <span className="form-error">{error}</span>}
         <button className="primary-button full" disabled={busy} type="submit">
-          {busy ? "Создание..." : "Создать аккаунт"}
+          {busy ? "Creating..." : "Create account"}
         </button>
       </form>
     </div>
@@ -433,7 +907,7 @@ function AccountEditDialog({
         status: accountStatusNumbers[status]
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Не удалось обновить аккаунт");
+      setError(err instanceof Error ? err.message : "Failed to update account");
     } finally {
       setBusy(false);
     }
@@ -442,14 +916,14 @@ function AccountEditDialog({
   return (
     <div className="dialog-backdrop">
       <form className="auth-dialog" onSubmit={submit}>
-        <button className="ghost icon-button close-button" onClick={onClose} title="Закрыть" type="button">
+        <button className="ghost icon-button close-button" onClick={onClose} title="Close" type="button">
           <X size={20} />
         </button>
         <Edit3 size={28} />
-        <h2>Редактировать аккаунт</h2>
+        <h2>Edit account</h2>
         <p className="dialog-subtitle">{account.steam_id64}</p>
         <label>
-          Статус
+          Status
           <select value={status} onChange={(event) => setStatus(event.target.value)}>
             {Object.keys(accountStatusNumbers).map((item) => (
               <option key={item} value={item}>
@@ -459,16 +933,16 @@ function AccountEditDialog({
           </select>
         </label>
         <label>
-          Цена за час
+          Hourly price
           <input min="1" onChange={(event) => setPrice(event.target.value)} required type="number" value={price} />
         </label>
         <label>
-          Депозит
+          Deposit
           <input min="0" onChange={(event) => setDeposit(event.target.value)} required type="number" value={deposit} />
         </label>
         {error && <span className="form-error">{error}</span>}
         <button className="primary-button full" disabled={busy} type="submit">
-          {busy ? "Сохранение..." : "Сохранить"}
+          {busy ? "Saving..." : "Save"}
         </button>
       </form>
     </div>

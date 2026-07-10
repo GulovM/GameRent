@@ -1,6 +1,6 @@
 export type View = "catalog" | "rentals" | "payments" | "profile" | "admin";
 
-export type AdminTab = "overview" | "accounts" | "users" | "audit";
+export type AdminTab = "overview" | "accounts" | "refunds" | "users" | "audit";
 
 export type Toast = { type: "ok" | "error"; message: string } | null;
 

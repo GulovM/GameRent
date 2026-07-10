@@ -352,6 +352,8 @@ POST {{apiUrl}}/rentals/{id}/extend
 
 `POST /me/rentals/{rentalId}/pay-with-balance` позволяет владельцу `WAITING_PAYMENT` аренды оплатить существующий `PENDING` payment из `available_balance`. Backend сам вычисляет сумму из rental/payment state; credentials автоматически не возвращаются.
 
+Деньги в backend хранятся только в integer minor units. Текущая финансовая модель включает `users.balance`, append-only `financial_ledger_entries`, `deposit_holds` и `refunds`; `float32/float64` для денежных сумм не используются.
+
 Credentials выдаются только владельцу активной оплаченной неистёкшей аренды через `GET /me/rentals/{rentalId}/credentials`.
 
 Cancel endpoint работает для `WAITING_PAYMENT`: rental становится `CANCELLED`, payment `FAILED`, account возвращается в `AVAILABLE`. Истёкшие `ACTIVE` аренды закрываются scheduler cleanup как `EXPIRED`; `SUCCESS` payment при этом не меняется.
@@ -384,7 +386,11 @@ X-Payment-Signature: <hmac_sha256_hex>
 
 Wallet payment использует тот же lifecycle `PENDING -> SUCCESS`, `WAITING_PAYMENT -> ACTIVE`, `RESERVED -> RENTED`, но без provider webhook: списывает `users.balance` атомарно внутри backend transaction и не возвращает credentials автоматически.
 
-Refund/deposit ledger пока не реализован.
+При успешном provider webhook создаётся immutable ledger entry `PROVIDER_PAYMENT_RECEIVED`, а при ненулевом депозите дополнительно создаются `deposit_holds` со статусом `HELD` и ledger entry `DEPOSIT_HELD`.
+
+Wallet payment создаёт immutable ledger entry `BALANCE_DEBIT`, а при ненулевом депозите использует тот же `deposit_holds` lifecycle `HELD -> RELEASED | FORFEITED | REFUNDED`.
+
+Admin wallet refund для wallet-paid rental создаёт отдельные immutable ledger entries `BALANCE_REFUND_CREDIT` и, если депозит ещё удержан, `DEPOSIT_REFUND_CREDIT`. `payment.status` при refund остаётся `SUCCESS`, а `rental.status` не меняется из-за refund.
 
 ### Reviews
 
@@ -424,7 +430,12 @@ POST  {{apiUrl}}/admin/accounts/{accountId}/sync
 GET   {{apiUrl}}/admin/users
 PATCH {{apiUrl}}/admin/users/{userId}
 GET   {{apiUrl}}/admin/audit-logs
+POST  {{apiUrl}}/admin/rentals/{rentalId}/wallet-refund
 ```
+
+`POST /admin/rentals/{rentalId}/wallet-refund` доступен только `ADMIN`. Endpoint принимает короткий `reason_code`, работает только для wallet-paid `SUCCESS` payment и только если rental уже находится в `EXPIRED` или `COMPLETED`. Backend сам рассчитывает principal/deposit refund, выполняет идемпотентный credit в `users.balance` и не возвращает credentials, provider internals или ledger metadata.
+
+Текущие ограничения refund flow: provider refund, partial refund, self-service refund и отдельный refund history API пока не реализованы.
 
 Создание аккаунта:
 

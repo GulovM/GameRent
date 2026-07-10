@@ -1,16 +1,14 @@
 {
-  "timestamp": "2026-07-06T18:53:28.376Z",
+  "timestamp": "2026-07-10T12:03:30.671Z",
   "distillationEnabled": true,
-  "patternsConsolidated": 6,
-  "memoryCleaned": 6,
+  "patternsConsolidated": 0,
+  "memoryCleaned": 0,
   "duplicatesRemoved": 0,
-  "episodes": 6,
-  "patternEmbeddings": 6,
-  "causalEdges": 2,
+  "episodes": 0,
+  "patternEmbeddings": 0,
+  "causalEdges": 0,
   "promoted": 0,
-  "byProvenance": {
-    "proxy:structural": 6
-  },
+  "byProvenance": {},
   "namespaces": [
     "gamerent/frontend-patterns",
     "gamerent/go-patterns",
@@ -18,7 +16,8 @@
     "gamerent/decisions",
     "gamerent/api-contracts",
     "gamerent/domain-invariants",
-    "gamerent/security"
+    "gamerent/security",
+    "default"
   ],
   "dryRun": false,
   "corrupt": false

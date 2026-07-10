@@ -3,6 +3,7 @@ import type { Account, FinancialBalance, Payment, Rental, RentalCredentials } fr
 import { gameNames } from "../../utils/accounts";
 import { formatTimestamp, money, remaining } from "../../utils/format";
 import { getPaymentStatusClass, paymentStatusLabel, PAYMENT_STATUS_PENDING } from "../payments/paymentStatus";
+import { refundStatusClass, refundStatusLabel } from "../refunds/refundStatus";
 import { depositStatusClass, depositStatusLabel } from "./depositStatus";
 import {
   canRequestCredentials,
@@ -80,7 +81,7 @@ export function RentalsView({
     if (!selectedRental || !selectedRentalWaitingPayment) return null;
     if (balanceLoading) return "Проверяем доступный баланс перед оплатой.";
     if (!balanceKnown) return "Баланс временно недоступен. Обновите статус и повторите.";
-    if (!selectedPayment || selectedPayment.status !== PAYMENT_STATUS_PENDING) return "Платёж уже обрабатывается или аренда уже оплачена.";
+    if (!selectedPayment || selectedPayment.status !== PAYMENT_STATUS_PENDING) return "Платёж уже обработан или аренда уже оплачена.";
     if (paymentWindowExpired) return "Окно оплаты истекло. Обновите статус аренды.";
     if (!hasEnoughBalance) return "Недостаточно средств на балансе для оплаты этой аренды.";
     return "Steam credentials не выдаются автоматически. Получение доступа остаётся отдельным действием после активации аренды.";
@@ -91,7 +92,7 @@ export function RentalsView({
       <div className="section-heading">
         <div>
           <h2>Мои аренды</h2>
-          <p>Активные сессии, история, продление и отмена.</p>
+          <p>Активные сессии, история, продление, отмена и refund summary.</p>
         </div>
         <button className="secondary-button" disabled={rentalsRefreshing} onClick={onRefreshStatus} type="button">
           <RefreshCcw size={18} />
@@ -120,9 +121,8 @@ export function RentalsView({
                     <span className={`status-pill ${getRentalStatusClass(rental.status)}`}>{rentalStatusLabels[rental.status] ?? rental.status}</span>
                     {payment && <span className={`status-pill ${getPaymentStatusClass(payment.status)}`}>{paymentStatusLabel(payment.status)}</span>}
                     <span className={`status-pill ${depositStatusClass(rental.deposit_status)}`}>{depositStatusLabel(rental.deposit_status)}</span>
-                    {waitingForPayment && rental.payment_expires_at && (
-                      <span className="status-pill amber">Pay in {remaining(rental.payment_expires_at)}</span>
-                    )}
+                    {rental.has_refund && <span className={`status-pill ${refundStatusClass(rental.refund_status)}`}>{refundStatusLabel(rental.refund_status)}</span>}
+                    {waitingForPayment && rental.payment_expires_at && <span className="status-pill amber">Pay in {remaining(rental.payment_expires_at)}</span>}
                   </div>
                 </div>
                 <strong>{money(rental.total_price)}</strong>
@@ -136,10 +136,17 @@ export function RentalsView({
                   <button className="danger-button" disabled={rental.status > RENTAL_STATUS_ACTIVE} onClick={() => onCancel(rental)} type="button">
                     Отменить
                   </button>
-                  <button className="primary-button" disabled={!canLoadCredentials} onClick={() => onLoadCredentials(rental)} type="button">
-                    <Lock size={18} />
-                    Credentials
-                  </button>
+                  {canLoadCredentials && (
+                    <button
+                      aria-label={`Get credentials for rental ${rental.id}`}
+                      className="primary-button"
+                      onClick={() => onLoadCredentials(rental)}
+                      type="button"
+                    >
+                      <Lock size={18} />
+                      Credentials
+                    </button>
+                  )}
                 </div>
               </article>
             );
@@ -157,7 +164,7 @@ export function RentalsView({
           <div className="section-heading">
             <div>
               <h2>{`Rental #${selectedRental.id}`}</h2>
-              <p>Status, payment window and controlled credential access.</p>
+              <p>Status, payment window, refund summary and controlled credential access.</p>
             </div>
           </div>
           <div className="rental-detail-grid">
@@ -197,6 +204,18 @@ export function RentalsView({
               <span>Deposit status</span>
               <strong>{depositStatusLabel(selectedRental.deposit_status)}</strong>
             </div>
+            <div className="detail-item">
+              <span>Refund status</span>
+              <strong>{selectedRental.has_refund ? refundStatusLabel(selectedRental.refund_status) : "No refund"}</strong>
+            </div>
+            <div className="detail-item">
+              <span>Refund total</span>
+              <strong>{money(selectedRental.refund_total_amount)}</strong>
+            </div>
+            <div className="detail-item">
+              <span>Refund processed</span>
+              <strong>{selectedRental.processed_at ? formatTimestamp(selectedRental.processed_at) : "No data"}</strong>
+            </div>
           </div>
           {selectedRental.status === RENTAL_STATUS_WAITING_PAYMENT && (
             <>
@@ -225,7 +244,13 @@ export function RentalsView({
                   {walletPaymentHint() ? <p className={walletPaymentMessage ? "error-text" : "wallet-payment-hint"}>{walletPaymentMessage ?? walletPaymentHint()}</p> : null}
                 </div>
                 <div className="detail-actions">
-                  <button className="primary-button" disabled={walletPaymentDisabled} onClick={() => onPayWithBalance(selectedRental)} type="button">
+                  <button
+                    aria-label="Pay with wallet balance"
+                    className="primary-button"
+                    disabled={walletPaymentDisabled}
+                    onClick={() => onPayWithBalance(selectedRental)}
+                    type="button"
+                  >
                     {walletPaymentLoading ? "Paying..." : "Оплатить с баланса"}
                   </button>
                 </div>
@@ -254,6 +279,7 @@ export function RentalsView({
           {!credentials && selectedRental.status === RENTAL_STATUS_ACTIVE && (
             <div className="detail-actions">
               <button
+                aria-label="Get rental credentials"
                 className="primary-button"
                 disabled={credentialsLoading || !canRequestCredentials(selectedRental, selectedPayment)}
                 onClick={() => onLoadCredentials(selectedRental)}

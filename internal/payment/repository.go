@@ -2,6 +2,7 @@ package payment
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 
@@ -20,12 +21,21 @@ const (
 	ledgerEntryDepositReleasedBalance  int16 = 3
 	ledgerEntryDepositForfeited        int16 = 4
 	ledgerEntryBalanceDebit            int16 = 5
+	ledgerEntryBalanceRefundCredit     int16 = 6
+	ledgerEntryDepositRefundCredit     int16 = 7
 	depositHoldStatusHeld              int16 = 1
 	depositHoldStatusReleased          int16 = 2
 	depositHoldStatusForfeited         int16 = 3
+	depositHoldStatusRefunded          int16 = 4
+	refundSourceTypeWallet             int16 = 1
+	refundKindFull                     int16 = 1
+	refundStatusRequested              int16 = 1
+	refundStatusCompleted              int16 = 2
+	refundStatusFailed                 int16 = 3
 	securityEventTypeDepositReleased   int16 = 11
 	securityEventTypeDepositForfeited  int16 = 12
 	securityEventTypeWalletPayment     int16 = 13
+	securityEventTypeWalletRefund      int16 = 14
 )
 
 type Repository interface {
@@ -38,6 +48,11 @@ type Repository interface {
 	GetUserBalance(ctx context.Context, userID int64) (*UserBalance, error)
 	ListUserLedgerEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicLedgerEntry, error)
 	CountUserLedgerEntries(ctx context.Context, userID int64) (int64, error)
+	ListUserRefundEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicRefundEntry, error)
+	CountUserRefundEntries(ctx context.Context, userID int64) (int64, error)
+	ListAdminRentalEntries(ctx context.Context, filters AdminRentalListFilter) ([]AdminRentalEntry, error)
+	SummarizeAdminRentals(ctx context.Context, filters AdminRentalListFilter) (AdminRentalSummary, error)
+	LockWalletRefundState(ctx context.Context, rentalID int64) (*WalletRefundState, error)
 	LockPaymentForWebhookByID(ctx context.Context, paymentID int64) (*WebhookPaymentState, error)
 	LockPaymentForWebhookByExternalTransaction(ctx context.Context, provider, externalTransactionID string) (*WebhookPaymentState, error)
 	MarkPaymentSuccessful(ctx context.Context, paymentID int64, externalTransactionID string) error
@@ -50,9 +65,16 @@ type Repository interface {
 	LoadDepositSettlementEligibility(ctx context.Context, rentalID int64) (*DepositSettlementEligibility, error)
 	MarkDepositReleased(ctx context.Context, holdID int64, now time.Time) error
 	MarkDepositForfeited(ctx context.Context, holdID int64, now time.Time) error
+	MarkDepositRefunded(ctx context.Context, holdID, refundID int64, now time.Time) error
 	CreditUserBalance(ctx context.Context, userID, amount int64, now time.Time) error
 	RecordDepositReleasedToBalance(ctx context.Context, entry FinancialLedgerEntry) error
 	RecordDepositForfeited(ctx context.Context, entry FinancialLedgerEntry) error
+	RecordBalanceRefundCredit(ctx context.Context, entry FinancialLedgerEntry) error
+	RecordDepositRefundCredit(ctx context.Context, entry FinancialLedgerEntry) error
+	CreateRefund(ctx context.Context, refund RefundRecord) (*RefundRecord, bool, error)
+	LoadCompletedRefundTotals(ctx context.Context, paymentID int64) (*RefundTotals, error)
+	MarkRefundCompleted(ctx context.Context, refundID int64, now time.Time) error
+	LogRefundSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, userAgent string, metadata []byte) error
 	LogDepositSecurityEvent(ctx context.Context, eventType int16, userID, accountID, rentalID int64, userAgent string, metadata []byte) error
 	LogWalletSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error
 	InsertAuditLog(ctx context.Context, actorUserID int64, entityType string, entityID int64, action string, oldValues, newValues []byte) error
@@ -110,6 +132,24 @@ type WalletPaymentState struct {
 	UserBalance           int64
 }
 
+type WalletRefundState struct {
+	PaymentID      int64
+	RentalID       int64
+	UserID         int64
+	AccountID      int64
+	Provider       string
+	PaymentStatus  int16
+	RentalStatus   int16
+	RentalPrice    int64
+	DepositAmount  int64
+	Currency       string
+	UserBalance    int64
+	HasDepositHold bool
+	HoldID         int64
+	HoldStatus     int16
+	HoldAmount     int64
+}
+
 type UserBalance struct {
 	UserID           int64
 	AvailableBalance int64
@@ -125,6 +165,20 @@ type PublicLedgerEntry struct {
 	PaymentID   *int64
 	CreatedAt   time.Time
 	DisplayType string
+}
+
+type PublicRefundEntry struct {
+	ID              int64
+	RentalID        int64
+	PaymentID       int64
+	Status          string
+	PrincipalAmount int64
+	DepositAmount   int64
+	TotalAmount     int64
+	Currency        string
+	ReasonCode      *string
+	CreatedAt       time.Time
+	ProcessedAt     *time.Time
 }
 
 type DepositHold struct {
@@ -157,6 +211,33 @@ type DepositSettlementEligibility struct {
 	PaymentStatus  int16
 	DepositAmount  int64
 	HasDepositHold bool
+}
+
+type RefundRecord struct {
+	ID                int64
+	PaymentID         int64
+	RentalID          int64
+	UserID            int64
+	AccountID         int64
+	SourceType        int16
+	RefundKind        int16
+	Status            int16
+	ReasonCode        string
+	RequestedByUserID *int64
+	RequestedByRole   string
+	AmountPrincipal   int64
+	AmountDeposit     int64
+	AmountTotal       int64
+	Currency          string
+	IdempotencyKey    string
+	CorrelationID     string
+	Metadata          string
+	ProcessedAt       *time.Time
+}
+
+type RefundTotals struct {
+	Principal int64
+	Deposit   int64
 }
 
 type PostgresRepository struct {
@@ -253,6 +334,98 @@ func (r *PostgresRepository) GetUserBalance(ctx context.Context, userID int64) (
 	return &result, nil
 }
 
+func (r *PostgresRepository) LockWalletRefundState(ctx context.Context, rentalID int64) (*WalletRefundState, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	withHoldQuery := `
+		SELECT
+			p.id,
+			r.id,
+			r.user_id,
+			r.account_id,
+			p.provider,
+			p.status,
+			r.status,
+			r.rental_price,
+			r.deposit_amount,
+			p.currency,
+			u.balance,
+			d.id,
+			d.status,
+			d.amount
+		FROM rentals r
+		JOIN accounts a ON a.id = r.account_id
+		JOIN users u ON u.id = r.user_id
+		JOIN payments p ON p.rental_id = r.id AND p.user_id = r.user_id
+		JOIN deposit_holds d ON d.rental_id = r.id
+		WHERE r.id = $1
+		FOR UPDATE OF p, r, a, u, d`
+
+	var state WalletRefundState
+	err := db.QueryRow(ctx, withHoldQuery, rentalID).Scan(
+		&state.PaymentID,
+		&state.RentalID,
+		&state.UserID,
+		&state.AccountID,
+		&state.Provider,
+		&state.PaymentStatus,
+		&state.RentalStatus,
+		&state.RentalPrice,
+		&state.DepositAmount,
+		&state.Currency,
+		&state.UserBalance,
+		&state.HoldID,
+		&state.HoldStatus,
+		&state.HoldAmount,
+	)
+	if err == nil {
+		state.HasDepositHold = true
+		return &state, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	withoutHoldQuery := `
+		SELECT
+			p.id,
+			r.id,
+			r.user_id,
+			r.account_id,
+			p.provider,
+			p.status,
+			r.status,
+			r.rental_price,
+			r.deposit_amount,
+			p.currency,
+			u.balance
+		FROM rentals r
+		JOIN accounts a ON a.id = r.account_id
+		JOIN users u ON u.id = r.user_id
+		JOIN payments p ON p.rental_id = r.id AND p.user_id = r.user_id
+		WHERE r.id = $1
+		FOR UPDATE OF p, r, a, u`
+
+	if err := db.QueryRow(ctx, withoutHoldQuery, rentalID).Scan(
+		&state.PaymentID,
+		&state.RentalID,
+		&state.UserID,
+		&state.AccountID,
+		&state.Provider,
+		&state.PaymentStatus,
+		&state.RentalStatus,
+		&state.RentalPrice,
+		&state.DepositAmount,
+		&state.Currency,
+		&state.UserBalance,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrWalletRefundNotFound
+		}
+		return nil, err
+	}
+	return &state, nil
+}
+
 func (r *PostgresRepository) ListUserLedgerEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicLedgerEntry, error) {
 	db := database.GetTxOrPool(ctx, r.pool)
 	rows, err := db.Query(ctx, `
@@ -301,6 +474,82 @@ func (r *PostgresRepository) CountUserLedgerEntries(ctx context.Context, userID 
 	return total, nil
 }
 
+func (r *PostgresRepository) ListUserRefundEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicRefundEntry, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	rows, err := db.Query(ctx, `
+		SELECT
+			id,
+			rental_id,
+			payment_id,
+			status,
+			amount_principal,
+			amount_deposit,
+			amount_total,
+			currency,
+			reason_code,
+			created_at,
+			processed_at
+		FROM refunds
+		WHERE user_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2 OFFSET $3`,
+		userID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]PublicRefundEntry, 0, limit)
+	for rows.Next() {
+		var (
+			entry         PublicRefundEntry
+			statusCode    int16
+			reasonCodeRaw string
+			processedAt   sql.NullTime
+		)
+		if err := rows.Scan(
+			&entry.ID,
+			&entry.RentalID,
+			&entry.PaymentID,
+			&statusCode,
+			&entry.PrincipalAmount,
+			&entry.DepositAmount,
+			&entry.TotalAmount,
+			&entry.Currency,
+			&reasonCodeRaw,
+			&entry.CreatedAt,
+			&processedAt,
+		); err != nil {
+			return nil, err
+		}
+		entry.Status = publicRefundStatus(statusCode)
+		if isSafeReasonCode(reasonCodeRaw) {
+			reasonCode := reasonCodeRaw
+			entry.ReasonCode = &reasonCode
+		}
+		if processedAt.Valid {
+			value := processedAt.Time
+			entry.ProcessedAt = &value
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
+func (r *PostgresRepository) CountUserRefundEntries(ctx context.Context, userID int64) (int64, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var total int64
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM refunds WHERE user_id = $1`, userID).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
 func publicLedgerDisplayType(entryType int16) string {
 	switch entryType {
 	case ledgerEntryProviderPaymentReceived:
@@ -313,6 +562,23 @@ func publicLedgerDisplayType(entryType int16) string {
 		return "DEPOSIT_FORFEITED"
 	case ledgerEntryBalanceDebit:
 		return "BALANCE_DEBIT"
+	case ledgerEntryBalanceRefundCredit:
+		return "BALANCE_REFUND_CREDIT"
+	case ledgerEntryDepositRefundCredit:
+		return "DEPOSIT_REFUND_CREDIT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func publicRefundStatus(status int16) string {
+	switch status {
+	case refundStatusRequested:
+		return "REQUESTED"
+	case refundStatusCompleted:
+		return "COMPLETED"
+	case refundStatusFailed:
+		return "FAILED"
 	default:
 		return "UNKNOWN"
 	}
@@ -633,6 +899,25 @@ func (r *PostgresRepository) MarkDepositForfeited(ctx context.Context, holdID in
 	return nil
 }
 
+func (r *PostgresRepository) MarkDepositRefunded(ctx context.Context, holdID, refundID int64, now time.Time) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	query := `
+		UPDATE deposit_holds
+		SET status = $2,
+			refunded_at = $3,
+			refund_id = $4,
+			updated_at = $3
+		WHERE id = $1 AND status = $5`
+	tag, err := db.Exec(ctx, query, holdID, depositHoldStatusRefunded, now, refundID, depositHoldStatusHeld)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrDepositSettlementNotAllowed
+	}
+	return nil
+}
+
 func (r *PostgresRepository) CreditUserBalance(ctx context.Context, userID, amount int64, now time.Time) error {
 	db := database.GetTxOrPool(ctx, r.pool)
 	query := `
@@ -678,6 +963,185 @@ func (r *PostgresRepository) RecordDepositReleasedToBalance(ctx context.Context,
 
 func (r *PostgresRepository) RecordDepositForfeited(ctx context.Context, entry FinancialLedgerEntry) error {
 	return r.insertLedgerEntry(ctx, ledgerEntryDepositForfeited, entry)
+}
+
+func (r *PostgresRepository) RecordBalanceRefundCredit(ctx context.Context, entry FinancialLedgerEntry) error {
+	return r.insertLedgerEntry(ctx, ledgerEntryBalanceRefundCredit, entry)
+}
+
+func (r *PostgresRepository) RecordDepositRefundCredit(ctx context.Context, entry FinancialLedgerEntry) error {
+	return r.insertLedgerEntry(ctx, ledgerEntryDepositRefundCredit, entry)
+}
+
+func (r *PostgresRepository) CreateRefund(ctx context.Context, refund RefundRecord) (*RefundRecord, bool, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	insertQuery := `
+		INSERT INTO refunds (
+			payment_id,
+			rental_id,
+			user_id,
+			account_id,
+			source_type,
+			refund_kind,
+			status,
+			reason_code,
+			requested_by_user_id,
+			requested_by_role,
+			amount_principal,
+			amount_deposit,
+			amount_total,
+			currency,
+			idempotency_key,
+			correlation_id,
+			metadata
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+			$11, $12, $13, $14, $15, $16, COALESCE($17::jsonb, '{}'::jsonb)
+		)
+		ON CONFLICT (idempotency_key) DO NOTHING
+		RETURNING id, processed_at, updated_at`
+
+	var created RefundRecord
+	var processedAt sql.NullTime
+	var updatedAt time.Time
+	err := db.QueryRow(
+		ctx,
+		insertQuery,
+		refund.PaymentID,
+		refund.RentalID,
+		refund.UserID,
+		refund.AccountID,
+		refund.SourceType,
+		refund.RefundKind,
+		refund.Status,
+		refund.ReasonCode,
+		refund.RequestedByUserID,
+		refund.RequestedByRole,
+		refund.AmountPrincipal,
+		refund.AmountDeposit,
+		refund.AmountTotal,
+		refund.Currency,
+		refund.IdempotencyKey,
+		refund.CorrelationID,
+		refund.Metadata,
+	).Scan(&created.ID, &processedAt, &updatedAt)
+	if err == nil {
+		refund.ID = created.ID
+		if processedAt.Valid {
+			ts := processedAt.Time
+			refund.ProcessedAt = &ts
+		}
+		return &refund, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, err
+	}
+
+	existing, loadErr := r.loadRefundByIdempotencyKey(ctx, refund.IdempotencyKey)
+	if loadErr != nil {
+		return nil, false, loadErr
+	}
+	return existing, false, nil
+}
+
+func (r *PostgresRepository) loadRefundByIdempotencyKey(ctx context.Context, idempotencyKey string) (*RefundRecord, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	query := `
+		SELECT
+			id,
+			payment_id,
+			rental_id,
+			user_id,
+			COALESCE(account_id, 0),
+			source_type,
+			refund_kind,
+			status,
+			reason_code,
+			requested_by_user_id,
+			requested_by_role,
+			amount_principal,
+			amount_deposit,
+			amount_total,
+			currency,
+			idempotency_key,
+			COALESCE(correlation_id, ''),
+			metadata::text,
+			processed_at
+		FROM refunds
+		WHERE idempotency_key = $1
+		FOR UPDATE`
+
+	var refund RefundRecord
+	var accountID int64
+	var requestedByUserID sql.NullInt64
+	var processedAt sql.NullTime
+	if err := db.QueryRow(ctx, query, idempotencyKey).Scan(
+		&refund.ID,
+		&refund.PaymentID,
+		&refund.RentalID,
+		&refund.UserID,
+		&accountID,
+		&refund.SourceType,
+		&refund.RefundKind,
+		&refund.Status,
+		&refund.ReasonCode,
+		&requestedByUserID,
+		&refund.RequestedByRole,
+		&refund.AmountPrincipal,
+		&refund.AmountDeposit,
+		&refund.AmountTotal,
+		&refund.Currency,
+		&refund.IdempotencyKey,
+		&refund.CorrelationID,
+		&refund.Metadata,
+		&processedAt,
+	); err != nil {
+		return nil, err
+	}
+	refund.AccountID = accountID
+	if requestedByUserID.Valid {
+		value := requestedByUserID.Int64
+		refund.RequestedByUserID = &value
+	}
+	if processedAt.Valid {
+		ts := processedAt.Time
+		refund.ProcessedAt = &ts
+	}
+	return &refund, nil
+}
+
+func (r *PostgresRepository) LoadCompletedRefundTotals(ctx context.Context, paymentID int64) (*RefundTotals, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	query := `
+		SELECT
+			COALESCE(SUM(amount_principal), 0),
+			COALESCE(SUM(amount_deposit), 0)
+		FROM refunds
+		WHERE payment_id = $1 AND status = $2`
+
+	var totals RefundTotals
+	if err := db.QueryRow(ctx, query, paymentID, refundStatusCompleted).Scan(&totals.Principal, &totals.Deposit); err != nil {
+		return nil, err
+	}
+	return &totals, nil
+}
+
+func (r *PostgresRepository) MarkRefundCompleted(ctx context.Context, refundID int64, now time.Time) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	query := `
+		UPDATE refunds
+		SET status = $2,
+			processed_at = $3,
+			updated_at = $3
+		WHERE id = $1 AND status = $4`
+	tag, err := db.Exec(ctx, query, refundID, refundStatusCompleted, now, refundStatusRequested)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrWalletRefundNotAllowed
+	}
+	return nil
 }
 
 func (r *PostgresRepository) insertLedgerEntry(ctx context.Context, entryType int16, entry FinancialLedgerEntry) error {
@@ -740,6 +1204,16 @@ func (r *PostgresRepository) LogWalletSecurityEvent(ctx context.Context, userID,
 	}
 
 	_, err := db.Exec(ctx, query, userID, accountID, rentalID, securityEventTypeWalletPayment, ipParam, userAgent, metadata)
+	return err
+}
+
+func (r *PostgresRepository) LogRefundSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, userAgent string, metadata []byte) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	query := `
+		INSERT INTO security_events (
+			user_id, account_id, rental_id, event_type, ip_address, user_agent, success, metadata, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, true, $7, NOW())`
+	_, err := db.Exec(ctx, query, userID, accountID, rentalID, securityEventTypeWalletRefund, nil, userAgent, metadata)
 	return err
 }
 

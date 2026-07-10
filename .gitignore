@@ -16,6 +16,7 @@ web/*.tsbuildinfo
 # Claude Flow runtime data
 .claude-flow
 .agents
+.agent
 .swarm
 # Environment variables
 .env

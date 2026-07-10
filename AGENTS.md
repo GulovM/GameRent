@@ -266,6 +266,23 @@ Never store:
 * database credentials;
 * user personal data.
 
+## Technical debt handling
+
+For every completed task:
+
+1. Extract newly discovered technical debt.
+2. Classify it as:
+
+   * P0: correctness, security, money, data integrity, test coverage for critical flow;
+   * P1: operational risk, scalability, maintainability, admin usability;
+   * P2: future capability or non-blocking improvement.
+3. For each item state one disposition:
+
+   * fixed in current task;
+   * scheduled as the next task;
+   * explicitly deferred with a reason and trigger for revisiting.
+4. Do not continue feature expansion when unresolved P0 debt affects money, authorization, concurrency, data integrity, or critical flow test coverage.
+
 ## Validation commands
 
 Run the narrowest relevant checks first.

@@ -1,9 +1,10 @@
 import { LogIn, UserRound } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
-import { api, type FinancialBalance, type LedgerEntry, type Pagination, type User } from "../../api";
+import { api, type FinancialBalance, type LedgerEntry, type Pagination, type RefundEntry, type User } from "../../api";
 import { messageForApiError } from "../../utils/apiErrors";
 import { BalancePanel } from "./BalancePanel";
 import { FinancialHistoryPanel } from "./FinancialHistoryPanel";
+import { RefundHistoryPanel } from "./RefundHistoryPanel";
 
 type ProfileViewProps = {
   onLogin: () => void;
@@ -23,6 +24,11 @@ export function ProfileView({ onLogin, onUpdateUser, user }: ProfileViewProps) {
   const [ledgerPage, setLedgerPage] = useState(1);
   const [ledgerLoading, setLedgerLoading] = useState(false);
   const [ledgerError, setLedgerError] = useState<string | null>(null);
+  const [refunds, setRefunds] = useState<RefundEntry[]>([]);
+  const [refundsPagination, setRefundsPagination] = useState<Pagination | null>(null);
+  const [refundsPage, setRefundsPage] = useState(1);
+  const [refundsLoading, setRefundsLoading] = useState(false);
+  const [refundsError, setRefundsError] = useState<string | null>(null);
 
   useEffect(() => {
     setFirstName(user?.first_name ?? "");
@@ -37,6 +43,10 @@ export function ProfileView({ onLogin, onUpdateUser, user }: ProfileViewProps) {
       setLedgerPage(1);
       setBalanceError(null);
       setLedgerError(null);
+      setRefunds([]);
+      setRefundsPagination(null);
+      setRefundsPage(1);
+      setRefundsError(null);
       return;
     }
 
@@ -45,32 +55,42 @@ export function ProfileView({ onLogin, onUpdateUser, user }: ProfileViewProps) {
     async function loadFinancialData() {
       setBalanceLoading(true);
       setLedgerLoading(true);
+      setRefundsLoading(true);
       setBalanceError(null);
       setLedgerError(null);
+      setRefundsError(null);
       try {
-        const [balanceRes, ledgerRes] = await Promise.all([api.myBalance(), api.myLedger({ page: ledgerPage, page_size: 20 })]);
+        const [balanceRes, ledgerRes, refundsRes] = await Promise.all([
+          api.myBalance(),
+          api.myLedger({ page: ledgerPage, page_size: 20 }),
+          api.myRefunds({ page: refundsPage, page_size: 20 })
+        ]);
         if (!active) return;
         setBalance(balanceRes);
         setLedger(ledgerRes.entries);
         setLedgerPagination(ledgerRes.pagination);
+        setRefunds(refundsRes.refunds);
+        setRefundsPagination(refundsRes.pagination);
       } catch (error) {
         if (!active) return;
-        const message = messageForApiError(error, "Не удалось загрузить финансовые данные");
+        const message = messageForApiError(error, "Failed to load financial data");
         setBalanceError(message);
         setLedgerError(message);
+        setRefundsError(message);
       } finally {
         if (!active) return;
         setBalanceLoading(false);
         setLedgerLoading(false);
+        setRefundsLoading(false);
       }
     }
 
-    void loadFinancialData()
+    void loadFinancialData();
 
     return () => {
       active = false;
     };
-  }, [ledgerPage, user]);
+  }, [ledgerPage, refundsPage, user]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -89,7 +109,7 @@ export function ProfileView({ onLogin, onUpdateUser, user }: ProfileViewProps) {
       <section className="workspace empty-state">
         <UserRound size={42} />
         <h2>Войдите в аккаунт</h2>
-        <p>Профиль, аренды, платежи и уведомления доступны после авторизации.</p>
+        <p>Профиль, аренды, платежи и финансовая история доступны после авторизации.</p>
         <button className="primary-button" onClick={onLogin} type="button">
           <LogIn size={18} />
           Войти
@@ -137,6 +157,14 @@ export function ProfileView({ onLogin, onUpdateUser, user }: ProfileViewProps) {
         onNextPage={() => setLedgerPage((current) => (ledgerPagination && current < ledgerPagination.total_pages ? current + 1 : current))}
         onPrevPage={() => setLedgerPage((current) => (current > 1 ? current - 1 : current))}
         pagination={ledgerPagination}
+      />
+      <RefundHistoryPanel
+        entries={refunds}
+        error={refundsError}
+        loading={refundsLoading}
+        onNextPage={() => setRefundsPage((current) => (refundsPagination && current < refundsPagination.total_pages ? current + 1 : current))}
+        onPrevPage={() => setRefundsPage((current) => (current > 1 ? current - 1 : current))}
+        pagination={refundsPagination}
       />
     </section>
   );

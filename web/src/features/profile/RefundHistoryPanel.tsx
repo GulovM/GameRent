@@ -1,9 +1,10 @@
-import { ChevronLeft, ChevronRight, Wallet } from "lucide-react";
-import type { LedgerEntry, Pagination } from "../../api";
+import { ChevronLeft, ChevronRight, RotateCcw } from "lucide-react";
+import type { Pagination, RefundEntry } from "../../api";
+import { refundStatusClass, refundStatusLabel } from "../refunds/refundStatus";
 import { formatTimestamp, money } from "../../utils/format";
 
-type FinancialHistoryPanelProps = {
-  entries: LedgerEntry[];
+type RefundHistoryPanelProps = {
+  entries: RefundEntry[];
   error: string | null;
   loading: boolean;
   onNextPage: () => void;
@@ -11,15 +12,7 @@ type FinancialHistoryPanelProps = {
   pagination: Pagination | null;
 };
 
-export function FinancialHistoryPanel({
-  entries,
-  error,
-  loading,
-  onNextPage,
-  onPrevPage,
-  pagination
-}: FinancialHistoryPanelProps) {
-  const hasEntries = entries.length > 0;
+export function RefundHistoryPanel({ entries, error, loading, onNextPage, onPrevPage, pagination }: RefundHistoryPanelProps) {
   const currentPage = pagination?.page ?? 1;
   const totalPages = pagination?.total_pages ?? 0;
 
@@ -27,8 +20,8 @@ export function FinancialHistoryPanel({
     <section className="profile-form">
       <div className="section-heading">
         <div>
-          <h2>Ledger history</h2>
-          <p>Only safe read-only ledger entries without technical metadata.</p>
+          <h2>Refund history</h2>
+          <p>Read-only refund records without internal metadata or actor details.</p>
         </div>
         <div className="row-actions">
           <button className="secondary-button" disabled={currentPage <= 1 || loading} onClick={onPrevPage} type="button">
@@ -43,31 +36,35 @@ export function FinancialHistoryPanel({
       </div>
       {loading ? (
         <div className="empty-inline">
-          <Wallet size={24} />
-          <span>Loading ledger history...</span>
+          <RotateCcw size={24} />
+          <span>Загрузка refund history...</span>
         </div>
       ) : error ? (
         <p className="error-text">{error}</p>
-      ) : !hasEntries ? (
+      ) : entries.length === 0 ? (
         <div className="empty-inline">
-          <Wallet size={24} />
-          <strong>Ledger history is empty</strong>
-          <span>Financial ledger entries will appear after payment and deposit settlement.</span>
+          <RotateCcw size={24} />
+          <strong>Refund history is empty</strong>
+          <span>Completed wallet refunds will appear here.</span>
         </div>
       ) : (
         <div className="ledger-list">
           {entries.map((entry) => (
             <article className="ledger-row" key={entry.id}>
               <div>
-                <strong>{entry.display_type}</strong>
+                <strong>Rental #{entry.rental_id}</strong>
                 <div className="rental-meta">
-                  {entry.rental_id ? <span>Rental #{entry.rental_id}</span> : null}
-                  {entry.payment_id ? <span>Payment #{entry.payment_id}</span> : null}
+                  <span>Payment #{entry.payment_id}</span>
+                  <span className={`status-pill ${refundStatusClass(entry.status)}`}>{refundStatusLabel(entry.status)}</span>
+                </div>
+                <div className="refund-breakdown">
+                  <span>Principal: {money({ amount: entry.principal_amount, currency: entry.currency })}</span>
+                  <span>Deposit: {money({ amount: entry.deposit_amount, currency: entry.currency })}</span>
                 </div>
               </div>
               <div className="ledger-row-side">
-                <strong>{money({ amount: entry.amount, currency: entry.currency })}</strong>
-                <span>{formatTimestamp(entry.created_at)}</span>
+                <strong>{money({ amount: entry.total_amount, currency: entry.currency })}</strong>
+                <span>{formatTimestamp(entry.processed_at ?? entry.created_at)}</span>
               </div>
             </article>
           ))}
@@ -78,7 +75,7 @@ export function FinancialHistoryPanel({
           Страница <strong>{currentPage}</strong>
         </span>
         <span>
-          Total entries <strong>{pagination?.total_items ?? 0}</strong>
+          Всего возвратов <strong>{pagination?.total_items ?? 0}</strong>
         </span>
       </div>
     </section>

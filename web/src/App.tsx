@@ -1,6 +1,26 @@
 import { DatabaseZap } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Account, api, AuditLog, clearTokens, FinancialBalance, getAccessToken, getRefreshToken, NotificationItem, Payment, Rental, RentalCredentials, User } from "./api";
+import {
+  Account,
+  AdminRentalFilters,
+  AdminRentalSummary,
+  AdminRentalRefundSummary,
+  AdminWalletRefundResponse,
+  api,
+  AuditLog,
+  clearTokens,
+  FinancialBalance,
+  getAccessToken,
+  getRefreshToken,
+  isApiError,
+  NotificationItem,
+  Pagination,
+  Payment,
+  RefundReasonCodeOption,
+  Rental,
+  RentalCredentials,
+  User
+} from "./api";
 import { AppHeader } from "./components/AppHeader";
 import { AuthDialog } from "./components/AuthDialog";
 import { MobileNav } from "./components/MobileNav";
@@ -20,6 +40,8 @@ import {
 import type { AdminAccountPatch, Toast, View } from "./types/app";
 import { isUnauthorized, messageForApiError, messageForWalletPaymentError } from "./utils/apiErrors";
 import { asList, normalizeAccount, statusFromNumber } from "./utils/accounts";
+
+const DEFAULT_ADMIN_RENTAL_FILTERS: AdminRentalFilters = {};
 
 function useTicker() {
   const [, setTick] = useState(0);
@@ -42,6 +64,14 @@ export default function App() {
   const [payments, setPayments] = useState<Payment[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [adminRentals, setAdminRentals] = useState<AdminRentalRefundSummary[]>([]);
+  const [adminRentalsSummary, setAdminRentalsSummary] = useState<AdminRentalSummary | null>(null);
+  const [adminRentalsPagination, setAdminRentalsPagination] = useState<Pagination | null>(null);
+  const [adminRentalsPage, setAdminRentalsPage] = useState(1);
+  const [adminRentalFilters, setAdminRentalFilters] = useState<AdminRentalFilters>(DEFAULT_ADMIN_RENTAL_FILTERS);
+  const [adminRentalsLoading, setAdminRentalsLoading] = useState(false);
+  const [adminRentalsError, setAdminRentalsError] = useState<string | null>(null);
+  const [adminRefundReasonCodes, setAdminRefundReasonCodes] = useState<RefundReasonCodeOption[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [user, setUser] = useState<User | null>(null);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
@@ -88,6 +118,7 @@ export default function App() {
     } catch (error) {
       if (isUnauthorized(error)) {
         setBalanceLoading(false);
+        setAdminRentalsLoading(false);
         handleAuthFailure();
         return;
       }
@@ -108,6 +139,14 @@ export default function App() {
     setBalance(null);
     setNotifications([]);
     setAuditLogs([]);
+    setAdminRentals([]);
+    setAdminRentalsSummary(null);
+    setAdminRentalsPagination(null);
+    setAdminRentalsPage(1);
+    setAdminRentalFilters(DEFAULT_ADMIN_RENTAL_FILTERS);
+    setAdminRentalsLoading(false);
+    setAdminRentalsError(null);
+    setAdminRefundReasonCodes([]);
     setAdminUsers([]);
     setSelectedRentalId(null);
     setCredentials(null);
@@ -176,6 +215,8 @@ export default function App() {
   async function loadPrivateData() {
     setBackendError(null);
     setBalanceLoading(true);
+    setAdminRentalsLoading(true);
+    setAdminRentalsError(null);
 
     try {
       const [meRes, rentalsRes, paymentsRes, notificationsRes, balanceRes] = await Promise.all([
@@ -194,13 +235,20 @@ export default function App() {
 
       if (meRes.role === "ADMIN") {
         setView("admin");
-        const [adminAccountsRes, usersRes, auditRes, publicAccountsRes] = await Promise.all([
+        const [adminAccountsRes, adminRentalsRes, usersRes, auditRes, publicAccountsRes, refundReasonCodesRes] = await Promise.all([
           api.adminAccounts(),
+          api.adminRentals(buildAdminRentalsQuery(adminRentalsPage, adminRentalFilters)),
           api.adminUsers(),
           api.adminAuditLogs(),
-          api.accounts({ page: 1, page_size: 40 })
+          api.accounts({ page: 1, page_size: 40 }),
+          api.adminRefundReasonCodes()
         ]);
 
+        setAdminRentals(asList(adminRentalsRes.rentals));
+        setAdminRentalsSummary(adminRentalsRes.summary);
+        setAdminRentalsPagination(adminRentalsRes.pagination);
+        setAdminRentalsPage(adminRentalsRes.pagination.page);
+        setAdminRefundReasonCodes(asList(refundReasonCodesRes.reason_codes));
         setAdminUsers(asList(usersRes.users));
         setAuditLogs(asList(auditRes.audit_logs));
 
@@ -220,6 +268,7 @@ export default function App() {
         );
       }
       setBalanceLoading(false);
+      setAdminRentalsLoading(false);
     } catch (error) {
       if (isUnauthorized(error)) {
         setBalanceLoading(false);
@@ -230,9 +279,15 @@ export default function App() {
       setPayments([]);
       setNotifications([]);
       setAuditLogs([]);
+      setAdminRentals([]);
+      setAdminRentalsSummary(null);
+      setAdminRentalsPagination(null);
+      setAdminRentalsError(null);
+      setAdminRefundReasonCodes([]);
       setAdminUsers([]);
       setBalance(null);
       setBalanceLoading(false);
+      setAdminRentalsLoading(false);
       setBackendError(error instanceof Error ? error.message : "Не удалось получить приватные данные");
     }
   }
@@ -564,6 +619,71 @@ export default function App() {
     }
   }
 
+  function buildAdminRentalsQuery(page: number, filters: AdminRentalFilters) {
+    return {
+      page,
+      page_size: 20,
+      rental_status: filters.rental_status || undefined,
+      payment_status: filters.payment_status || undefined,
+      payment_provider: filters.payment_provider || undefined,
+      deposit_status: filters.deposit_status || undefined,
+      refund_status: filters.refund_status || undefined,
+      eligible_wallet_refund: filters.eligible_wallet_refund,
+      user_id: filters.user_id,
+      rental_id: filters.rental_id
+    };
+  }
+
+  async function refreshAdminRentals(page = adminRentalsPage, filters = adminRentalFilters) {
+    setAdminRentalsLoading(true);
+    setAdminRentalsError(null);
+    try {
+      const result = await api.adminRentals(buildAdminRentalsQuery(page, filters));
+      setAdminRentals(asList(result.rentals));
+      setAdminRentalsSummary(result.summary);
+      setAdminRentalsPagination(result.pagination);
+      setAdminRentalsPage(result.pagination.page);
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        handleAuthFailure();
+        return;
+      }
+      const message = messageForApiError(error, "Failed to refresh admin refund data");
+      setAdminRentalsError(message);
+      setToast({ type: "error", message });
+      throw error;
+    } finally {
+      setAdminRentalsLoading(false);
+    }
+  }
+
+  async function handleAdminRentalFiltersChange(nextFilters: AdminRentalFilters) {
+    setAdminRentalFilters(nextFilters);
+    setAdminRentalsPage(1);
+    await refreshAdminRentals(1, nextFilters);
+  }
+
+  async function handleAdminRentalFiltersReset() {
+    setAdminRentalFilters(DEFAULT_ADMIN_RENTAL_FILTERS);
+    setAdminRentalsPage(1);
+    await refreshAdminRentals(1, DEFAULT_ADMIN_RENTAL_FILTERS);
+  }
+
+  async function handleAdminWalletRefund(rentalId: number, reasonCode: string): Promise<AdminWalletRefundResponse> {
+    try {
+      const result = await api.adminWalletRefund(rentalId, reasonCode);
+      await refreshAdminRentals();
+      return result;
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        handleAuthFailure();
+      } else if (isApiError(error) && (error.status === 404 || error.status === 409)) {
+        await refreshAdminRentals().catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
   async function handleLogout() {
     const refresh = getRefreshToken();
     clearTokens();
@@ -636,8 +756,30 @@ export default function App() {
         {effectiveView === "admin" && (
           <AdminView
             accounts={accounts}
+            adminRentals={adminRentals}
+            adminRentalFilters={adminRentalFilters}
+            adminRentalsError={adminRentalsError}
+            adminRentalsLoading={adminRentalsLoading}
+            adminRentalsPagination={adminRentalsPagination}
+            adminRentalsSummary={adminRentalsSummary}
+            refundReasonOptions={adminRefundReasonCodes}
             auditLogs={auditLogs}
+            onAdminRentalFiltersChange={handleAdminRentalFiltersChange}
+            onAdminRentalFiltersReset={handleAdminRentalFiltersReset}
             onCreateAccount={handleCreateAccount}
+            onNextRefundPage={() => {
+              if (!adminRentalsPagination || adminRentalsPage >= adminRentalsPagination.total_pages) {
+                return Promise.resolve();
+              }
+              return refreshAdminRentals(adminRentalsPage + 1);
+            }}
+            onPrevRefundPage={() => {
+              if (adminRentalsPage <= 1) {
+                return Promise.resolve();
+              }
+              return refreshAdminRentals(adminRentalsPage - 1);
+            }}
+            onWalletRefund={handleAdminWalletRefund}
             onSync={handleSyncAccount}
             onToggleAccount={handleToggleAccount}
             onUpdateAccount={handleUpdateAccount}

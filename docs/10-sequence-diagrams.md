@@ -543,7 +543,7 @@ sequenceDiagram
 
 ### 14. Rental Completion
 
-**Description** Реализованные терминальные сценарии: отмена неоплаченной аренды пользователем/owner flow и автоматическое истечение активной аренды. Включает отзыв доступа и освобождение ресурсов без refund/deposit ledger.
+**Description** Реализованные терминальные сценарии: отмена неоплаченной аренды пользователем/owner flow и автоматическое истечение активной аренды. Включает отзыв доступа, освобождение ресурсов и сохранение уже подтверждённого финансового состояния без автоматического refund.
 
 **Flow** 1. Клиент отправляет запрос на эндпоинт `POST /rentals/{rentalId}/cancel` для `WAITING_PAYMENT` rental или триггер срабатывает из фонового планировщика `Scheduler` для истёкшей `ACTIVE` rental.
 2. `Rental Handler` вызывает Use Case метод в `Rental Service`.
@@ -556,13 +556,46 @@ sequenceDiagram
 
 ---
 
-### 15. Deposit Release / Return
+### 15. Admin Wallet Refund
 
-**Description** Будущий процесс автоматического возврата денежного залога (Deposit). В текущем backend refund/deposit ledger не реализован, поэтому этот раздел описывает целевое расширение, а не исполняемый flow.
+**Description** Реализованный admin/system flow полного refund для wallet-paid rental. Refund не меняет `payment.status` и `rental.status`, а кредитует `users.balance` через immutable ledger.
 
-**Current status** 1. Отдельные refund/deposit payment records не создаются.
-2. Payment `SUCCESS` после expiration не изменяется.
-3. Возврат депозита, ledger и отдельные notification events для deposit release остаются будущим расширением.
+```mermaid
+sequenceDiagram
+    participant Admin as ADMIN
+    participant API as Admin Refund API
+    participant Service as Payment/Refund Service
+    participant DB as PostgreSQL
+    participant Audit as Audit/Security
+
+    Admin->>API: POST /api/v1/admin/rentals/{rentalId}/wallet-refund
+    API->>Service: RefundWalletPayment(rentalId, reason_code)
+    Service->>DB: tx begin
+    Service->>DB: lock user, payment, rental, account, deposit_hold
+    Service->>Service: eligibility checks
+    Service->>DB: create/load refund by deterministic idempotency key
+    Service->>DB: credit users.balance
+    alt deposit_hold == HELD and deposit > 0
+        Service->>DB: deposit_hold HELD -> REFUNDED
+        Service->>DB: insert DEPOSIT_REFUND_CREDIT
+    end
+    Service->>DB: insert BALANCE_REFUND_CREDIT
+    Service->>DB: mark refund COMPLETED
+    Service->>Audit: write audit/security event
+    Service->>DB: commit
+    API-->>Admin: success/data summary
+```
+
+**Current behavior**
+
+1. Flow доступен только `ADMIN` API actor и service-level actor `SYSTEM`.
+2. Работает только для wallet-paid `SUCCESS` payment.
+3. Rental должен быть в `EXPIRED` или `COMPLETED`.
+4. `reason_code` обязателен и валидируется как короткий код.
+5. Backend сам вычисляет principal/deposit refund из текущего DB state.
+6. При `deposit_hold = HELD` депозит переводится в `REFUNDED` и кредитуется отдельной ledger entry.
+7. При `deposit_hold = RELEASED` или `FORFEITED` principal можно вернуть, но депозит повторно не кредитуется.
+8. Повторный identical request идемпотентен и не создаёт second credit.
 
 ---
 

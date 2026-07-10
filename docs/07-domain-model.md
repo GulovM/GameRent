@@ -741,7 +741,7 @@ PENDING
 SUCCESS
 ```
 
-В текущем backend создание rental создаёт payment сразу в `PENDING`. Статусы refund/deposit ledger не реализованы.
+В текущем backend создание rental создаёт payment сразу в `PENDING`. И provider webhook, и wallet payment переводят один и тот же payment `PENDING -> SUCCESS`. Отдельного `payment.status = REFUNDED` нет: refund моделируется через `refunds` и immutable ledger.
 
 ---
 
@@ -774,11 +774,48 @@ SUCCESS
 | From | To | Trigger | Notes |
 | --- | --- | --- | --- |
 | `PENDING` | `SUCCESS` | successful webhook | требует `external_transaction_id`; активирует rental |
+| `PENDING` | `SUCCESS` | `POST /me/rentals/{rentalId}/pay-with-balance` | списывает `users.balance`; активирует rental |
 | `PENDING` | `FAILED` | cancel `WAITING_PAYMENT` | terminal для отменённой неоплаченной аренды |
 | `PENDING` | `FAILED` | waiting-payment cleanup | terminal для просроченной неоплаченной аренды |
 | `SUCCESS` | `SUCCESS` | repeated webhook with same `external_transaction_id` | идемпотентный no-op |
 
-`provider` и `external_transaction_id` используются для идемпотентности webhook. Отдельный refund/deposit ledger пока не реализован.
+`provider` и `external_transaction_id` используются для идемпотентности webhook. Wallet payment использует `provider = balance` и отдельный flow списания внутреннего баланса.
+
+---
+
+## 11.4 Deposit Hold State Machine
+
+```
+HELD
+ ├──────────────► RELEASED
+ ├──────────────► FORFEITED
+ └──────────────► REFUNDED
+```
+
+`HELD` создаётся только для аренды с ненулевым депозитом. Terminal states `RELEASED`, `FORFEITED` и `REFUNDED` взаимоисключающие.
+
+Реализованные переходы:
+
+| From | To | Trigger | Notes |
+| --- | --- | --- | --- |
+| `HELD` | `RELEASED` | admin/system deposit release | кредитует `users.balance` на сумму депозита |
+| `HELD` | `FORFEITED` | admin deposit forfeit | `users.balance` не меняется |
+| `HELD` | `REFUNDED` | admin/system wallet full refund | допускается только для wallet-paid rental |
+
+---
+
+## 11.5 Refund Aggregate State Machine
+
+```
+REQUESTED
+    │
+    ├──────────────► FAILED
+    │
+    ▼
+COMPLETED
+```
+
+На текущем этапе реализован только wallet-paid full refund. Refund не меняет `rental.status` и не переводит `payment.status` в отдельный refund status.
 
 ---
 
@@ -868,6 +905,10 @@ Credentials не возвращаются из `POST /rentals` или `POST /pay
 
 ## Payment
 
+Денежные значения хранятся только в integer minor units.
+
+`users.balance`, `payments`, `financial_ledger_entries`, `deposit_holds` и `refunds` вместе образуют текущую финансовую модель.
+
 Сумма платежа всегда больше нуля.
 
 ---
@@ -878,7 +919,15 @@ Credentials не возвращаются из `POST /rentals` или `POST /pay
 
 Возврат не может превышать сумму первоначального платежа.
 
-Refund/deposit ledger пока не реализован в backend; это правило остаётся целевым ограничением для будущего ledger, а не текущим исполняемым flow.
+Wallet full refund в текущем backend допускается только для wallet-paid `SUCCESS` payment и только когда rental уже находится в `EXPIRED` или `COMPLETED`.
+
+При wallet refund principal и deposit учитываются отдельно:
+
+* `BALANCE_REFUND_CREDIT` кредитует principal в `users.balance`;
+* `DEPOSIT_REFUND_CREDIT` кредитует deposit только если hold ещё находится в `HELD`;
+* если `deposit_hold` уже `RELEASED` или `FORFEITED`, депозит повторно не кредитуется.
+
+Terminal consistency: один и тот же депозит не может одновременно быть `REFUNDED` и `RELEASED` или `FORFEITED`.
 
 ---
 

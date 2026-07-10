@@ -343,6 +343,12 @@ PATCH /admin/accounts/{accountId}
 
 POST /admin/accounts/{accountId}/sync
 
+GET /admin/rentals
+
+GET /admin/refund-reason-codes
+
+POST /admin/rentals/{rentalId}/wallet-refund
+
 GET /admin/users
 
 PATCH /admin/users/{userId}
@@ -363,6 +369,9 @@ GET /admin/audit-logs
 6. `POST /rentals/{rentalId}/cancel` отменяет только `WAITING_PAYMENT` аренду: `rental -> CANCELLED`, `payment PENDING -> FAILED`, `account RESERVED -> AVAILABLE`.
 7. Expiration worker переводит истёкшую `ACTIVE` аренду в `EXPIRED`, освобождает account `RENTED -> AVAILABLE` и не изменяет `SUCCESS` payment.
 8. Waiting-payment cleanup переводит просроченную неоплаченную аренду `WAITING_PAYMENT -> EXPIRED`, payment `PENDING -> FAILED`, account `RESERVED -> AVAILABLE`.
+9. Успешный provider webhook пишет immutable `financial_ledger_entries`: `PROVIDER_PAYMENT_RECEIVED` и, при ненулевом депозите, `DEPOSIT_HELD`.
+10. `POST /api/v1/admin/rentals/{rentalId}/wallet-refund` доступен только `ADMIN`, принимает `reason_code`, работает только для wallet-paid `SUCCESS` payment и rental в `EXPIRED` или `COMPLETED`. Backend сам рассчитывает full refund, не переводит `payment.status` в отдельный `REFUNDED` status и не меняет `rental.status` из-за refund.
+11. Wallet refund кредитует `users.balance` идемпотентно и пишет отдельные ledger entries `BALANCE_REFUND_CREDIT` и `DEPOSIT_REFUND_CREDIT`. Если `deposit_hold` уже `RELEASED` или `FORFEITED`, депозит повторно не кредитуется.
 
 Для одного account база запрещает одновременно более одной аренды в статусе `WAITING_PAYMENT` или `ACTIVE`.
 
@@ -372,11 +381,124 @@ Webhook idempotency:
 - конфликтующий `external_transaction_id` не принимается;
 - webhook без `payment_id` и без `external_transaction_id` отклоняется;
 - первая успешная обработка требует `external_transaction_id`;
-- `provider` и `external_transaction_id` сохраняются в `payments` как provider metadata.
+- `provider` и `external_transaction_id` сохраняются в `payments` как provider metadata;
+- wallet payment использует существующий `PENDING` payment и provider `balance`;
+- повторный wallet refund по тому же rental должен возвращать идемпотентный результат без второго balance credit;
+- refund history public API пока отсутствует.
 
-Refund/deposit ledger в текущем backend не реализован. `security_deposit` хранится в rental/payment суммах, но отдельного ledger для refund/deposit release нет.
+### Admin wallet refund contract
+
+`GET /api/v1/admin/refund-reason-codes` returns the backend-owned safe catalog for wallet refund reasons and should be used as the frontend source of truth:
+
+```json
+{
+  "success": true,
+  "data": {
+    "reason_codes": [
+      { "code": "SERVICE_UNAVAILABLE", "label": "Service unavailable" },
+      { "code": "ACCOUNT_INVALID", "label": "Account invalid" },
+      { "code": "ADMIN_CORRECTION", "label": "Admin correction" }
+    ]
+  }
+}
+```
+
+`POST /api/v1/admin/rentals/{rentalId}/wallet-refund`
+
+Request body:
+
+```json
+{
+  "reason_code": "SERVICE_UNAVAILABLE"
+}
+```
+
+Validation and behavior:
+
+- доступ только для `ADMIN`;
+- `reason_code` обязателен, короткий и ограничен буквами, цифрами, `_` и `-`;
+- endpoint работает только для wallet-paid payment (`provider = balance`);
+- payment должен быть `SUCCESS`;
+- rental должен быть `EXPIRED` или `COMPLETED`;
+- backend сам рассчитывает `principal_amount`, `deposit_amount` и `total_amount`;
+- credentials, ledger metadata, idempotency keys, provider details и внутренние correlation IDs в response не возвращаются.
+
+Success response (`200 OK`, стандартный response envelope):
+
+```json
+{
+  "success": true,
+  "data": {
+    "changed": true,
+    "idempotent": false,
+    "status": "COMPLETED",
+    "principal_amount": 500,
+    "deposit_amount": 700,
+    "total_amount": 1200,
+    "deposit_status": "REFUNDED"
+  }
+}
+```
+
+Known limitations of the current contract:
+
+- provider refund ещё не реализован;
+- partial refund ещё не реализован;
+- self-service refund ещё не реализован;
+- отдельный public refund history endpoint ещё не реализован;
+- system actor существует на service level, но отдельный internal caller surface пока не опубликован как API.
 
 ---
+
+### Admin rentals summary contract
+
+`GET /api/v1/admin/rentals` supports validated server-side filters:
+
+- `rental_status`: `WAITING_PAYMENT | ACTIVE | EXPIRED | CANCELLED | COMPLETED`
+- `payment_status`: `PENDING | SUCCESS | FAILED`
+- `payment_provider`: `balance | internal`
+- `deposit_status`: `NONE | HELD | RELEASED | FORFEITED | REFUNDED`
+- `refund_status`: `NONE | REQUESTED | COMPLETED | FAILED`
+- `eligible_wallet_refund`: `true | false`
+- `user_id`: exact `int64`
+- `rental_id`: exact `int64`
+- `page`: `> 0`
+- `page_size`: `> 0` and `<= 100`
+
+Invalid filter values return the standard validation envelope with `422 VALIDATION_ERROR`.
+
+The response includes a server-side `summary` alongside `rentals` and `pagination` so admin KPI values, `eligible_wallet_refund_count`, and `total_items` are all computed from the same filtered result set rather than from the loaded page slice:
+
+```json
+{
+  "success": true,
+  "data": {
+    "summary": {
+      "total_count": 120,
+      "eligible_wallet_refund_count": 7,
+      "rental_status_counts": {
+        "WAITING_PAYMENT": 10,
+        "ACTIVE": 20,
+        "EXPIRED": 30,
+        "COMPLETED": 40,
+        "CANCELLED": 20
+      },
+      "payment_status_counts": {
+        "PENDING": 10,
+        "SUCCESS": 90,
+        "FAILED": 15,
+        "CANCELLED": 5
+      },
+      "refund_status_counts": {
+        "NONE": 113,
+        "REQUESTED": 0,
+        "COMPLETED": 7,
+        "FAILED": 0
+      }
+    }
+  }
+}
+```
 
 # 11. HTTP Status Codes
 

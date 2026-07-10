@@ -87,7 +87,7 @@ func setupE2ETestDB(t *testing.T) (*pgxpool.Pool, database.TxManager) {
 		t.Fatalf("failed to run migrations: %v", err)
 	}
 
-	_, _ = poolConn.Pool.Exec(ctx, "TRUNCATE financial_ledger_entries, deposit_holds")
+	_, _ = poolConn.Pool.Exec(ctx, "TRUNCATE refunds, financial_ledger_entries, deposit_holds")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM payments")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM security_events")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM audit_logs")
@@ -147,6 +147,29 @@ func registerAndLoginE2EUser(t *testing.T, ts *httptest.Server, email, password,
 	}
 
 	return regResp.Data.User.ID, loginResp.Data.AccessToken
+}
+
+func loginE2EUser(t *testing.T, ts *httptest.Server, email, password string) string {
+	t.Helper()
+
+	loginReqBytes, _ := json.Marshal(auth.LoginRequest{Email: email, Password: password})
+	res, err := http.Post(ts.URL+"/api/v1/auth/login", "application/json", bytes.NewBuffer(loginReqBytes))
+	if err != nil {
+		t.Fatalf("failed to login user: %v", err)
+	}
+	defer res.Body.Close()
+
+	var loginResp struct {
+		Success bool               `json:"success"`
+		Data    auth.LoginResponse `json:"data"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&loginResp); err != nil {
+		t.Fatalf("failed to decode login response: %v", err)
+	}
+	if !loginResp.Success || loginResp.Data.AccessToken == "" {
+		t.Fatalf("unexpected login response: %+v", loginResp)
+	}
+	return loginResp.Data.AccessToken
 }
 
 func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
@@ -706,6 +729,7 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 	insertAccount(7103, 2, 500)
 	insertAccount(7104, 3, 0)
 	insertAccount(7105, 4, 500)
+	insertAccount(7106, 2, 500)
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at)
@@ -714,7 +738,8 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 			(7202, $1, 7102, 3, $3, $4, 500, 500, $5, $3, $3),
 			(7203, $1, 7103, 4, $3, $4, 500, 500, $5, $3, $3),
 			(7204, $1, 7104, 1, $3, $4, 500, 0, $5, $3, $3),
-			(7205, $2, 7105, 2, $3, $4, 500, 500, $5, $3, $3)`,
+			(7205, $2, 7105, 2, $3, $4, 500, 500, $5, $3, $3),
+			(7206, $1, 7106, 4, $3, $4, 500, 500, $5, $3, $3)`,
 		userID, otherUserID, now.Add(-2*time.Hour), now.Add(2*time.Hour), now.Add(30*time.Minute)); err != nil {
 		t.Fatalf("failed to insert rentals: %v", err)
 	}
@@ -726,7 +751,8 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 			(7302, 7202, $1, 1, 'internal', 2, 1000, 'USD', 'tx-7202', $3, $3),
 			(7303, 7203, $1, 1, 'internal', 2, 1000, 'USD', 'tx-7203', $3, $3),
 			(7304, 7204, $1, 1, 'internal', 1, 500, 'USD', NULL, $3, NULL),
-			(7305, 7205, $2, 1, 'internal', 2, 1000, 'USD', 'tx-7205', $3, $3)`,
+			(7305, 7205, $2, 1, 'internal', 2, 1000, 'USD', 'tx-7205', $3, $3),
+			(7306, 7206, $1, 1, 'balance', 2, 1000, 'USD', NULL, $3, $3)`,
 		userID, otherUserID, now.Add(-90*time.Minute)); err != nil {
 		t.Fatalf("failed to insert payments: %v", err)
 	}
@@ -737,9 +763,24 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 			(7401, 7201, $1, 7301, 500, 'USD', 1, $2, NULL, NULL, 'deposit:hold:rental:7201', $2, $2),
 			(7402, 7202, $1, 7302, 500, 'USD', 2, $2, $3, NULL, 'deposit:hold:rental:7202', $2, $3),
 			(7403, 7203, $1, 7303, 500, 'USD', 3, $2, NULL, $3, 'deposit:hold:rental:7203', $2, $3),
-			(7405, 7205, $4, 7305, 500, 'USD', 1, $2, NULL, NULL, 'deposit:hold:rental:7205', $2, $2)`,
+			(7405, 7205, $4, 7305, 500, 'USD', 1, $2, NULL, NULL, 'deposit:hold:rental:7205', $2, $2),
+			(7406, 7206, $1, 7306, 500, 'USD', 4, $2, NULL, NULL, 'deposit:hold:rental:7206', $2, $3)`,
 		userID, now.Add(-80*time.Minute), now.Add(-30*time.Minute), otherUserID); err != nil {
 		t.Fatalf("failed to insert deposit holds: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO refunds (
+			id, payment_id, rental_id, user_id, account_id, source_type, refund_kind, status, reason_code,
+			requested_by_user_id, requested_by_role, amount_principal, amount_deposit, amount_total, currency,
+			idempotency_key, correlation_id, metadata, processed_at, created_at, updated_at
+		)
+		VALUES
+			(7501, 7302, 7202, $1, 7102, 1, 1, 2, 'SERVICE_UNAVAILABLE', NULL, 'SYSTEM', 500, 0, 500, 'USD', 'refund:wallet:full:rental:7202', 'refund:wallet:full:rental:7202', '{}'::jsonb, $2, $3, $3),
+			(7502, 7306, 7206, $1, 7106, 1, 1, 2, 'SERVICE_UNAVAILABLE', NULL, 'SYSTEM', 500, 500, 1000, 'USD', 'refund:wallet:full:rental:7206', 'refund:wallet:full:rental:7206', '{}'::jsonb, $3, $4, $4),
+			(7503, 7305, 7205, $5, 7105, 1, 1, 2, 'SERVICE_UNAVAILABLE', NULL, 'SYSTEM', 500, 500, 1000, 'USD', 'refund:wallet:full:rental:7205', 'refund:wallet:full:rental:7205', '{}'::jsonb, $4, $4, $4)`,
+		userID, now.Add(-25*time.Minute), now.Add(-26*time.Minute), now.Add(-5*time.Minute), otherUserID); err != nil {
+		t.Fatalf("failed to insert refunds: %v", err)
 	}
 
 	if _, err := pool.Exec(ctx, `
@@ -867,23 +908,43 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 		Success bool `json:"success"`
 		Data    struct {
 			Rentals []struct {
-				ID            int64  `json:"id"`
-				DepositStatus string `json:"deposit_status"`
+				ID                int64  `json:"id"`
+				DepositStatus     string `json:"deposit_status"`
+				HasRefund         bool   `json:"has_refund"`
+				RefundStatus      string `json:"refund_status"`
+				RefundTotalAmount struct {
+					Amount int64 `json:"amount"`
+				} `json:"refund_total_amount"`
 			} `json:"rentals"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(rentalsRes.Body).Decode(&rentalsResp); err != nil {
 		t.Fatalf("failed to decode rentals response: %v", err)
 	}
-	if !rentalsResp.Success || len(rentalsResp.Data.Rentals) != 4 {
+	if !rentalsResp.Success || len(rentalsResp.Data.Rentals) != 5 {
 		t.Fatalf("unexpected rentals response: %+v", rentalsResp)
 	}
 	depositStatuses := map[int64]string{}
+	refundStatuses := map[int64]string{}
+	refundFlags := map[int64]bool{}
+	refundTotals := map[int64]int64{}
 	for _, item := range rentalsResp.Data.Rentals {
 		depositStatuses[item.ID] = item.DepositStatus
+		refundStatuses[item.ID] = item.RefundStatus
+		refundFlags[item.ID] = item.HasRefund
+		refundTotals[item.ID] = item.RefundTotalAmount.Amount
 	}
-	if depositStatuses[7201] != "HELD" || depositStatuses[7202] != "RELEASED" || depositStatuses[7203] != "FORFEITED" || depositStatuses[7204] != "NONE" {
+	if depositStatuses[7201] != "HELD" || depositStatuses[7202] != "RELEASED" || depositStatuses[7203] != "FORFEITED" || depositStatuses[7204] != "NONE" || depositStatuses[7206] != "REFUNDED" {
 		t.Fatalf("unexpected deposit statuses: %+v", depositStatuses)
+	}
+	if refundFlags[7201] || refundStatuses[7201] != "NONE" || refundTotals[7201] != 0 {
+		t.Fatalf("expected no refund summary for rental 7201, got flags=%+v statuses=%+v totals=%+v", refundFlags, refundStatuses, refundTotals)
+	}
+	if !refundFlags[7202] || refundStatuses[7202] != "COMPLETED" || refundTotals[7202] != 500 {
+		t.Fatalf("expected principal-only refund summary for rental 7202, got flags=%+v statuses=%+v totals=%+v", refundFlags, refundStatuses, refundTotals)
+	}
+	if !refundFlags[7206] || refundStatuses[7206] != "COMPLETED" || refundTotals[7206] != 1000 {
+		t.Fatalf("expected principal+deposit refund summary for rental 7206, got flags=%+v statuses=%+v totals=%+v", refundFlags, refundStatuses, refundTotals)
 	}
 
 	rentalDetailReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/rentals/7203", nil)
@@ -897,13 +958,41 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 		Success bool `json:"success"`
 		Data    struct {
 			DepositStatus string `json:"deposit_status"`
+			HasRefund     bool   `json:"has_refund"`
+			RefundStatus  string `json:"refund_status"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(rentalDetailRes.Body).Decode(&rentalDetailResp); err != nil {
 		t.Fatalf("failed to decode rental detail response: %v", err)
 	}
-	if !rentalDetailResp.Success || rentalDetailResp.Data.DepositStatus != "FORFEITED" {
+	if !rentalDetailResp.Success || rentalDetailResp.Data.DepositStatus != "FORFEITED" || rentalDetailResp.Data.HasRefund || rentalDetailResp.Data.RefundStatus != "NONE" {
 		t.Fatalf("unexpected rental detail response: %+v", rentalDetailResp)
+	}
+
+	rentalRefundDetailReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/rentals/7206", nil)
+	rentalRefundDetailReq.Header.Set("Authorization", "Bearer "+accessToken)
+	rentalRefundDetailRes, err := http.DefaultClient.Do(rentalRefundDetailReq)
+	if err != nil {
+		t.Fatalf("failed to request refunded rental detail: %v", err)
+	}
+	defer rentalRefundDetailRes.Body.Close()
+	var rentalRefundDetailResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			DepositStatus     string `json:"deposit_status"`
+			HasRefund         bool   `json:"has_refund"`
+			RefundStatus      string `json:"refund_status"`
+			ProcessedAt       string `json:"processed_at"`
+			RefundTotalAmount struct {
+				Amount int64 `json:"amount"`
+			} `json:"refund_total_amount"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(rentalRefundDetailRes.Body).Decode(&rentalRefundDetailResp); err != nil {
+		t.Fatalf("failed to decode refunded rental detail response: %v", err)
+	}
+	if !rentalRefundDetailResp.Success || rentalRefundDetailResp.Data.DepositStatus != "REFUNDED" || !rentalRefundDetailResp.Data.HasRefund || rentalRefundDetailResp.Data.RefundStatus != "COMPLETED" || rentalRefundDetailResp.Data.RefundTotalAmount.Amount != 1000 || rentalRefundDetailResp.Data.ProcessedAt == "" {
+		t.Fatalf("unexpected refunded rental detail response: %+v", rentalRefundDetailResp)
 	}
 
 	otherLedgerReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/me/ledger?page=1&page_size=10", nil)
@@ -929,6 +1018,107 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 		t.Fatalf("other user saw non-owned ledger entries: %+v", otherLedgerResp.Data.Entries)
 	}
 
+	refundsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/me/refunds?page=1&page_size=1", nil)
+	refundsReq.Header.Set("Authorization", "Bearer "+accessToken)
+	refundsRes, err := http.DefaultClient.Do(refundsReq)
+	if err != nil {
+		t.Fatalf("failed to request refunds: %v", err)
+	}
+	defer refundsRes.Body.Close()
+	if refundsRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected refunds status 200, got %d", refundsRes.StatusCode)
+	}
+	refundsBody, _ := io.ReadAll(refundsRes.Body)
+	var refundsResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Refunds    []map[string]any `json:"refunds"`
+			Pagination struct {
+				Page       int `json:"page"`
+				PageSize   int `json:"page_size"`
+				TotalItems int `json:"total_items"`
+				TotalPages int `json:"total_pages"`
+			} `json:"pagination"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(refundsBody, &refundsResp); err != nil {
+		t.Fatalf("failed to decode refunds response: %v", err)
+	}
+	if !refundsResp.Success || len(refundsResp.Data.Refunds) != 1 {
+		t.Fatalf("unexpected refunds response: %s", string(refundsBody))
+	}
+	if refundsResp.Data.Pagination.Page != 1 || refundsResp.Data.Pagination.PageSize != 1 || refundsResp.Data.Pagination.TotalItems != 2 || refundsResp.Data.Pagination.TotalPages != 2 {
+		t.Fatalf("unexpected refunds pagination: %+v", refundsResp.Data.Pagination)
+	}
+	if rentalID, ok := refundsResp.Data.Refunds[0]["rental_id"].(float64); !ok || int64(rentalID) != 7206 {
+		t.Fatalf("expected newest refund first for rental 7206, got %s", string(refundsBody))
+	}
+	for _, forbidden := range []string{"idempotency_key", "metadata", "correlation_id", "requested_by_user_id", "requested_by_role", "credentials", "token", "provider"} {
+		if _, exists := refundsResp.Data.Refunds[0][forbidden]; exists {
+			t.Fatalf("refund DTO leaked forbidden field %q: %s", forbidden, string(refundsBody))
+		}
+	}
+	if _, ok := refundsResp.Data.Refunds[0]["reason_code"].(string); !ok {
+		t.Fatalf("expected safe reason_code in refund DTO, got %s", string(refundsBody))
+	}
+
+	refundsSecondPageReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/me/refunds?page=2&page_size=1", nil)
+	refundsSecondPageReq.Header.Set("Authorization", "Bearer "+accessToken)
+	refundsSecondPageRes, err := http.DefaultClient.Do(refundsSecondPageReq)
+	if err != nil {
+		t.Fatalf("failed to request refunds second page: %v", err)
+	}
+	defer refundsSecondPageRes.Body.Close()
+	var refundsSecondPage struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Refunds []map[string]any `json:"refunds"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(refundsSecondPageRes.Body).Decode(&refundsSecondPage); err != nil {
+		t.Fatalf("failed to decode refunds second page: %v", err)
+	}
+	if !refundsSecondPage.Success || len(refundsSecondPage.Data.Refunds) != 1 {
+		t.Fatalf("expected exactly one refund on second page, got %+v", refundsSecondPage)
+	}
+	if rentalID, ok := refundsSecondPage.Data.Refunds[0]["rental_id"].(float64); !ok || int64(rentalID) != 7202 {
+		t.Fatalf("expected second refund page to contain rental 7202, got %+v", refundsSecondPage.Data.Refunds)
+	}
+
+	refundsInvalidReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/me/refunds?page=0&page_size=101", nil)
+	refundsInvalidReq.Header.Set("Authorization", "Bearer "+accessToken)
+	refundsInvalidRes, err := http.DefaultClient.Do(refundsInvalidReq)
+	if err != nil {
+		t.Fatalf("failed to request refunds with invalid pagination: %v", err)
+	}
+	defer refundsInvalidRes.Body.Close()
+	if refundsInvalidRes.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected invalid refunds pagination to return 422, got %d", refundsInvalidRes.StatusCode)
+	}
+
+	otherRefundsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/me/refunds?page=1&page_size=10", nil)
+	otherRefundsReq.Header.Set("Authorization", "Bearer "+otherAccessToken)
+	otherRefundsRes, err := http.DefaultClient.Do(otherRefundsReq)
+	if err != nil {
+		t.Fatalf("failed to request other user refunds: %v", err)
+	}
+	defer otherRefundsRes.Body.Close()
+	var otherRefundsResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Refunds []map[string]any `json:"refunds"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(otherRefundsRes.Body).Decode(&otherRefundsResp); err != nil {
+		t.Fatalf("failed to decode other user refunds response: %v", err)
+	}
+	if !otherRefundsResp.Success || len(otherRefundsResp.Data.Refunds) != 1 {
+		t.Fatalf("expected other user to see only own refund entry, got %+v", otherRefundsResp)
+	}
+	if rentalID, ok := otherRefundsResp.Data.Refunds[0]["rental_id"].(float64); !ok || int64(rentalID) != 7205 {
+		t.Fatalf("other user saw non-owned refund entries: %+v", otherRefundsResp.Data.Refunds)
+	}
+
 	unauthorizedBalanceRes, err := http.Get(ts.URL + "/api/v1/me/balance")
 	if err != nil {
 		t.Fatalf("failed to request unauthorized balance: %v", err)
@@ -936,6 +1126,15 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 	defer unauthorizedBalanceRes.Body.Close()
 	if unauthorizedBalanceRes.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected unauthorized balance status 401, got %d", unauthorizedBalanceRes.StatusCode)
+	}
+
+	unauthorizedRefundsRes, err := http.Get(ts.URL + "/api/v1/me/refunds")
+	if err != nil {
+		t.Fatalf("failed to request unauthorized refunds: %v", err)
+	}
+	defer unauthorizedRefundsRes.Body.Close()
+	if unauthorizedRefundsRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized refunds status 401, got %d", unauthorizedRefundsRes.StatusCode)
 	}
 }
 
@@ -1078,5 +1277,480 @@ func TestE2E_PayRentalWithBalanceEndpoint(t *testing.T) {
 	}
 	if balance != 9000 || paymentStatus != 2 || rentalStatus != 2 || accountStatus != 4 || provider != "balance" {
 		t.Fatalf("unexpected owner wallet payment state balance=%d payment=%d provider=%q rental=%d account=%d", balance, paymentStatus, provider, rentalStatus, accountStatus)
+	}
+}
+
+func TestE2E_AdminWalletRefundEndpoint(t *testing.T) {
+	ctx := context.Background()
+
+	pool, txManager := setupE2ETestDB(t)
+
+	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-12345")
+
+	logger, _ := zap.NewDevelopment()
+	defer logger.Sync()
+	sLogger := &shared_logger.Logger{Logger: logger}
+
+	jwtSecret := "e2e-jwt-secret-key-1234567890123"
+	authRepo := auth.NewPostgresRepository(pool)
+	authService := auth.NewPostgresService(authRepo, txManager, jwtSecret, 1*time.Hour)
+	authHandler := auth.NewHandler(authService, logger)
+
+	paymentRepo := payment.NewPostgresRepository(pool)
+	paymentService := payment.NewPaymentService(paymentRepo)
+	paymentHandler := payment.NewHandler(paymentService, logger)
+
+	accountRepo := account.NewPostgresRepository(pool, "super-secret-32-byte-key-for-aes")
+	userRepo := user.NewPostgresRepository(pool)
+	rentalRepo := rental.NewPostgresRepository(pool)
+	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
+	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+
+	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
+	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
+	router.RegisterRoutes(paymentHandler.Routes()...)
+	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", router))
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	renterID, renterToken := registerAndLoginE2EUser(t, ts, "refund-renter@example.com", "super-secure-pass-123", "Refund", "Renter")
+	adminID, _ := registerAndLoginE2EUser(t, ts, "refund-admin@example.com", "super-secure-pass-456", "Refund", "Admin")
+	if _, err := pool.Exec(ctx, `UPDATE users SET role = 'ADMIN' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("failed to grant admin role: %v", err)
+	}
+	adminToken := loginE2EUser(t, ts, "refund-admin@example.com", "super-secure-pass-456")
+
+	if _, err := pool.Exec(ctx, `UPDATE users SET balance = $1 WHERE id = $2`, 10000, renterID); err != nil {
+		t.Fatalf("failed to set renter balance: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id, login, encrypted_password, status, steam_guard_enabled, inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at)
+		VALUES (8401, 'refund_login_1', $1, 3, true, true, 250, 500, '765611980008401', $2, $2)`,
+		[]byte("enc-pass"), now); err != nil {
+		t.Fatalf("failed to insert refund account: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at)
+		VALUES (8501, $1, 8401, 1, $2, $3, 500, 500, $4, $2, $2)`,
+		renterID, now, now.Add(2*time.Hour), now.Add(30*time.Minute)); err != nil {
+		t.Fatalf("failed to insert refund rental: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO payments (id, rental_id, user_id, payment_type, provider, status, amount, currency, created_at)
+		VALUES (8601, 8501, $1, 1, 'internal', 1, 1000, 'USD', $2)`,
+		renterID, now); err != nil {
+		t.Fatalf("failed to insert refund payment: %v", err)
+	}
+	if _, err := paymentService.PayRentalWithBalance(context.Background(), renterID, 8501, "127.0.0.1", "test", time.Now().UTC()); err != nil {
+		t.Fatalf("failed to wallet pay refund rental: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE rentals SET status = 3, actual_finished_at = NOW(), updated_at = NOW() WHERE id = 8501`); err != nil {
+		t.Fatalf("failed to expire refund rental: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE accounts SET status = 2, updated_at = NOW() WHERE id = 8401`); err != nil {
+		t.Fatalf("failed to release refund account: %v", err)
+	}
+
+	adminListUnauthorizedReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/admin/rentals?page=1&page_size=10", nil)
+	adminListUnauthorizedReq.Header.Set("Authorization", "Bearer "+renterToken)
+	adminListUnauthorizedRes, err := http.DefaultClient.Do(adminListUnauthorizedReq)
+	if err != nil {
+		t.Fatalf("failed to call non-admin rentals admin endpoint: %v", err)
+	}
+	defer adminListUnauthorizedRes.Body.Close()
+	if adminListUnauthorizedRes.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected non-admin admin rentals status 403, got %d", adminListUnauthorizedRes.StatusCode)
+	}
+
+	adminListReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/admin/rentals?page=1&page_size=10", nil)
+	adminListReq.Header.Set("Authorization", "Bearer "+adminToken)
+	adminListRes, err := http.DefaultClient.Do(adminListReq)
+	if err != nil {
+		t.Fatalf("failed to call admin rentals endpoint: %v", err)
+	}
+	defer adminListRes.Body.Close()
+	if adminListRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected admin rentals status 200, got %d", adminListRes.StatusCode)
+	}
+	adminListBody, _ := io.ReadAll(adminListRes.Body)
+	var adminListResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Rentals    []map[string]any `json:"rentals"`
+			Summary    map[string]any   `json:"summary"`
+			Pagination struct {
+				Page       int `json:"page"`
+				PageSize   int `json:"page_size"`
+				TotalItems int `json:"total_items"`
+				TotalPages int `json:"total_pages"`
+			} `json:"pagination"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(adminListBody, &adminListResp); err != nil {
+		t.Fatalf("failed to decode admin rentals response: %v", err)
+	}
+	if !adminListResp.Success || len(adminListResp.Data.Rentals) == 0 {
+		t.Fatalf("unexpected admin rentals response: %s", string(adminListBody))
+	}
+	if adminListResp.Data.Pagination.Page != 1 || adminListResp.Data.Pagination.PageSize != 10 {
+		t.Fatalf("unexpected admin rentals pagination: %+v", adminListResp.Data.Pagination)
+	}
+	for _, required := range []string{"total_count", "eligible_wallet_refund_count", "rental_status_counts", "payment_status_counts", "refund_status_counts"} {
+		if _, exists := adminListResp.Data.Summary[required]; !exists {
+			t.Fatalf("admin rentals summary missed %q: %s", required, string(adminListBody))
+		}
+	}
+	row := adminListResp.Data.Rentals[0]
+	for _, required := range []string{"id", "user_id", "account_id", "status", "payment_status", "payment_provider", "rental_price", "security_deposit", "deposit_status", "has_refund", "refund_status", "refund_total_amount"} {
+		if _, exists := row[required]; !exists {
+			t.Fatalf("admin rentals DTO missed %q: %s", required, string(adminListBody))
+		}
+	}
+	for _, forbidden := range []string{"login", "password", "credentials", "metadata", "idempotency_key", "correlation_id", "provider_payload", "token", "secret"} {
+		if _, exists := row[forbidden]; exists {
+			t.Fatalf("admin rentals DTO leaked forbidden field %q: %s", forbidden, string(adminListBody))
+		}
+	}
+
+	reasonCodesReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/admin/refund-reason-codes", nil)
+	reasonCodesReq.Header.Set("Authorization", "Bearer "+adminToken)
+	reasonCodesRes, err := http.DefaultClient.Do(reasonCodesReq)
+	if err != nil {
+		t.Fatalf("failed to call admin refund reason codes endpoint: %v", err)
+	}
+	defer reasonCodesRes.Body.Close()
+	if reasonCodesRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected admin refund reason codes status 200, got %d", reasonCodesRes.StatusCode)
+	}
+	reasonCodesBody, _ := io.ReadAll(reasonCodesRes.Body)
+	var reasonCodesResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			ReasonCodes []map[string]any `json:"reason_codes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(reasonCodesBody, &reasonCodesResp); err != nil {
+		t.Fatalf("failed to decode admin refund reason codes response: %v", err)
+	}
+	if !reasonCodesResp.Success || len(reasonCodesResp.Data.ReasonCodes) == 0 {
+		t.Fatalf("unexpected admin refund reason codes response: %s", string(reasonCodesBody))
+	}
+	for _, required := range []string{"code", "label"} {
+		if _, exists := reasonCodesResp.Data.ReasonCodes[0][required]; !exists {
+			t.Fatalf("admin refund reason code DTO missed %q: %s", required, string(reasonCodesBody))
+		}
+	}
+	for _, forbidden := range []string{"metadata", "token", "secret", "credentials"} {
+		if _, exists := reasonCodesResp.Data.ReasonCodes[0][forbidden]; exists {
+			t.Fatalf("admin refund reason codes leaked forbidden field %q: %s", forbidden, string(reasonCodesBody))
+		}
+	}
+
+	unauthorizedReqBody := bytes.NewBufferString(`{"reason_code":"SERVICE_UNAVAILABLE"}`)
+	unauthorizedReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/rentals/8501/wallet-refund", unauthorizedReqBody)
+	unauthorizedReq.Header.Set("Authorization", "Bearer "+renterToken)
+	unauthorizedReq.Header.Set("Content-Type", "application/json")
+	unauthorizedRes, err := http.DefaultClient.Do(unauthorizedReq)
+	if err != nil {
+		t.Fatalf("failed to call non-admin wallet refund endpoint: %v", err)
+	}
+	defer unauthorizedRes.Body.Close()
+	if unauthorizedRes.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected non-admin wallet refund status 403, got %d", unauthorizedRes.StatusCode)
+	}
+
+	adminReqBody := bytes.NewBufferString(`{"reason_code":"SERVICE_UNAVAILABLE"}`)
+	adminReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/rentals/8501/wallet-refund", adminReqBody)
+	adminReq.Header.Set("Authorization", "Bearer "+adminToken)
+	adminReq.Header.Set("Content-Type", "application/json")
+	adminRes, err := http.DefaultClient.Do(adminReq)
+	if err != nil {
+		t.Fatalf("failed to call admin wallet refund endpoint: %v", err)
+	}
+	defer adminRes.Body.Close()
+	if adminRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected admin wallet refund status 200, got %d", adminRes.StatusCode)
+	}
+	bodyBytes, _ := io.ReadAll(adminRes.Body)
+	var adminResp struct {
+		Success bool           `json:"success"`
+		Data    map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(bodyBytes, &adminResp); err != nil {
+		t.Fatalf("failed to decode admin wallet refund response: %v", err)
+	}
+	if !adminResp.Success {
+		t.Fatalf("unexpected admin wallet refund response: %s", string(bodyBytes))
+	}
+	for _, forbidden := range []string{"metadata", "idempotency_key", "correlation_id", "external_transaction_id", "credentials", "token", "secret"} {
+		if _, exists := adminResp.Data[forbidden]; exists {
+			t.Fatalf("wallet refund response leaked forbidden field %q: %s", forbidden, string(bodyBytes))
+		}
+	}
+
+	var balance int64
+	var holdStatus int16
+	var refundCount int
+	if err := pool.QueryRow(ctx, "SELECT balance FROM users WHERE id = $1", renterID).Scan(&balance); err != nil {
+		t.Fatalf("failed to read balance after refund: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT status FROM deposit_holds WHERE rental_id = 8501").Scan(&holdStatus); err != nil {
+		t.Fatalf("failed to read hold after refund: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM refunds WHERE rental_id = 8501").Scan(&refundCount); err != nil {
+		t.Fatalf("failed to read refund count: %v", err)
+	}
+	if balance != 10000 || holdStatus != 4 || refundCount != 1 {
+		t.Fatalf("unexpected admin refund final state balance=%d hold=%d refunds=%d", balance, holdStatus, refundCount)
+	}
+}
+
+func TestE2E_AdminRentalsFiltersEndpoint(t *testing.T) {
+	ctx := context.Background()
+
+	pool, txManager := setupE2ETestDB(t)
+
+	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-12345")
+
+	logger, _ := zap.NewDevelopment()
+	defer logger.Sync()
+	sLogger := &shared_logger.Logger{Logger: logger}
+
+	jwtSecret := "e2e-jwt-secret-key-1234567890123"
+	authRepo := auth.NewPostgresRepository(pool)
+	authService := auth.NewPostgresService(authRepo, txManager, jwtSecret, time.Hour)
+	authHandler := auth.NewHandler(authService, logger)
+
+	paymentRepo := payment.NewPostgresRepository(pool)
+	paymentService := payment.NewPaymentService(paymentRepo)
+	paymentHandler := payment.NewHandler(paymentService, logger)
+
+	accountRepo := account.NewPostgresRepository(pool, "super-secret-32-byte-key-for-aes")
+	userRepo := user.NewPostgresRepository(pool)
+	rentalRepo := rental.NewPostgresRepository(pool)
+	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
+	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+
+	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
+	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
+	router.RegisterRoutes(paymentHandler.Routes()...)
+	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", router))
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	renterOneID, renterOneToken := registerAndLoginE2EUser(t, ts, "filters-renter-1@example.com", "super-secure-pass-123", "Filters", "One")
+	renterTwoID, _ := registerAndLoginE2EUser(t, ts, "filters-renter-2@example.com", "super-secure-pass-234", "Filters", "Two")
+	adminID, _ := registerAndLoginE2EUser(t, ts, "filters-admin@example.com", "super-secure-pass-456", "Filters", "Admin")
+	if _, err := pool.Exec(ctx, `UPDATE users SET role = 'ADMIN' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("failed to grant admin role: %v", err)
+	}
+	adminToken := loginE2EUser(t, ts, "filters-admin@example.com", "super-secure-pass-456")
+
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, query := range []struct {
+		sql  string
+		args []any
+	}{
+		{
+			sql: `INSERT INTO accounts (id, login, encrypted_password, status, steam_guard_enabled, inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at)
+				VALUES (9401, 'filter_login_1', $1, 2, true, true, 250, 700, '765611980009401', $2, $2)`,
+			args: []any{[]byte("enc-pass"), now},
+		},
+		{
+			sql: `INSERT INTO accounts (id, login, encrypted_password, status, steam_guard_enabled, inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at)
+				VALUES (9402, 'filter_login_2', $1, 3, true, true, 250, 0, '765611980009402', $2, $2)`,
+			args: []any{[]byte("enc-pass"), now},
+		},
+		{
+			sql: `INSERT INTO accounts (id, login, encrypted_password, status, steam_guard_enabled, inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at)
+				VALUES (9403, 'filter_login_3', $1, 4, true, true, 250, 500, '765611980009403', $2, $2)`,
+			args: []any{[]byte("enc-pass"), now},
+		},
+		{
+			sql: `INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at, actual_finished_at)
+				VALUES (9501, $1, 9401, 3, $3, $4, 500, 700, $5, $2, $2, $2)`,
+			args: []any{renterOneID, now, now.Add(-2 * time.Hour), now.Add(-time.Hour), now.Add(15 * time.Minute)},
+		},
+		{
+			sql: `INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at)
+				VALUES (9502, $1, 9402, 1, $2, $3, 500, 0, $4, $2, $2)`,
+			args: []any{renterOneID, now, now.Add(2 * time.Hour), now.Add(15 * time.Minute)},
+		},
+		{
+			sql: `INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at)
+				VALUES (9503, $1, 9403, 2, $2, $3, 500, 500, $4, $2, $2)`,
+			args: []any{renterTwoID, now, now.Add(2 * time.Hour), now.Add(15 * time.Minute)},
+		},
+		{
+			sql: `INSERT INTO payments (id, rental_id, user_id, payment_type, provider, status, amount, currency, created_at)
+				VALUES (9601, 9501, $1, 1, 'balance', 2, 1200, 'USD', $2)`,
+			args: []any{renterOneID, now},
+		},
+		{
+			sql: `INSERT INTO payments (id, rental_id, user_id, payment_type, provider, status, amount, currency, created_at)
+				VALUES (9602, 9502, $1, 1, 'internal', 1, 500, 'USD', $2)`,
+			args: []any{renterOneID, now},
+		},
+		{
+			sql: `INSERT INTO payments (id, rental_id, user_id, payment_type, provider, status, amount, currency, created_at)
+				VALUES (9603, 9503, $1, 1, 'balance', 2, 1000, 'USD', $2)`,
+			args: []any{renterTwoID, now},
+		},
+		{
+			sql:  `INSERT INTO deposit_holds (id, user_id, rental_id, payment_id, amount, currency, status, held_at, created_at, updated_at, idempotency_key) VALUES (9701, $1, 9501, 9601, 700, 'USD', 1, $2, $2, $2, 'hold-9501')`,
+			args: []any{renterOneID, now},
+		},
+	} {
+		if _, err := pool.Exec(ctx, query.sql, query.args...); err != nil {
+			t.Fatalf("failed to seed admin rentals filter data: %v", err)
+		}
+	}
+
+	doAdminRentalsRequest := func(token string, query string) (int, []byte) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/admin/rentals?"+query, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("failed to call admin rentals endpoint: %v", err)
+		}
+		defer res.Body.Close()
+		body, _ := io.ReadAll(res.Body)
+		return res.StatusCode, body
+	}
+
+	status, _ := doAdminRentalsRequest(renterOneToken, "page=1&page_size=10")
+	if status != http.StatusForbidden {
+		t.Fatalf("expected non-admin admin rentals status 403, got %d", status)
+	}
+
+	expiredStatus, expiredBody := doAdminRentalsRequest(adminToken, "page=1&page_size=10&rental_status=EXPIRED")
+	if expiredStatus != http.StatusOK {
+		t.Fatalf("expected EXPIRED filter status 200, got %d body=%s", expiredStatus, string(expiredBody))
+	}
+	var expiredResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Rentals []map[string]any `json:"rentals"`
+			Summary struct {
+				TotalCount                float64            `json:"total_count"`
+				EligibleWalletRefundCount float64            `json:"eligible_wallet_refund_count"`
+				RentalStatusCounts        map[string]float64 `json:"rental_status_counts"`
+				PaymentStatusCounts       map[string]float64 `json:"payment_status_counts"`
+				RefundStatusCounts        map[string]float64 `json:"refund_status_counts"`
+			} `json:"summary"`
+			Pagination struct {
+				TotalItems float64 `json:"total_items"`
+			} `json:"pagination"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(expiredBody, &expiredResp); err != nil {
+		t.Fatalf("failed to decode EXPIRED filter response: %v", err)
+	}
+	if !expiredResp.Success || len(expiredResp.Data.Rentals) != 1 || int64(expiredResp.Data.Rentals[0]["id"].(float64)) != 9501 {
+		t.Fatalf("unexpected EXPIRED filter payload: %s", string(expiredBody))
+	}
+	if expiredResp.Data.Summary.TotalCount != 1 || expiredResp.Data.Pagination.TotalItems != 1 {
+		t.Fatalf("expected filtered totals to equal 1, got summary=%v pagination=%v", expiredResp.Data.Summary.TotalCount, expiredResp.Data.Pagination.TotalItems)
+	}
+	if expiredResp.Data.Summary.EligibleWalletRefundCount != 1 || expiredResp.Data.Summary.RentalStatusCounts["EXPIRED"] != 1 || expiredResp.Data.Summary.PaymentStatusCounts["SUCCESS"] != 1 || expiredResp.Data.Summary.RefundStatusCounts["NONE"] != 1 {
+		t.Fatalf("unexpected filtered summary counts: %s", string(expiredBody))
+	}
+
+	balanceStatus, balanceBody := doAdminRentalsRequest(adminToken, "page=1&page_size=10&payment_provider=balance")
+	if balanceStatus != http.StatusOK {
+		t.Fatalf("expected balance filter status 200, got %d body=%s", balanceStatus, string(balanceBody))
+	}
+	var balanceResp struct {
+		Data struct {
+			Rentals []map[string]any `json:"rentals"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(balanceBody, &balanceResp); err != nil {
+		t.Fatalf("failed to decode payment_provider response: %v", err)
+	}
+	if len(balanceResp.Data.Rentals) != 2 {
+		t.Fatalf("expected 2 balance rentals, got %d body=%s", len(balanceResp.Data.Rentals), string(balanceBody))
+	}
+	for _, row := range balanceResp.Data.Rentals {
+		if row["payment_provider"] != "balance" {
+			t.Fatalf("expected only balance provider rows, got %s", string(balanceBody))
+		}
+	}
+
+	eligibleStatus, eligibleBody := doAdminRentalsRequest(adminToken, "page=1&page_size=10&eligible_wallet_refund=true")
+	if eligibleStatus != http.StatusOK {
+		t.Fatalf("expected eligible filter status 200, got %d body=%s", eligibleStatus, string(eligibleBody))
+	}
+	var eligibleResp struct {
+		Data struct {
+			Rentals []map[string]any `json:"rentals"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(eligibleBody, &eligibleResp); err != nil {
+		t.Fatalf("failed to decode eligible filter response: %v", err)
+	}
+	if len(eligibleResp.Data.Rentals) != 1 || int64(eligibleResp.Data.Rentals[0]["id"].(float64)) != 9501 {
+		t.Fatalf("expected only eligible rental 9501, got %s", string(eligibleBody))
+	}
+
+	userStatus, userBody := doAdminRentalsRequest(adminToken, fmt.Sprintf("page=1&page_size=10&user_id=%d", renterTwoID))
+	if userStatus != http.StatusOK {
+		t.Fatalf("expected user_id filter status 200, got %d body=%s", userStatus, string(userBody))
+	}
+	var userResp struct {
+		Data struct {
+			Rentals []map[string]any `json:"rentals"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(userBody, &userResp); err != nil {
+		t.Fatalf("failed to decode user_id filter response: %v", err)
+	}
+	if len(userResp.Data.Rentals) != 1 || int64(userResp.Data.Rentals[0]["user_id"].(float64)) != renterTwoID {
+		t.Fatalf("expected exact user_id match, got %s", string(userBody))
+	}
+
+	rentalStatus, rentalBody := doAdminRentalsRequest(adminToken, "page=1&page_size=10&rental_id=9502")
+	if rentalStatus != http.StatusOK {
+		t.Fatalf("expected rental_id filter status 200, got %d body=%s", rentalStatus, string(rentalBody))
+	}
+	var rentalResp struct {
+		Data struct {
+			Rentals []map[string]any `json:"rentals"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rentalBody, &rentalResp); err != nil {
+		t.Fatalf("failed to decode rental_id filter response: %v", err)
+	}
+	if len(rentalResp.Data.Rentals) != 1 || int64(rentalResp.Data.Rentals[0]["id"].(float64)) != 9502 {
+		t.Fatalf("expected exact rental_id match, got %s", string(rentalBody))
+	}
+	for _, forbidden := range []string{"login", "password", "credentials", "metadata", "idempotency_key", "correlation_id", "provider_payload", "token", "secret"} {
+		if _, exists := rentalResp.Data.Rentals[0][forbidden]; exists {
+			t.Fatalf("admin rentals DTO leaked forbidden field %q: %s", forbidden, string(rentalBody))
+		}
+	}
+
+	invalidEnumStatus, _ := doAdminRentalsRequest(adminToken, "page=1&page_size=10&payment_status=BROKEN")
+	if invalidEnumStatus != http.StatusUnprocessableEntity {
+		t.Fatalf("expected invalid enum status 422, got %d", invalidEnumStatus)
+	}
+
+	invalidPageStatus, _ := doAdminRentalsRequest(adminToken, "page=0&page_size=101")
+	if invalidPageStatus != http.StatusUnprocessableEntity {
+		t.Fatalf("expected invalid pagination status 422, got %d", invalidPageStatus)
 	}
 }

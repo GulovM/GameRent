@@ -75,7 +75,7 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, database.TxManager) {
 		t.Fatalf("failed to run migrations: %v", err)
 	}
 
-	_, _ = poolConn.Pool.Exec(ctx, "TRUNCATE financial_ledger_entries, deposit_holds")
+	_, _ = poolConn.Pool.Exec(ctx, "TRUNCATE refunds, financial_ledger_entries, deposit_holds")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM payments")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM security_events")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM audit_logs")
@@ -904,6 +904,22 @@ func seedHeldDepositSettlementRental(t *testing.T, pool *pgxpool.Pool, userID, a
 	}
 }
 
+func seedWalletPaidRefundableRental(t *testing.T, pool *pgxpool.Pool, userID, accountID, rentalID, paymentID int64, balance, rentalPrice, depositAmount int64) {
+	t.Helper()
+	seedWaitingPaymentRentalWithBalance(t, pool, userID, accountID, rentalID, paymentID, balance, rentalPrice, depositAmount)
+
+	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
+	if _, err := paymentService.PayRentalWithBalance(context.Background(), userID, rentalID, "127.0.0.1", "test", time.Now().UTC()); err != nil {
+		t.Fatalf("failed to wallet-pay refundable rental: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), "UPDATE rentals SET status = 3, actual_finished_at = NOW(), updated_at = NOW() WHERE id = $1", rentalID); err != nil {
+		t.Fatalf("failed to expire wallet-paid rental: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), "UPDATE accounts SET status = 2, updated_at = NOW() WHERE id = $1", accountID); err != nil {
+		t.Fatalf("failed to mark wallet-paid account available: %v", err)
+	}
+}
+
 func TestDepositReleaseCreditsBalanceOnce(t *testing.T) {
 	pool, _ := setupTestDB(t)
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
@@ -1419,6 +1435,229 @@ func TestWalletPaymentWithBalance_ConcurrentAndWebhookRace(t *testing.T) {
 		}
 	default:
 		t.Fatalf("unexpected final payment provider in race: %q", finalProvider)
+	}
+}
+
+func TestWalletRefundCreditsBalanceAndDepositOnce(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
+	userID, accountID, rentalID, paymentID := int64(9981), int64(9982), int64(9983), int64(9984)
+	seedWalletPaidRefundableRental(t, pool, userID, accountID, rentalID, paymentID, 10000, 500, 500)
+
+	var beforeBalance int64
+	if err := pool.QueryRow(context.Background(), "SELECT balance FROM users WHERE id = $1", userID).Scan(&beforeBalance); err != nil {
+		t.Fatalf("failed to read balance before refund: %v", err)
+	}
+
+	result, err := paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RefundWalletPayment failed: %v", err)
+	}
+	if result == nil || !result.Changed || result.Idempotent || result.TotalAmount != 1000 || result.DepositStatus != "REFUNDED" {
+		t.Fatalf("unexpected refund result: %+v", result)
+	}
+
+	var afterBalance int64
+	var holdStatus int16
+	var refundStatus int16
+	var principalLedgerCount, depositLedgerCount, auditCount, securityCount int
+	if err := pool.QueryRow(context.Background(), "SELECT balance FROM users WHERE id = $1", userID).Scan(&afterBalance); err != nil {
+		t.Fatalf("failed to read balance after refund: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT status FROM deposit_holds WHERE rental_id = $1", rentalID).Scan(&holdStatus); err != nil {
+		t.Fatalf("failed to read hold after refund: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT status FROM refunds WHERE rental_id = $1", rentalID).Scan(&refundStatus); err != nil {
+		t.Fatalf("failed to read refund row: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM financial_ledger_entries WHERE rental_id = $1 AND entry_type = 6", rentalID).Scan(&principalLedgerCount); err != nil {
+		t.Fatalf("failed to count principal refund entries: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM financial_ledger_entries WHERE rental_id = $1 AND entry_type = 7", rentalID).Scan(&depositLedgerCount); err != nil {
+		t.Fatalf("failed to count deposit refund entries: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM audit_logs WHERE entity_type = 'refund' AND action = 'wallet_refund_completed'").Scan(&auditCount); err != nil {
+		t.Fatalf("failed to count refund audit logs: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM security_events WHERE rental_id = $1 AND event_type = 14", rentalID).Scan(&securityCount); err != nil {
+		t.Fatalf("failed to count refund security events: %v", err)
+	}
+	if afterBalance != beforeBalance+1000 || holdStatus != 4 || refundStatus != 2 {
+		t.Fatalf("unexpected refund state balance=%d before=%d hold=%d refund=%d", afterBalance, beforeBalance, holdStatus, refundStatus)
+	}
+	if principalLedgerCount != 1 || depositLedgerCount != 1 || auditCount != 1 || securityCount != 1 {
+		t.Fatalf("unexpected refund side effects principal=%d deposit=%d audit=%d security=%d", principalLedgerCount, depositLedgerCount, auditCount, securityCount)
+	}
+
+	result, err = paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("refund replay failed: %v", err)
+	}
+	if result == nil || !result.Idempotent || result.Changed {
+		t.Fatalf("expected idempotent refund replay, got %+v", result)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT balance FROM users WHERE id = $1", userID).Scan(&afterBalance); err != nil {
+		t.Fatalf("failed to read balance after replay: %v", err)
+	}
+	if afterBalance != beforeBalance+1000 {
+		t.Fatalf("balance changed twice on refund replay: before=%d after=%d", beforeBalance, afterBalance)
+	}
+}
+
+func TestWalletRefundPrincipalOnlyScenarios(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
+
+	userID, accountID, rentalID, paymentID := int64(9991), int64(9992), int64(9993), int64(9994)
+	seedWalletPaidRefundableRental(t, pool, userID, accountID, rentalID, paymentID, 10000, 500, 0)
+	result, err := paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("zero-deposit refund failed: %v", err)
+	}
+	if result.TotalAmount != 500 || result.DepositAmount != 0 || result.DepositStatus != "NONE" {
+		t.Fatalf("unexpected zero-deposit refund result: %+v", result)
+	}
+
+	userID2, accountID2, rentalID2, paymentID2 := int64(9995), int64(9996), int64(9997), int64(9998)
+	seedWalletPaidRefundableRental(t, pool, userID2, accountID2, rentalID2, paymentID2, 10000, 500, 500)
+	if _, err := paymentService.ReleaseDeposit(context.Background(), 7103, "ADMIN", rentalID2, time.Now().UTC()); err != nil {
+		t.Fatalf("failed to release deposit before refund test: %v", err)
+	}
+	result, err = paymentService.RefundWalletPayment(context.Background(), userID2, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("released-hold principal refund failed: %v", err)
+	}
+	if result.TotalAmount != 500 || result.DepositAmount != 0 || result.DepositStatus != "RELEASED" {
+		t.Fatalf("unexpected released-hold refund result: %+v", result)
+	}
+
+	userID3, accountID3, rentalID3, paymentID3 := int64(10001), int64(10002), int64(10003), int64(10004)
+	seedWalletPaidRefundableRental(t, pool, userID3, accountID3, rentalID3, paymentID3, 10000, 500, 500)
+	if _, err := paymentService.ForfeitDeposit(context.Background(), 7104, "ADMIN", rentalID3, "damage_confirmed", time.Now().UTC()); err != nil {
+		t.Fatalf("failed to forfeit deposit before refund test: %v", err)
+	}
+	result, err = paymentService.RefundWalletPayment(context.Background(), userID3, "ADMIN", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("forfeited-hold principal refund failed: %v", err)
+	}
+	if result.TotalAmount != 500 || result.DepositAmount != 0 || result.DepositStatus != "FORFEITED" {
+		t.Fatalf("unexpected forfeited-hold refund result: %+v", result)
+	}
+}
+
+func TestWalletRefundRejectsInvalidEligibilityAndRoles(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
+
+	userID, accountID, rentalID, paymentID := int64(10011), int64(10012), int64(10013), int64(10014)
+	seedWaitingPaymentRentalWithBalance(t, pool, userID, accountID, rentalID, paymentID, 10000, 500, 500)
+	if _, err := paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
+		t.Fatalf("expected WAITING_PAYMENT wallet refund rejection, got %v", err)
+	}
+
+	userID2, accountID2, rentalID2, paymentID2 := int64(10021), int64(10022), int64(10023), int64(10024)
+	seedWaitingPaymentRentalWithBalance(t, pool, userID2, accountID2, rentalID2, paymentID2, 10000, 500, 500)
+	if _, err := paymentService.PayRentalWithBalance(context.Background(), userID2, rentalID2, "127.0.0.1", "test", time.Now().UTC()); err != nil {
+		t.Fatalf("wallet payment failed for ACTIVE refund rejection test: %v", err)
+	}
+	if _, err := paymentService.RefundWalletPayment(context.Background(), userID2, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
+		t.Fatalf("expected ACTIVE wallet refund rejection, got %v", err)
+	}
+
+	userID3, accountID3, rentalID3, paymentID3 := int64(10031), int64(10032), int64(10033), int64(10034)
+	seedHeldDepositSettlementRental(t, pool, userID3, accountID3, rentalID3, paymentID3, 500, 500)
+	if _, err := paymentService.RefundWalletPayment(context.Background(), userID3, "ADMIN", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
+		t.Fatalf("expected provider-paid wallet refund rejection, got %v", err)
+	}
+
+	if _, err := paymentService.RefundWalletPayment(context.Background(), userID3, "RENT", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrAdminRequired) {
+		t.Fatalf("expected non-admin wallet refund rejection, got %v", err)
+	}
+}
+
+func TestWalletRefundConcurrentWithDepositSettlement(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
+
+	userID, accountID, rentalID, paymentID := int64(10041), int64(10042), int64(10043), int64(10044)
+	seedWalletPaidRefundableRental(t, pool, userID, accountID, rentalID, paymentID, 10000, 500, 500)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var refundErr, releaseErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, refundErr = paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, releaseErr = paymentService.ReleaseDeposit(context.Background(), 7203, "ADMIN", rentalID, time.Now().UTC())
+	}()
+	close(start)
+	wg.Wait()
+
+	if refundErr != nil && !errors.Is(refundErr, payment.ErrDepositAlreadySettled) && !errors.Is(refundErr, payment.ErrWalletRefundNotAllowed) {
+		t.Fatalf("unexpected refund/release refund error: %v", refundErr)
+	}
+	if releaseErr != nil && !errors.Is(releaseErr, payment.ErrDepositAlreadySettled) {
+		t.Fatalf("unexpected refund/release deposit error: %v", releaseErr)
+	}
+
+	var holdStatus int16
+	var balance int64
+	if err := pool.QueryRow(context.Background(), "SELECT status FROM deposit_holds WHERE rental_id = $1", rentalID).Scan(&holdStatus); err != nil {
+		t.Fatalf("failed to read hold status after refund/release race: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT balance FROM users WHERE id = $1", userID).Scan(&balance); err != nil {
+		t.Fatalf("failed to read balance after refund/release race: %v", err)
+	}
+	if holdStatus != 2 && holdStatus != 4 {
+		t.Fatalf("unexpected hold status after refund/release race: %d", holdStatus)
+	}
+	if balance != 10000 {
+		t.Fatalf("unexpected balance after refund/release race: %d", balance)
+	}
+
+	userID2, accountID2, rentalID2, paymentID2 := int64(10051), int64(10052), int64(10053), int64(10054)
+	seedWalletPaidRefundableRental(t, pool, userID2, accountID2, rentalID2, paymentID2, 10000, 500, 500)
+	start = make(chan struct{})
+	wg = sync.WaitGroup{}
+	var refundErr2, forfeitErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, refundErr2 = paymentService.RefundWalletPayment(context.Background(), userID2, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), 7205, "ADMIN", rentalID2, "damage_confirmed", time.Now().UTC())
+	}()
+	close(start)
+	wg.Wait()
+
+	if refundErr2 != nil && !errors.Is(refundErr2, payment.ErrDepositAlreadySettled) && !errors.Is(refundErr2, payment.ErrWalletRefundNotAllowed) {
+		t.Fatalf("unexpected refund/forfeit refund error: %v", refundErr2)
+	}
+	if forfeitErr != nil && !errors.Is(forfeitErr, payment.ErrDepositAlreadySettled) {
+		t.Fatalf("unexpected refund/forfeit deposit error: %v", forfeitErr)
+	}
+
+	if err := pool.QueryRow(context.Background(), "SELECT status FROM deposit_holds WHERE rental_id = $1", rentalID2).Scan(&holdStatus); err != nil {
+		t.Fatalf("failed to read hold status after refund/forfeit race: %v", err)
+	}
+	if holdStatus != 3 && holdStatus != 4 {
+		t.Fatalf("unexpected hold status after refund/forfeit race: %d", holdStatus)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT balance FROM users WHERE id = $1", userID2).Scan(&balance); err != nil {
+		t.Fatalf("failed to read balance after refund/forfeit race: %v", err)
+	}
+	if balance != 9500 && balance != 10000 {
+		t.Fatalf("unexpected balance after refund/forfeit race: %d", balance)
 	}
 }
 

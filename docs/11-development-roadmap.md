@@ -105,7 +105,9 @@
 - Реализация триггеров алармов для администраторов при фиксации критических инцидентов.
 
 ### 5.2. Возврат депозита и Trust Score Recalculation
-- **Deposit Release / Return** остаётся будущим расширением: отдельный refund/deposit ledger в текущем backend не реализован.
+- Финансовая модель больше не ограничивается только `payments`: в backend уже используются `users.balance`, append-only `financial_ledger_entries`, `deposit_holds` и `refunds`.
+- Реализованы wallet payment, admin deposit release/forfeit и первый этап wallet-paid full refund для `EXPIRED`/`COMPLETED` rental.
+- В roadmap как future work остаются provider refund, partial refund, self-service refund, отдельный refund history API и выделенный internal system caller surface.
 - Разработка `TrustService`: метод `RecalculateTrust`. Асинхронный расчёт числового значения `trust_score` (0–1000) на основании истории успешных аренд и штрафов. Автоматическое обновление уровня доверия (`TrustLevel`: Bronze, Silver, Gold, Diamond) и очистка кэша профиля в Redis.
 
 ### 5.3. Модуль Отзывов (`internal/review`)

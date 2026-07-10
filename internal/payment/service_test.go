@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -17,8 +18,12 @@ type mockRepository struct {
 	statesByID                    map[int64]*WebhookPaymentState
 	statesByExt                   map[string]*WebhookPaymentState
 	walletStatesByRental          map[int64]*WalletPaymentState
+	refundStatesByRental          map[int64]*WalletRefundState
 	settlementStatesByRental      map[int64]*DepositSettlementState
 	settlementEligibilityByRental map[int64]*DepositSettlementEligibility
+	refundsByKey                  map[string]*RefundRecord
+	adminRentals                  []AdminRentalEntry
+	adminRentalSummary            AdminRentalSummary
 
 	markPaymentErr error
 	activateErr    error
@@ -35,18 +40,23 @@ type mockRepository struct {
 	depositLedgerCalls  int
 	depositReleaseCalls int
 	depositForfeitCalls int
+	depositRefundCalls  int
 	balanceDebitCalls   int
 	balanceCreditCalls  int
 	securityEventCalls  int
 	auditCalls          int
 	logCalls            int
+	refundCreateCalls   int
+	refundCompleteCalls int
 
 	providerLedgerEntries []FinancialLedgerEntry
 	balanceDebitEntries   []FinancialLedgerEntry
+	balanceRefundEntries  []FinancialLedgerEntry
 	depositHolds          []DepositHold
 	depositLedgerEntries  []FinancialLedgerEntry
 	depositReleaseEntries []FinancialLedgerEntry
 	depositForfeitEntries []FinancialLedgerEntry
+	depositRefundEntries  []FinancialLedgerEntry
 }
 
 func newMockRepository(state *WebhookPaymentState) *mockRepository {
@@ -54,8 +64,10 @@ func newMockRepository(state *WebhookPaymentState) *mockRepository {
 		statesByID:                    map[int64]*WebhookPaymentState{},
 		statesByExt:                   map[string]*WebhookPaymentState{},
 		walletStatesByRental:          map[int64]*WalletPaymentState{},
+		refundStatesByRental:          map[int64]*WalletRefundState{},
 		settlementStatesByRental:      map[int64]*DepositSettlementState{},
 		settlementEligibilityByRental: map[int64]*DepositSettlementEligibility{},
+		refundsByKey:                  map[string]*RefundRecord{},
 	}
 	if state != nil {
 		repo.statesByID[state.PaymentID] = cloneWebhookState(state)
@@ -94,14 +106,18 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 	snapshotByID := make(map[int64]*WebhookPaymentState, len(m.statesByID))
 	snapshotByExt := make(map[string]*WebhookPaymentState, len(m.statesByExt))
 	snapshotWalletStates := make(map[int64]*WalletPaymentState, len(m.walletStatesByRental))
+	snapshotRefundStates := make(map[int64]*WalletRefundState, len(m.refundStatesByRental))
 	snapshotSettlementStates := make(map[int64]*DepositSettlementState, len(m.settlementStatesByRental))
 	snapshotSettlementEligibility := make(map[int64]*DepositSettlementEligibility, len(m.settlementEligibilityByRental))
+	snapshotRefundsByKey := make(map[string]*RefundRecord, len(m.refundsByKey))
 	snapshotProviderLedger := append([]FinancialLedgerEntry(nil), m.providerLedgerEntries...)
 	snapshotBalanceDebitLedger := append([]FinancialLedgerEntry(nil), m.balanceDebitEntries...)
+	snapshotBalanceRefundLedger := append([]FinancialLedgerEntry(nil), m.balanceRefundEntries...)
 	snapshotDepositHolds := append([]DepositHold(nil), m.depositHolds...)
 	snapshotDepositLedger := append([]FinancialLedgerEntry(nil), m.depositLedgerEntries...)
 	snapshotDepositRelease := append([]FinancialLedgerEntry(nil), m.depositReleaseEntries...)
 	snapshotDepositForfeit := append([]FinancialLedgerEntry(nil), m.depositForfeitEntries...)
+	snapshotDepositRefund := append([]FinancialLedgerEntry(nil), m.depositRefundEntries...)
 	for id, state := range m.statesByID {
 		snapshotByID[id] = cloneWebhookState(state)
 	}
@@ -112,6 +128,10 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 		cp := *state
 		snapshotWalletStates[rentalID] = &cp
 	}
+	for rentalID, state := range m.refundStatesByRental {
+		cp := *state
+		snapshotRefundStates[rentalID] = &cp
+	}
 	for rentalID, state := range m.settlementStatesByRental {
 		cp := *state
 		snapshotSettlementStates[rentalID] = &cp
@@ -119,6 +139,10 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 	for rentalID, state := range m.settlementEligibilityByRental {
 		cp := *state
 		snapshotSettlementEligibility[rentalID] = &cp
+	}
+	for key, record := range m.refundsByKey {
+		cp := *record
+		snapshotRefundsByKey[key] = &cp
 	}
 	m.mu.Unlock()
 
@@ -132,14 +156,18 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 		m.statesByID = snapshotByID
 		m.statesByExt = snapshotByExt
 		m.walletStatesByRental = snapshotWalletStates
+		m.refundStatesByRental = snapshotRefundStates
 		m.settlementStatesByRental = snapshotSettlementStates
 		m.settlementEligibilityByRental = snapshotSettlementEligibility
+		m.refundsByKey = snapshotRefundsByKey
 		m.providerLedgerEntries = snapshotProviderLedger
 		m.balanceDebitEntries = snapshotBalanceDebitLedger
+		m.balanceRefundEntries = snapshotBalanceRefundLedger
 		m.depositHolds = snapshotDepositHolds
 		m.depositLedgerEntries = snapshotDepositLedger
 		m.depositReleaseEntries = snapshotDepositRelease
 		m.depositForfeitEntries = snapshotDepositForfeit
+		m.depositRefundEntries = snapshotDepositRefund
 		m.mu.Unlock()
 	}
 	return err
@@ -227,6 +255,11 @@ func (m *mockRepository) GetUserBalance(ctx context.Context, userID int64) (*Use
 			return &UserBalance{UserID: userID, AvailableBalance: state.UserBalance, Currency: "USD"}, nil
 		}
 	}
+	for _, state := range m.refundStatesByRental {
+		if state.UserID == userID {
+			return &UserBalance{UserID: userID, AvailableBalance: state.UserBalance, Currency: "USD"}, nil
+		}
+	}
 	return nil, ErrFinancialUserNotFound
 }
 
@@ -234,7 +267,7 @@ func (m *mockRepository) ListUserLedgerEntries(ctx context.Context, userID int64
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	entries := make([]PublicLedgerEntry, 0, len(m.providerLedgerEntries)+len(m.depositLedgerEntries)+len(m.depositReleaseEntries)+len(m.depositForfeitEntries))
+	entries := make([]PublicLedgerEntry, 0, len(m.providerLedgerEntries)+len(m.balanceDebitEntries)+len(m.balanceRefundEntries)+len(m.depositLedgerEntries)+len(m.depositReleaseEntries)+len(m.depositForfeitEntries)+len(m.depositRefundEntries))
 	appendEntries := func(source []FinancialLedgerEntry, entryType int16) {
 		for idx, entry := range source {
 			if entry.UserID != userID {
@@ -264,9 +297,11 @@ func (m *mockRepository) ListUserLedgerEntries(ctx context.Context, userID int64
 	}
 	appendEntries(m.providerLedgerEntries, ledgerEntryProviderPaymentReceived)
 	appendEntries(m.balanceDebitEntries, ledgerEntryBalanceDebit)
+	appendEntries(m.balanceRefundEntries, ledgerEntryBalanceRefundCredit)
 	appendEntries(m.depositLedgerEntries, ledgerEntryDepositHeld)
 	appendEntries(m.depositReleaseEntries, ledgerEntryDepositReleasedBalance)
 	appendEntries(m.depositForfeitEntries, ledgerEntryDepositForfeited)
+	appendEntries(m.depositRefundEntries, ledgerEntryDepositRefundCredit)
 
 	if offset >= len(entries) {
 		return []PublicLedgerEntry{}, nil
@@ -292,10 +327,90 @@ func (m *mockRepository) CountUserLedgerEntries(ctx context.Context, userID int6
 	}
 	countEntries(m.providerLedgerEntries)
 	countEntries(m.balanceDebitEntries)
+	countEntries(m.balanceRefundEntries)
 	countEntries(m.depositLedgerEntries)
 	countEntries(m.depositReleaseEntries)
 	countEntries(m.depositForfeitEntries)
+	countEntries(m.depositRefundEntries)
 	return count, nil
+}
+
+func (m *mockRepository) ListUserRefundEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicRefundEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entries := make([]PublicRefundEntry, 0, len(m.refundsByKey))
+	for _, refund := range m.refundsByKey {
+		if refund.UserID != userID {
+			continue
+		}
+		var reasonCode *string
+		if refund.ReasonCode != "" {
+			value := refund.ReasonCode
+			reasonCode = &value
+		}
+		processedAt := refund.ProcessedAt
+		entries = append(entries, PublicRefundEntry{
+			ID:              refund.ID,
+			RentalID:        refund.RentalID,
+			PaymentID:       refund.PaymentID,
+			Status:          publicRefundStatus(refund.Status),
+			PrincipalAmount: refund.AmountPrincipal,
+			DepositAmount:   refund.AmountDeposit,
+			TotalAmount:     refund.AmountTotal,
+			Currency:        refund.Currency,
+			ReasonCode:      reasonCode,
+			CreatedAt:       time.Unix(refund.ID, 0).UTC(),
+			ProcessedAt:     processedAt,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].CreatedAt.Equal(entries[j].CreatedAt) {
+			return entries[i].ID > entries[j].ID
+		}
+		return entries[i].CreatedAt.After(entries[j].CreatedAt)
+	})
+	if offset >= len(entries) {
+		return []PublicRefundEntry{}, nil
+	}
+	end := offset + limit
+	if end > len(entries) {
+		end = len(entries)
+	}
+	return entries[offset:end], nil
+}
+
+func (m *mockRepository) CountUserRefundEntries(ctx context.Context, userID int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var count int64
+	for _, refund := range m.refundsByKey {
+		if refund.UserID == userID {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (m *mockRepository) ListAdminRentalEntries(ctx context.Context, filters AdminRentalListFilter) ([]AdminRentalEntry, error) {
+	return append([]AdminRentalEntry(nil), m.adminRentals...), nil
+}
+
+func (m *mockRepository) SummarizeAdminRentals(ctx context.Context, filters AdminRentalListFilter) (AdminRentalSummary, error) {
+	return m.adminRentalSummary, nil
+}
+
+func (m *mockRepository) LockWalletRefundState(ctx context.Context, rentalID int64) (*WalletRefundState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state, ok := m.refundStatesByRental[rentalID]
+	if !ok {
+		return nil, ErrWalletRefundNotFound
+	}
+	cp := *state
+	return &cp, nil
 }
 
 func (m *mockRepository) LockPaymentForWebhookByID(ctx context.Context, paymentID int64) (*WebhookPaymentState, error) {
@@ -470,6 +585,11 @@ func (m *mockRepository) MarkDepositReleased(ctx context.Context, holdID int64, 
 				return ErrDepositSettlementNotAllowed
 			}
 			state.HoldStatus = depositHoldStatusReleased
+			for _, refundState := range m.refundStatesByRental {
+				if refundState.HoldID == holdID {
+					refundState.HoldStatus = depositHoldStatusReleased
+				}
+			}
 			m.depositReleaseCalls++
 			return nil
 		}
@@ -486,7 +606,43 @@ func (m *mockRepository) MarkDepositForfeited(ctx context.Context, holdID int64,
 				return ErrDepositSettlementNotAllowed
 			}
 			state.HoldStatus = depositHoldStatusForfeited
+			for _, refundState := range m.refundStatesByRental {
+				if refundState.HoldID == holdID {
+					refundState.HoldStatus = depositHoldStatusForfeited
+				}
+			}
 			m.depositForfeitCalls++
+			return nil
+		}
+	}
+	return ErrDepositHoldNotFound
+}
+
+func (m *mockRepository) MarkDepositRefunded(ctx context.Context, holdID, refundID int64, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, state := range m.settlementStatesByRental {
+		if state.HoldID == holdID {
+			if state.HoldStatus != depositHoldStatusHeld {
+				return ErrDepositSettlementNotAllowed
+			}
+			state.HoldStatus = depositHoldStatusRefunded
+			for _, refundState := range m.refundStatesByRental {
+				if refundState.HoldID == holdID {
+					refundState.HoldStatus = depositHoldStatusRefunded
+				}
+			}
+			m.depositRefundCalls++
+			return nil
+		}
+	}
+	for _, state := range m.refundStatesByRental {
+		if state.HoldID == holdID {
+			if state.HoldStatus != depositHoldStatusHeld {
+				return ErrDepositSettlementNotAllowed
+			}
+			state.HoldStatus = depositHoldStatusRefunded
+			m.depositRefundCalls++
 			return nil
 		}
 	}
@@ -499,6 +655,23 @@ func (m *mockRepository) CreditUserBalance(ctx context.Context, userID, amount i
 	for _, state := range m.settlementStatesByRental {
 		if state.UserID == userID {
 			state.UserBalance += amount
+			for _, refundState := range m.refundStatesByRental {
+				if refundState.UserID == userID {
+					refundState.UserBalance += amount
+				}
+			}
+			m.balanceCreditCalls++
+			return nil
+		}
+	}
+	for _, state := range m.refundStatesByRental {
+		if state.UserID == userID {
+			state.UserBalance += amount
+			for _, settlementState := range m.settlementStatesByRental {
+				if settlementState.UserID == userID {
+					settlementState.UserBalance += amount
+				}
+			}
 			m.balanceCreditCalls++
 			return nil
 		}
@@ -536,6 +709,81 @@ func (m *mockRepository) RecordDepositForfeited(ctx context.Context, entry Finan
 	return nil
 }
 
+func (m *mockRepository) RecordBalanceRefundCredit(ctx context.Context, entry FinancialLedgerEntry) error {
+	if m.ledgerErr != nil {
+		return m.ledgerErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.balanceRefundEntries {
+		if existing.IdempotencyKey == entry.IdempotencyKey {
+			return nil
+		}
+	}
+	m.balanceRefundEntries = append(m.balanceRefundEntries, entry)
+	return nil
+}
+
+func (m *mockRepository) RecordDepositRefundCredit(ctx context.Context, entry FinancialLedgerEntry) error {
+	if m.ledgerErr != nil {
+		return m.ledgerErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.depositRefundEntries {
+		if existing.IdempotencyKey == entry.IdempotencyKey {
+			return nil
+		}
+	}
+	m.depositRefundEntries = append(m.depositRefundEntries, entry)
+	return nil
+}
+
+func (m *mockRepository) CreateRefund(ctx context.Context, refund RefundRecord) (*RefundRecord, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.refundsByKey[refund.IdempotencyKey]; ok {
+		cp := *existing
+		return &cp, false, nil
+	}
+	refund.ID = int64(len(m.refundsByKey) + 1)
+	cp := refund
+	m.refundsByKey[refund.IdempotencyKey] = &cp
+	m.refundCreateCalls++
+	return &cp, true, nil
+}
+
+func (m *mockRepository) LoadCompletedRefundTotals(ctx context.Context, paymentID int64) (*RefundTotals, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var totals RefundTotals
+	for _, refund := range m.refundsByKey {
+		if refund.PaymentID == paymentID && refund.Status == refundStatusCompleted {
+			totals.Principal += refund.AmountPrincipal
+			totals.Deposit += refund.AmountDeposit
+		}
+	}
+	return &totals, nil
+}
+
+func (m *mockRepository) MarkRefundCompleted(ctx context.Context, refundID int64, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, refund := range m.refundsByKey {
+		if refund.ID == refundID {
+			if refund.Status != refundStatusRequested {
+				return ErrWalletRefundNotAllowed
+			}
+			refund.Status = refundStatusCompleted
+			ts := now
+			refund.ProcessedAt = &ts
+			m.refundCompleteCalls++
+			return nil
+		}
+	}
+	return ErrWalletRefundNotFound
+}
+
 func (m *mockRepository) LogDepositSecurityEvent(ctx context.Context, eventType int16, userID, accountID, rentalID int64, userAgent string, metadata []byte) error {
 	if m.logErr != nil {
 		return m.logErr
@@ -547,6 +795,16 @@ func (m *mockRepository) LogDepositSecurityEvent(ctx context.Context, eventType 
 }
 
 func (m *mockRepository) LogWalletSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error {
+	if m.logErr != nil {
+		return m.logErr
+	}
+	m.mu.Lock()
+	m.securityEventCalls++
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *mockRepository) LogRefundSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, userAgent string, metadata []byte) error {
 	if m.logErr != nil {
 		return m.logErr
 	}
@@ -616,6 +874,25 @@ func seedWalletPaymentState(repo *mockRepository, state *WalletPaymentState) {
 		PaymentExpiresAt:      state.PaymentExpiresAt,
 		RentalStatus:          state.RentalStatus,
 		AccountStatus:         state.AccountStatus,
+	}
+}
+
+func seedWalletRefundState(repo *mockRepository, state *WalletRefundState) {
+	repo.refundStatesByRental[state.RentalID] = state
+	if state.HasDepositHold {
+		repo.settlementStatesByRental[state.RentalID] = &DepositSettlementState{
+			HoldID:        state.HoldID,
+			RentalID:      state.RentalID,
+			UserID:        state.UserID,
+			AccountID:     state.AccountID,
+			PaymentID:     state.PaymentID,
+			HoldStatus:    state.HoldStatus,
+			RentalStatus:  state.RentalStatus,
+			PaymentStatus: state.PaymentStatus,
+			Amount:        state.HoldAmount,
+			Currency:      state.Currency,
+			UserBalance:   state.UserBalance,
+		}
 	}
 }
 
@@ -1008,6 +1285,274 @@ func TestPaymentService_PayRentalWithBalance_RollbackOnLedgerFailure(t *testing.
 	}
 }
 
+func TestPaymentService_RefundWalletPayment_Success(t *testing.T) {
+	repo := newMockRepository(nil)
+	seedWalletRefundState(repo, &WalletRefundState{
+		PaymentID:      160,
+		RentalID:       260,
+		UserID:         360,
+		AccountID:      460,
+		Provider:       walletPaymentProvider,
+		PaymentStatus:  2,
+		RentalStatus:   3,
+		RentalPrice:    500,
+		DepositAmount:  700,
+		Currency:       "USD",
+		UserBalance:    1000,
+		HasDepositHold: true,
+		HoldID:         560,
+		HoldStatus:     depositHoldStatusHeld,
+		HoldAmount:     700,
+	})
+	service := NewPaymentService(repo)
+
+	res, err := service.RefundWalletPayment(context.Background(), 900, "ADMIN", 260, "SERVICE_UNAVAILABLE", time.Now())
+	if err != nil {
+		t.Fatalf("RefundWalletPayment failed: %v", err)
+	}
+	if !res.Changed || res.Idempotent || res.Status != "COMPLETED" || res.TotalAmount != 1200 || res.DepositStatus != "REFUNDED" {
+		t.Fatalf("unexpected wallet refund result: %+v", res)
+	}
+	state := repo.refundStatesByRental[260]
+	if state.UserBalance != 2200 || state.HoldStatus != depositHoldStatusRefunded {
+		t.Fatalf("unexpected wallet refund state: %+v", state)
+	}
+	if len(repo.balanceRefundEntries) != 1 || repo.balanceRefundEntries[0].Amount != 500 {
+		t.Fatalf("expected one principal refund entry, got %+v", repo.balanceRefundEntries)
+	}
+	if len(repo.depositRefundEntries) != 1 || repo.depositRefundEntries[0].Amount != 700 {
+		t.Fatalf("expected one deposit refund entry, got %+v", repo.depositRefundEntries)
+	}
+	if repo.balanceCreditCalls != 1 || repo.auditCalls != 1 || repo.securityEventCalls != 1 || repo.refundCompleteCalls != 1 {
+		t.Fatalf("expected one credit/audit/security/completion call, got balance=%d audit=%d security=%d completion=%d", repo.balanceCreditCalls, repo.auditCalls, repo.securityEventCalls, repo.refundCompleteCalls)
+	}
+}
+
+func TestPaymentService_RefundWalletPayment_PrincipalOnlyStates(t *testing.T) {
+	cases := []struct {
+		name          string
+		rentalID      int64
+		depositAmount int64
+		holdStatus    int16
+		hasHold       bool
+		wantDeposit   string
+	}{
+		{name: "zero deposit", rentalID: 261, depositAmount: 0, holdStatus: 0, hasHold: false, wantDeposit: "NONE"},
+		{name: "released hold", rentalID: 262, depositAmount: 700, holdStatus: depositHoldStatusReleased, hasHold: true, wantDeposit: "RELEASED"},
+		{name: "forfeited hold", rentalID: 263, depositAmount: 700, holdStatus: depositHoldStatusForfeited, hasHold: true, wantDeposit: "FORFEITED"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newMockRepository(nil)
+			seedWalletRefundState(repo, &WalletRefundState{
+				PaymentID:      160 + tc.rentalID,
+				RentalID:       tc.rentalID,
+				UserID:         360,
+				AccountID:      460,
+				Provider:       walletPaymentProvider,
+				PaymentStatus:  2,
+				RentalStatus:   3,
+				RentalPrice:    500,
+				DepositAmount:  tc.depositAmount,
+				Currency:       "USD",
+				UserBalance:    1000,
+				HasDepositHold: tc.hasHold,
+				HoldID:         560 + tc.rentalID,
+				HoldStatus:     tc.holdStatus,
+				HoldAmount:     tc.depositAmount,
+			})
+			service := NewPaymentService(repo)
+
+			res, err := service.RefundWalletPayment(context.Background(), 900, "ADMIN", tc.rentalID, "SERVICE_UNAVAILABLE", time.Now())
+			if err != nil {
+				t.Fatalf("RefundWalletPayment failed: %v", err)
+			}
+			if res.TotalAmount != 500 || res.PrincipalAmount != 500 || res.DepositAmount != 0 || res.DepositStatus != tc.wantDeposit {
+				t.Fatalf("unexpected principal-only refund result: %+v", res)
+			}
+			if len(repo.balanceRefundEntries) != 1 || len(repo.depositRefundEntries) != 0 {
+				t.Fatalf("unexpected refund ledger entries principal=%d deposit=%d", len(repo.balanceRefundEntries), len(repo.depositRefundEntries))
+			}
+			if repo.refundStatesByRental[tc.rentalID].UserBalance != 1500 {
+				t.Fatalf("expected principal credit only, got balance=%d", repo.refundStatesByRental[tc.rentalID].UserBalance)
+			}
+		})
+	}
+}
+
+func TestPaymentService_RefundWalletPayment_ReplayIsIdempotent(t *testing.T) {
+	repo := newMockRepository(nil)
+	completedAt := time.Now()
+	repo.refundsByKey["refund:wallet:full:rental:264"] = &RefundRecord{
+		ID:              1,
+		PaymentID:       164,
+		RentalID:        264,
+		UserID:          364,
+		AccountID:       464,
+		SourceType:      refundSourceTypeWallet,
+		RefundKind:      refundKindFull,
+		Status:          refundStatusCompleted,
+		ReasonCode:      "SERVICE_UNAVAILABLE",
+		RequestedByRole: "ADMIN",
+		AmountPrincipal: 500,
+		AmountDeposit:   700,
+		AmountTotal:     1200,
+		Currency:        "USD",
+		IdempotencyKey:  "refund:wallet:full:rental:264",
+		ProcessedAt:     &completedAt,
+	}
+	seedWalletRefundState(repo, &WalletRefundState{
+		PaymentID:      164,
+		RentalID:       264,
+		UserID:         364,
+		AccountID:      464,
+		Provider:       walletPaymentProvider,
+		PaymentStatus:  2,
+		RentalStatus:   3,
+		RentalPrice:    500,
+		DepositAmount:  700,
+		Currency:       "USD",
+		UserBalance:    2200,
+		HasDepositHold: true,
+		HoldID:         564,
+		HoldStatus:     depositHoldStatusRefunded,
+		HoldAmount:     700,
+	})
+	service := NewPaymentService(repo)
+
+	res, err := service.RefundWalletPayment(context.Background(), 900, "ADMIN", 264, "SERVICE_UNAVAILABLE", time.Now())
+	if err != nil {
+		t.Fatalf("RefundWalletPayment replay failed: %v", err)
+	}
+	if !res.Idempotent || res.Changed || res.TotalAmount != 1200 {
+		t.Fatalf("expected idempotent refund replay, got %+v", res)
+	}
+	if repo.balanceCreditCalls != 0 || len(repo.balanceRefundEntries) != 0 || len(repo.depositRefundEntries) != 0 || repo.auditCalls != 0 || repo.securityEventCalls != 0 {
+		t.Fatalf("expected no replay side effects")
+	}
+}
+
+func TestPaymentService_RefundWalletPayment_RollbackOnLedgerFailure(t *testing.T) {
+	repo := newMockRepository(nil)
+	repo.ledgerErr = errors.New("ledger insert failed")
+	seedWalletRefundState(repo, &WalletRefundState{
+		PaymentID:      165,
+		RentalID:       265,
+		UserID:         365,
+		AccountID:      465,
+		Provider:       walletPaymentProvider,
+		PaymentStatus:  2,
+		RentalStatus:   3,
+		RentalPrice:    500,
+		DepositAmount:  700,
+		Currency:       "USD",
+		UserBalance:    1000,
+		HasDepositHold: true,
+		HoldID:         565,
+		HoldStatus:     depositHoldStatusHeld,
+		HoldAmount:     700,
+	})
+	service := NewPaymentService(repo)
+
+	_, err := service.RefundWalletPayment(context.Background(), 900, "ADMIN", 265, "SERVICE_UNAVAILABLE", time.Now())
+	if err == nil {
+		t.Fatalf("expected wallet refund ledger failure")
+	}
+	state := repo.refundStatesByRental[265]
+	if state.UserBalance != 1000 || state.HoldStatus != depositHoldStatusHeld {
+		t.Fatalf("expected rollback to preserve refund state, got %+v", state)
+	}
+	if len(repo.balanceRefundEntries) != 0 || len(repo.depositRefundEntries) != 0 || repo.auditCalls != 0 || repo.securityEventCalls != 0 || repo.refundCompleteCalls != 0 {
+		t.Fatalf("expected rollback to suppress refund side effects")
+	}
+}
+
+func TestPaymentService_RefundWalletPayment_Rejections(t *testing.T) {
+	service := NewPaymentService(newMockRepository(nil))
+	if _, err := service.RefundWalletPayment(context.Background(), 900, "RENT", 1, "SERVICE_UNAVAILABLE", time.Now()); !errors.Is(err, ErrAdminRequired) {
+		t.Fatalf("expected admin rejection, got %v", err)
+	}
+
+	repo := newMockRepository(nil)
+	seedWalletRefundState(repo, &WalletRefundState{
+		PaymentID:      166,
+		RentalID:       266,
+		UserID:         366,
+		AccountID:      466,
+		Provider:       webhookPaymentProvider,
+		PaymentStatus:  2,
+		RentalStatus:   3,
+		RentalPrice:    500,
+		DepositAmount:  0,
+		Currency:       "USD",
+		UserBalance:    1000,
+		HasDepositHold: false,
+	})
+	if _, err := NewPaymentService(repo).RefundWalletPayment(context.Background(), 900, "ADMIN", 266, "SERVICE_UNAVAILABLE", time.Now()); !errors.Is(err, ErrWalletRefundNotAllowed) {
+		t.Fatalf("expected provider-paid refund rejection, got %v", err)
+	}
+}
+
+func TestPaymentService_ListUserRefunds(t *testing.T) {
+	repo := newMockRepository(nil)
+	processedAt := time.Now().UTC()
+	repo.refundsByKey["refund:wallet:full:rental:1"] = &RefundRecord{
+		ID:              1,
+		PaymentID:       11,
+		RentalID:        21,
+		UserID:          301,
+		Status:          refundStatusCompleted,
+		ReasonCode:      "SERVICE_UNAVAILABLE",
+		AmountPrincipal: 500,
+		AmountDeposit:   0,
+		AmountTotal:     500,
+		Currency:        "USD",
+		ProcessedAt:     &processedAt,
+	}
+	repo.refundsByKey["refund:wallet:full:rental:2"] = &RefundRecord{
+		ID:              2,
+		PaymentID:       12,
+		RentalID:        22,
+		UserID:          302,
+		Status:          refundStatusCompleted,
+		ReasonCode:      "SERVICE_UNAVAILABLE",
+		AmountPrincipal: 500,
+		AmountDeposit:   500,
+		AmountTotal:     1000,
+		Currency:        "USD",
+		ProcessedAt:     &processedAt,
+	}
+
+	page, err := NewPaymentService(repo).ListUserRefunds(context.Background(), 301, 1, 10)
+	if err != nil {
+		t.Fatalf("ListUserRefunds failed: %v", err)
+	}
+	if page.TotalItems != 1 || len(page.Entries) != 1 {
+		t.Fatalf("expected one owned refund, got total=%d entries=%d", page.TotalItems, len(page.Entries))
+	}
+	if page.Entries[0].RentalID != 21 || page.Entries[0].Status != "COMPLETED" {
+		t.Fatalf("unexpected refund entry: %+v", page.Entries[0])
+	}
+	if page.Entries[0].ReasonCode == nil || *page.Entries[0].ReasonCode != "SERVICE_UNAVAILABLE" {
+		t.Fatalf("expected safe reason_code in public refund entry, got %+v", page.Entries[0])
+	}
+}
+
+func TestPaymentService_ListUserRefunds_InvalidPagination(t *testing.T) {
+	service := NewPaymentService(newMockRepository(nil))
+
+	if _, err := service.ListUserRefunds(context.Background(), 1, 0, 10); !errors.Is(err, ErrInvalidRefundPagination) {
+		t.Fatalf("expected invalid page error, got %v", err)
+	}
+	if _, err := service.ListUserRefunds(context.Background(), 1, 1, 0); !errors.Is(err, ErrInvalidRefundPagination) {
+		t.Fatalf("expected invalid page_size error, got %v", err)
+	}
+	if _, err := service.ListUserRefunds(context.Background(), 1, 1, 101); !errors.Is(err, ErrInvalidRefundPagination) {
+		t.Fatalf("expected oversized page_size error, got %v", err)
+	}
+}
+
 func TestPaymentService_ReleaseDeposit_Success(t *testing.T) {
 	repo := newMockRepository(nil)
 	seedSettlementState(repo, &DepositSettlementState{
@@ -1282,5 +1827,30 @@ func TestPaymentService_ProcessWebhook_RollbackOnAccountUpdateFailure(t *testing
 	state := repo.statesByID[101]
 	if state.Status != 1 || state.RentalStatus != 1 || state.AccountStatus != 3 {
 		t.Fatalf("expected rollback to restore original state, got %+v", state)
+	}
+}
+
+func TestPaymentService_ListAdminRentals_InvalidFilters(t *testing.T) {
+	service := NewPaymentService(newMockRepository(nil))
+
+	_, err := service.ListAdminRentals(context.Background(), AdminRentalListFilter{
+		Page:         1,
+		PageSize:     20,
+		RentalStatus: "BROKEN",
+	})
+	if !errors.Is(err, ErrInvalidAdminRentalFilters) {
+		t.Fatalf("expected invalid admin filter error, got %v", err)
+	}
+}
+
+func TestPaymentService_ListAdminRentals_InvalidPagination(t *testing.T) {
+	service := NewPaymentService(newMockRepository(nil))
+
+	_, err := service.ListAdminRentals(context.Background(), AdminRentalListFilter{
+		Page:     0,
+		PageSize: 101,
+	})
+	if !errors.Is(err, ErrInvalidAdminRentalFilters) {
+		t.Fatalf("expected invalid admin pagination error, got %v", err)
 	}
 }

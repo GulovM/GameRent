@@ -69,6 +69,10 @@ export type Rental = {
   security_deposit: Money;
   deposit_status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | string;
   total_price: Money;
+  has_refund: boolean;
+  refund_status: "NONE" | "REQUESTED" | "COMPLETED" | "FAILED" | string;
+  refund_total_amount: Money;
+  processed_at?: string;
 };
 
 export type FinancialBalance = {
@@ -85,6 +89,68 @@ export type LedgerEntry = {
   payment_id?: number;
   created_at: string;
   display_type: string;
+};
+
+export type RefundEntry = {
+  id: number;
+  rental_id: number;
+  payment_id: number;
+  status: "REQUESTED" | "COMPLETED" | "FAILED" | string;
+  principal_amount: number;
+  deposit_amount: number;
+  total_amount: number;
+  currency: string;
+  reason_code?: string;
+  created_at: string;
+  processed_at?: string;
+};
+
+export type AdminRentalRefundSummary = {
+  id: number;
+  user_id: number;
+  account_id: number;
+  payment_id?: number;
+  status: number;
+  payment_status: number | string;
+  payment_provider: string;
+  rental_price: Money;
+  security_deposit: Money;
+  deposit_status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | string;
+  total_price: Money;
+  has_refund: boolean;
+  refund_status: "NONE" | "REQUESTED" | "COMPLETED" | "FAILED" | string;
+  refund_total_amount: Money;
+  processed_at?: string;
+};
+
+export type RefundReasonCodeOption = {
+  code: string;
+  label: string;
+};
+
+export type AdminRentalFilters = {
+  rental_status?: "WAITING_PAYMENT" | "ACTIVE" | "EXPIRED" | "CANCELLED" | "COMPLETED" | "";
+  payment_status?: "PENDING" | "SUCCESS" | "FAILED" | "";
+  payment_provider?: "balance" | "internal" | "";
+  deposit_status?: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | "";
+  refund_status?: "NONE" | "REQUESTED" | "COMPLETED" | "FAILED" | "";
+  eligible_wallet_refund?: boolean | undefined;
+  user_id?: number | undefined;
+  rental_id?: number | undefined;
+};
+
+export type AdminRentalSummary = {
+  total_count: number;
+  eligible_wallet_refund_count: number;
+  rental_status_counts: Record<string, number>;
+  payment_status_counts: Record<string, number>;
+  refund_status_counts: Record<string, number>;
+};
+
+export type AdminRentalsResponse = {
+  rentals: AdminRentalRefundSummary[];
+  summary: AdminRentalSummary;
+  pagination: Pagination;
 };
 
 export type Payment = {
@@ -111,6 +177,16 @@ export type WalletPaymentResponse = {
   rental_status: number;
   account_status: number;
   payment_provider: string;
+};
+
+export type AdminWalletRefundResponse = {
+  changed: boolean;
+  idempotent: boolean;
+  status: string;
+  principal_amount: Money;
+  deposit_amount: Money;
+  total_amount: Money;
+  deposit_status: string;
 };
 
 export type NotificationItem = {
@@ -258,6 +334,9 @@ export const api = {
   myLedger(query?: Query) {
     return request<{ entries: LedgerEntry[]; pagination: Pagination }>("/api/v1/me/ledger", {}, query);
   },
+  myRefunds(query?: Query) {
+    return request<{ refunds: RefundEntry[]; pagination: Pagination }>("/api/v1/me/refunds", {}, query);
+  },
   updateUser(id: number, payload: { first_name: string; last_name: string }) {
     return request<User>(`/api/v1/users/${id}`, {
       method: "PATCH",
@@ -381,5 +460,17 @@ export const api = {
   },
   adminAuditLogs() {
     return request<{ audit_logs: AuditLog[] }>("/api/v1/admin/audit-logs");
+  },
+  adminRentals(query?: Query) {
+    return request<AdminRentalsResponse>("/api/v1/admin/rentals", {}, query);
+  },
+  adminRefundReasonCodes() {
+    return request<{ reason_codes: RefundReasonCodeOption[] }>("/api/v1/admin/refund-reason-codes");
+  },
+  adminWalletRefund(rentalId: number, reason_code: string) {
+    return request<AdminWalletRefundResponse>(`/api/v1/admin/rentals/${rentalId}/wallet-refund`, {
+      method: "POST",
+      body: JSON.stringify({ reason_code })
+    });
   }
 };

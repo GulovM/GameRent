@@ -1090,6 +1090,13 @@ td small {
   text-align: right;
 }
 
+.refund-breakdown {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+  color: var(--muted);
+}
+
 .profile-form label,
 .auth-dialog label {
   flex-direction: column;
@@ -1195,6 +1202,118 @@ td small {
   gap: 10px;
   margin-top: 22px;
   padding: 18px;
+}
+
+.admin-refund-panel {
+  gap: 18px;
+}
+
+.admin-refund-feedback {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.admin-refund-feedback.ok {
+  color: #e8fff6;
+  border-color: rgba(61, 220, 151, 0.48);
+  background: rgba(61, 220, 151, 0.12);
+}
+
+.admin-refund-feedback.error {
+  color: #ffecea;
+  border-color: rgba(239, 107, 92, 0.48);
+  background: rgba(239, 107, 92, 0.12);
+}
+
+.admin-filter-panel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  padding: 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.admin-filter-panel label {
+  display: grid;
+  gap: 6px;
+}
+
+.admin-filter-panel span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.admin-refund-list {
+  display: grid;
+  gap: 16px;
+}
+
+.admin-refund-card {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.admin-refund-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.admin-refund-grid,
+.admin-refund-confirm-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.admin-refund-actions {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+}
+
+.admin-refund-reason {
+  display: grid;
+  gap: 6px;
+  min-width: 240px;
+}
+
+.admin-refund-reason span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.admin-refund-confirm {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.admin-refund-confirm-grid span,
+.admin-refund-hint {
+  padding: 12px 14px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.admin-refund-confirm-grid strong,
+.admin-refund-hint strong {
+  color: var(--text);
 }
 
 .audit-strip.compact {
@@ -1460,6 +1579,21 @@ td small {
   .row-actions button,
   .table-actions button {
     width: 100%;
+  }
+
+  .admin-refund-card-top,
+  .admin-refund-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .admin-refund-grid,
+  .admin-refund-confirm-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-refund-reason {
+    min-width: 0;
   }
 
   th,

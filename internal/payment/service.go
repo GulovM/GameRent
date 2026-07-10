@@ -29,12 +29,16 @@ var (
 	ErrWalletPaymentNotAllowed     = errors.New("wallet payment is not allowed")
 	ErrWalletPaymentExpired        = errors.New("wallet payment has expired")
 	ErrWalletInsufficientBalance   = errors.New("insufficient wallet balance")
+	ErrWalletRefundNotFound        = errors.New("wallet refund rental not found")
+	ErrWalletRefundNotAllowed      = errors.New("wallet refund is not allowed")
 	ErrDepositHoldNotFound         = errors.New("deposit hold not found")
 	ErrDepositSettlementNotAllowed = errors.New("deposit settlement is not allowed")
 	ErrDepositAlreadySettled       = errors.New("deposit is already settled")
 	ErrAdminRequired               = errors.New("admin role is required")
 	ErrInvalidReasonCode           = errors.New("invalid reason_code")
 	ErrInvalidLedgerPagination     = errors.New("invalid ledger pagination")
+	ErrInvalidRefundPagination     = errors.New("invalid refund pagination")
+	ErrInvalidAdminRentalFilters   = errors.New("invalid admin rental filters")
 )
 
 type Service interface {
@@ -42,7 +46,10 @@ type Service interface {
 	VerifySignature(payload []byte, signature string) bool
 	GetUserBalance(ctx context.Context, userID int64) (*UserBalance, error)
 	ListUserLedger(ctx context.Context, userID int64, page, pageSize int) (*UserLedgerPage, error)
+	ListUserRefunds(ctx context.Context, userID int64, page, pageSize int) (*UserRefundPage, error)
+	ListAdminRentals(ctx context.Context, filters AdminRentalListFilter) (*AdminRentalPage, error)
 	PayRentalWithBalance(ctx context.Context, userID, rentalID int64, clientIP, userAgent string, now time.Time) (*WalletPaymentResult, error)
+	RefundWalletPayment(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*WalletRefundResult, error)
 	ReleaseDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, now time.Time) (*DepositSettlementResult, error)
 	ForfeitDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*DepositSettlementResult, error)
 }
@@ -67,6 +74,13 @@ type UserLedgerPage struct {
 	TotalItems int64
 }
 
+type UserRefundPage struct {
+	Entries    []PublicRefundEntry
+	Page       int
+	PageSize   int
+	TotalItems int64
+}
+
 type WalletPaymentResult struct {
 	Changed         bool
 	Idempotent      bool
@@ -79,10 +93,40 @@ type WalletPaymentResult struct {
 	PaymentProvider string
 }
 
+type WalletRefundResult struct {
+	Changed         bool
+	Idempotent      bool
+	RefundID        int64
+	Status          string
+	PrincipalAmount int64
+	DepositAmount   int64
+	TotalAmount     int64
+	DepositStatus   string
+}
+
+type WalletRefundReasonOption struct {
+	Code  string
+	Label string
+}
+
 type PaymentService struct {
 	repo          Repository
 	webhookSecret string
 }
+
+var walletRefundReasonOptions = []WalletRefundReasonOption{
+	{Code: "SERVICE_UNAVAILABLE", Label: "Service unavailable"},
+	{Code: "ACCOUNT_INVALID", Label: "Account invalid"},
+	{Code: "ADMIN_CORRECTION", Label: "Admin correction"},
+}
+
+var walletRefundReasonCodeSet = func() map[string]struct{} {
+	result := make(map[string]struct{}, len(walletRefundReasonOptions))
+	for _, option := range walletRefundReasonOptions {
+		result[option.Code] = struct{}{}
+	}
+	return result
+}()
 
 func NewPaymentService(repo Repository) *PaymentService {
 	webhookSecret := os.Getenv("PAYMENT_WEBHOOK_SECRET")
@@ -94,6 +138,21 @@ func NewPaymentService(repo Repository) *PaymentService {
 		repo:          repo,
 		webhookSecret: webhookSecret,
 	}
+}
+
+func WalletRefundReasonOptions() []WalletRefundReasonOption {
+	options := make([]WalletRefundReasonOption, len(walletRefundReasonOptions))
+	copy(options, walletRefundReasonOptions)
+	return options
+}
+
+func IsAllowedWalletRefundReasonCode(reasonCode string) bool {
+	reasonCode = strings.TrimSpace(reasonCode)
+	if !isSafeReasonCode(reasonCode) {
+		return false
+	}
+	_, ok := walletRefundReasonCodeSet[reasonCode]
+	return ok
 }
 
 func (s *PaymentService) VerifySignature(payload []byte, signature string) bool {
@@ -334,6 +393,29 @@ func (s *PaymentService) ListUserLedger(ctx context.Context, userID int64, page,
 	}, nil
 }
 
+func (s *PaymentService) ListUserRefunds(ctx context.Context, userID int64, page, pageSize int) (*UserRefundPage, error) {
+	if page < 1 || pageSize < 1 || pageSize > 100 {
+		return nil, ErrInvalidRefundPagination
+	}
+
+	offset := (page - 1) * pageSize
+	entries, err := s.repo.ListUserRefundEntries(ctx, userID, pageSize, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list user refunds: %w", err)
+	}
+	total, err := s.repo.CountUserRefundEntries(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("count user refunds: %w", err)
+	}
+
+	return &UserRefundPage{
+		Entries:    entries,
+		Page:       page,
+		PageSize:   pageSize,
+		TotalItems: total,
+	}, nil
+}
+
 func (s *PaymentService) PayRentalWithBalance(ctx context.Context, userID, rentalID int64, clientIP, userAgent string, now time.Time) (*WalletPaymentResult, error) {
 	result := &WalletPaymentResult{}
 
@@ -508,6 +590,226 @@ func (s *PaymentService) PayRentalWithBalance(ctx context.Context, userID, renta
 	return result, nil
 }
 
+func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*WalletRefundResult, error) {
+	if actorRole != "ADMIN" && actorRole != "SYSTEM" {
+		return nil, ErrAdminRequired
+	}
+	reasonCode = strings.TrimSpace(reasonCode)
+	if !IsAllowedWalletRefundReasonCode(reasonCode) {
+		return nil, ErrInvalidReasonCode
+	}
+
+	result := &WalletRefundResult{}
+	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		state, err := s.repo.LockWalletRefundState(txCtx, rentalID)
+		if err != nil {
+			if errors.Is(err, ErrWalletRefundNotFound) {
+				return err
+			}
+			return fmt.Errorf("lock wallet refund state: %w", err)
+		}
+
+		principalAmount, depositAmount, err := validateWalletRefundEligibility(state)
+		if err != nil {
+			return err
+		}
+
+		refundKey := fmt.Sprintf("refund:wallet:full:rental:%d", state.RentalID)
+		correlationID := refundKey
+		refundMetadata, err := marshalFinancialMetadata(map[string]any{
+			"event":               "wallet_full_refund",
+			"payment_id":          strconv.FormatInt(state.PaymentID, 10),
+			"rental_id":           strconv.FormatInt(state.RentalID, 10),
+			"account_id":          strconv.FormatInt(state.AccountID, 10),
+			"reason_code":         reasonCode,
+			"actor_user":          strconv.FormatInt(actorUserID, 10),
+			"deposit_hold_status": walletRefundDepositStatus(state.HoldStatus, state.DepositAmount, state.HasDepositHold),
+			"recorded_at":         now.UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			return fmt.Errorf("marshal wallet refund metadata: %w", err)
+		}
+
+		requestedByUserID := &actorUserID
+		if actorRole == "SYSTEM" {
+			requestedByUserID = nil
+		}
+		refundRecord, _, err := s.repo.CreateRefund(txCtx, RefundRecord{
+			PaymentID:         state.PaymentID,
+			RentalID:          state.RentalID,
+			UserID:            state.UserID,
+			AccountID:         state.AccountID,
+			SourceType:        refundSourceTypeWallet,
+			RefundKind:        refundKindFull,
+			Status:            refundStatusRequested,
+			ReasonCode:        reasonCode,
+			RequestedByUserID: requestedByUserID,
+			RequestedByRole:   actorRole,
+			AmountPrincipal:   principalAmount,
+			AmountDeposit:     depositAmount,
+			AmountTotal:       principalAmount + depositAmount,
+			Currency:          state.Currency,
+			IdempotencyKey:    refundKey,
+			CorrelationID:     correlationID,
+			Metadata:          refundMetadata,
+		})
+		if err != nil {
+			return fmt.Errorf("create refund record: %w", err)
+		}
+
+		result.RefundID = refundRecord.ID
+		result.PrincipalAmount = refundRecord.AmountPrincipal
+		result.DepositAmount = refundRecord.AmountDeposit
+		result.TotalAmount = refundRecord.AmountTotal
+		result.DepositStatus = walletRefundDepositStatus(state.HoldStatus, state.DepositAmount, state.HasDepositHold)
+
+		if refundRecord.Status == refundStatusCompleted {
+			result.Idempotent = true
+			result.Status = "COMPLETED"
+			if state.DepositAmount > 0 && state.HasDepositHold && state.HoldStatus == depositHoldStatusHeld {
+				result.DepositStatus = "REFUNDED"
+			}
+			return nil
+		}
+
+		totals, err := s.repo.LoadCompletedRefundTotals(txCtx, state.PaymentID)
+		if err != nil {
+			return fmt.Errorf("load completed refund totals: %w", err)
+		}
+		if totals.Principal+principalAmount > state.RentalPrice {
+			return ErrWalletRefundNotAllowed
+		}
+		if totals.Deposit+depositAmount > maxRefundableDeposit(state) {
+			return ErrWalletRefundNotAllowed
+		}
+
+		totalAmount := principalAmount + depositAmount
+		if err := s.repo.CreditUserBalance(txCtx, state.UserID, totalAmount, now.UTC()); err != nil {
+			return fmt.Errorf("credit refund amount to balance: %w", err)
+		}
+
+		if depositAmount > 0 {
+			if err := s.repo.MarkDepositRefunded(txCtx, state.HoldID, refundRecord.ID, now.UTC()); err != nil {
+				return fmt.Errorf("mark deposit refunded: %w", err)
+			}
+			result.DepositStatus = "REFUNDED"
+		}
+
+		principalMetadata, err := marshalFinancialMetadata(map[string]any{
+			"event":       "balance_refund_credit",
+			"refund_id":   strconv.FormatInt(refundRecord.ID, 10),
+			"payment_id":  strconv.FormatInt(state.PaymentID, 10),
+			"rental_id":   strconv.FormatInt(state.RentalID, 10),
+			"account_id":  strconv.FormatInt(state.AccountID, 10),
+			"reason_code": reasonCode,
+			"recorded_at": now.UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			return fmt.Errorf("marshal principal refund metadata: %w", err)
+		}
+		if err := s.repo.RecordBalanceRefundCredit(txCtx, FinancialLedgerEntry{
+			UserID:         state.UserID,
+			RentalID:       state.RentalID,
+			PaymentID:      state.PaymentID,
+			AccountID:      state.AccountID,
+			Amount:         principalAmount,
+			Currency:       state.Currency,
+			Provider:       walletPaymentProvider,
+			IdempotencyKey: fmt.Sprintf("refund:wallet:principal:full:rental:%d", state.RentalID),
+			CorrelationID:  correlationID,
+			Metadata:       principalMetadata,
+		}); err != nil {
+			return fmt.Errorf("insert principal refund ledger entry: %w", err)
+		}
+
+		if depositAmount > 0 {
+			depositMetadata, err := marshalFinancialMetadata(map[string]any{
+				"event":       "deposit_refund_credit",
+				"refund_id":   strconv.FormatInt(refundRecord.ID, 10),
+				"payment_id":  strconv.FormatInt(state.PaymentID, 10),
+				"rental_id":   strconv.FormatInt(state.RentalID, 10),
+				"account_id":  strconv.FormatInt(state.AccountID, 10),
+				"reason_code": reasonCode,
+				"recorded_at": now.UTC().Format(time.RFC3339),
+			})
+			if err != nil {
+				return fmt.Errorf("marshal deposit refund metadata: %w", err)
+			}
+			if err := s.repo.RecordDepositRefundCredit(txCtx, FinancialLedgerEntry{
+				UserID:         state.UserID,
+				RentalID:       state.RentalID,
+				PaymentID:      state.PaymentID,
+				AccountID:      state.AccountID,
+				Amount:         depositAmount,
+				Currency:       state.Currency,
+				Provider:       walletPaymentProvider,
+				IdempotencyKey: fmt.Sprintf("refund:wallet:deposit:full:rental:%d", state.RentalID),
+				CorrelationID:  correlationID,
+				Metadata:       depositMetadata,
+			}); err != nil {
+				return fmt.Errorf("insert deposit refund ledger entry: %w", err)
+			}
+		}
+
+		if err := s.repo.MarkRefundCompleted(txCtx, refundRecord.ID, now.UTC()); err != nil {
+			return fmt.Errorf("mark refund completed: %w", err)
+		}
+
+		eventMetadata, err := json.Marshal(map[string]any{
+			"event":              "wallet_refund_completed",
+			"refund_id":          strconv.FormatInt(refundRecord.ID, 10),
+			"payment_id":         strconv.FormatInt(state.PaymentID, 10),
+			"rental_id":          strconv.FormatInt(state.RentalID, 10),
+			"account_id":         strconv.FormatInt(state.AccountID, 10),
+			"actor_id":           strconv.FormatInt(actorUserID, 10),
+			"reason_code":        reasonCode,
+			"principal_refunded": principalAmount > 0,
+			"deposit_refunded":   depositAmount > 0,
+			"deposit_status":     result.DepositStatus,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal refund security metadata: %w", err)
+		}
+		if err := s.repo.LogRefundSecurityEvent(txCtx, state.UserID, state.AccountID, state.RentalID, "api", eventMetadata); err != nil {
+			return fmt.Errorf("log refund security event: %w", err)
+		}
+
+		oldValues, err := json.Marshal(map[string]any{
+			"status":         "REQUESTED",
+			"principal":      principalAmount,
+			"deposit":        depositAmount,
+			"deposit_status": walletRefundDepositStatus(state.HoldStatus, state.DepositAmount, state.HasDepositHold),
+		})
+		if err != nil {
+			return fmt.Errorf("marshal refund audit old values: %w", err)
+		}
+		newValues, err := json.Marshal(map[string]any{
+			"status":         "COMPLETED",
+			"principal":      principalAmount,
+			"deposit":        depositAmount,
+			"deposit_status": result.DepositStatus,
+			"reason_code":    reasonCode,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal refund audit new values: %w", err)
+		}
+		if err := s.repo.InsertAuditLog(txCtx, actorUserID, "refund", refundRecord.ID, "wallet_refund_completed", oldValues, newValues); err != nil {
+			return fmt.Errorf("insert refund audit log: %w", err)
+		}
+
+		result.Changed = true
+		result.Status = "COMPLETED"
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result.Status == "" {
+		result.Status = "COMPLETED"
+	}
+	return result, nil
+}
+
 func (s *PaymentService) ReleaseDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, now time.Time) (*DepositSettlementResult, error) {
 	if actorRole != "ADMIN" {
 		return nil, ErrAdminRequired
@@ -606,7 +908,7 @@ func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, 
 		return nil, ErrAdminRequired
 	}
 	reasonCode = strings.TrimSpace(reasonCode)
-	if !isValidReasonCode(reasonCode) {
+	if !isSafeReasonCode(reasonCode) {
 		return nil, ErrInvalidReasonCode
 	}
 
@@ -717,6 +1019,9 @@ func validateDepositReleaseState(state *DepositSettlementState) error {
 	if state.HoldStatus == depositHoldStatusForfeited {
 		return ErrDepositAlreadySettled
 	}
+	if state.HoldStatus == depositHoldStatusRefunded {
+		return ErrDepositAlreadySettled
+	}
 	if state.HoldStatus == depositHoldStatusReleased {
 		return nil
 	}
@@ -736,6 +1041,9 @@ func validateDepositForfeitState(state *DepositSettlementState) error {
 	if state.HoldStatus == depositHoldStatusReleased {
 		return ErrDepositAlreadySettled
 	}
+	if state.HoldStatus == depositHoldStatusRefunded {
+		return ErrDepositAlreadySettled
+	}
 	if state.HoldStatus == depositHoldStatusForfeited {
 		return nil
 	}
@@ -751,12 +1059,15 @@ func validateDepositForfeitState(state *DepositSettlementState) error {
 	return nil
 }
 
-func isValidReasonCode(reasonCode string) bool {
+func isSafeReasonCode(reasonCode string) bool {
 	if len(reasonCode) == 0 || len(reasonCode) > 64 {
 		return false
 	}
 	for _, ch := range reasonCode {
 		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
 			continue
 		}
 		if ch >= '0' && ch <= '9' {
@@ -768,6 +1079,69 @@ func isValidReasonCode(reasonCode string) bool {
 		return false
 	}
 	return true
+}
+
+func validateWalletRefundEligibility(state *WalletRefundState) (int64, int64, error) {
+	if state.Provider != walletPaymentProvider {
+		return 0, 0, ErrWalletRefundNotAllowed
+	}
+	if state.PaymentStatus != 2 {
+		return 0, 0, ErrWalletRefundNotAllowed
+	}
+	if state.RentalStatus != 3 && state.RentalStatus != 4 {
+		return 0, 0, ErrWalletRefundNotAllowed
+	}
+	principalAmount := state.RentalPrice
+	if principalAmount <= 0 {
+		return 0, 0, ErrWalletRefundNotAllowed
+	}
+
+	if state.DepositAmount <= 0 {
+		return principalAmount, 0, nil
+	}
+	if !state.HasDepositHold {
+		return 0, 0, ErrWalletRefundNotAllowed
+	}
+
+	switch state.HoldStatus {
+	case depositHoldStatusHeld:
+		return principalAmount, state.HoldAmount, nil
+	case depositHoldStatusReleased, depositHoldStatusForfeited, depositHoldStatusRefunded:
+		return principalAmount, 0, nil
+	default:
+		return 0, 0, ErrWalletRefundNotAllowed
+	}
+}
+
+func maxRefundableDeposit(state *WalletRefundState) int64 {
+	if state.DepositAmount <= 0 {
+		return 0
+	}
+	if state.HasDepositHold && state.HoldStatus == depositHoldStatusHeld {
+		return state.HoldAmount
+	}
+	return 0
+}
+
+func walletRefundDepositStatus(holdStatus int16, depositAmount int64, hasDepositHold bool) string {
+	if depositAmount <= 0 {
+		return "NONE"
+	}
+	if !hasDepositHold {
+		return "NONE"
+	}
+	switch holdStatus {
+	case depositHoldStatusHeld:
+		return "HELD"
+	case depositHoldStatusReleased:
+		return "RELEASED"
+	case depositHoldStatusForfeited:
+		return "FORFEITED"
+	case depositHoldStatusRefunded:
+		return "REFUNDED"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func (s *PaymentService) loadWebhookState(ctx context.Context, req WebhookRequest) (*WebhookPaymentState, error) {
