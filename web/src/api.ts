@@ -27,6 +27,33 @@ export type User = {
   updated_at?: string;
 };
 
+export type AdminUserPatch = {
+  trust_score?: number;
+  is_blocked?: boolean;
+  role?: string;
+};
+
+export type AdminBalanceAdjustmentInput = {
+  amount: number;
+  currency: "USD";
+  reason_code: string;
+  comment?: string;
+  idempotency_key: string;
+};
+
+export type AdminBalanceAdjustmentResponse = {
+  adjustment_id: number;
+  user_id: number;
+  previous_balance: number;
+  new_balance: number;
+  amount: number;
+  currency: "USD";
+  ledger_entry_id: number;
+  idempotency_key: string;
+  idempotent_replay: boolean;
+  created_at: string;
+};
+
 export type Game = {
   id: number;
   steam_app_id: number;
@@ -67,7 +94,7 @@ export type Rental = {
   payment_expires_at?: string;
   rental_price: Money;
   security_deposit: Money;
-  deposit_status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | string;
+  deposit_status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | "UNKNOWN" | string;
   total_price: Money;
   has_refund: boolean;
   refund_status: "NONE" | "REQUESTED" | "COMPLETED" | "FAILED" | string;
@@ -115,7 +142,7 @@ export type AdminRentalRefundSummary = {
   payment_provider: string;
   rental_price: Money;
   security_deposit: Money;
-  deposit_status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | string;
+  deposit_status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | "UNKNOWN" | string;
   total_price: Money;
   has_refund: boolean;
   refund_status: "NONE" | "REQUESTED" | "COMPLETED" | "FAILED" | string;
@@ -132,7 +159,7 @@ export type AdminRentalFilters = {
   rental_status?: "WAITING_PAYMENT" | "ACTIVE" | "EXPIRED" | "CANCELLED" | "COMPLETED" | "";
   payment_status?: "PENDING" | "SUCCESS" | "FAILED" | "";
   payment_provider?: "balance" | "internal" | "";
-  deposit_status?: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | "";
+  deposit_status?: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | "UNKNOWN" | "";
   refund_status?: "NONE" | "REQUESTED" | "COMPLETED" | "FAILED" | "";
   eligible_wallet_refund?: boolean | undefined;
   user_id?: number | undefined;
@@ -151,6 +178,63 @@ export type AdminRentalsResponse = {
   rentals: AdminRentalRefundSummary[];
   summary: AdminRentalSummary;
   pagination: Pagination;
+};
+
+export type AdminRentalDetail = {
+  rental: {
+    id: number;
+    user_id: number;
+    account_id: number;
+    status: number;
+    start_at: string;
+    end_at: string;
+    rental_price: Money;
+    deposit_amount: Money;
+    payment_expires_at: string;
+    created_at: string;
+    updated_at: string;
+  };
+  payment: null | {
+    id: number;
+    status: number | string;
+    provider: string;
+    amount: number;
+    currency: string;
+    created_at: string;
+  };
+  deposit: null | {
+    amount: number;
+    currency: string;
+    status: "NONE" | "HELD" | "RELEASED" | "FORFEITED" | "REFUNDED" | string;
+    held_at?: string;
+    released_at?: string;
+    forfeited_at?: string;
+    refunded_at?: string;
+  };
+  refund_summary: {
+    count: number;
+    latest_refund_status: "NONE" | "REQUESTED" | "COMPLETED" | "FAILED" | string;
+    total_refunded_principal: Money;
+    total_refunded_deposit: Money;
+    latest_processed_at?: string;
+  };
+  ledger_summary: {
+    counts_by_display_type: Record<string, number>;
+    totals_by_display_type: Record<string, Money>;
+    latest_entries: Array<{
+      id: number;
+      display_type: string;
+      amount: number;
+      currency: string;
+      created_at: string;
+    }>;
+  };
+  support_flags: {
+    eligible_wallet_refund: boolean;
+    refund_ineligible_reason: string;
+    has_active_credentials_access: boolean;
+    payment_window_expired: boolean;
+  };
 };
 
 export type Payment = {
@@ -254,6 +338,11 @@ export function isApiError(error: unknown): error is ApiError {
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 const ACCESS_KEY = "gamerent.access";
 const REFRESH_KEY = "gamerent.refresh";
+export const SESSION_INVALIDATED_EVENT = "gamerent:session-invalidated";
+export const AUTHORIZATION_CHANGED_EVENT = "gamerent:authorization-changed";
+
+let refreshPromise: Promise<Tokens> | null = null;
+let authEpoch = 0;
 
 export function getAccessToken() {
   return localStorage.getItem(ACCESS_KEY);
@@ -269,6 +358,7 @@ export function saveTokens(tokens: Tokens) {
 }
 
 export function clearTokens() {
+	authEpoch += 1;
   localStorage.removeItem(ACCESS_KEY);
   localStorage.removeItem(REFRESH_KEY);
 }
@@ -283,21 +373,89 @@ function url(path: string, query?: Query) {
   return `${API_BASE}${path}${params.size ? `?${params.toString()}` : ""}`;
 }
 
-async function request<T>(path: string, options: RequestInit = {}, query?: Query): Promise<T> {
+async function parseResponse<T>(response: Response): Promise<{ envelope: ApiEnvelope<T>; error?: ApiError }> {
+  const envelope = (await response.json().catch(() => ({}))) as ApiEnvelope<T>;
+  if (!response.ok || envelope.success === false) {
+    return {
+      envelope,
+      error: new ApiError(envelope.error?.message || `HTTP ${response.status}`, response.status, envelope.error?.code)
+    };
+  }
+  return { envelope };
+}
+
+async function refreshTokensSingleFlight(): Promise<Tokens> {
+  if (refreshPromise) return refreshPromise;
+
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) throw new ApiError("Session has expired", 401, "UNAUTHORIZED");
+  const epoch = authEpoch;
+
+  refreshPromise = (async () => {
+    const response = await fetch(url("/api/v1/auth/refresh"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken })
+    });
+    const parsed = await parseResponse<Tokens>(response);
+    if (parsed.error || !parsed.envelope.data) {
+      throw parsed.error ?? new ApiError("Session has expired", 401, "UNAUTHORIZED");
+    }
+    if (authEpoch !== epoch || getRefreshToken() !== refreshToken) {
+      throw new ApiError("Session has changed", 401, "SESSION_CHANGED");
+    }
+    saveTokens(parsed.envelope.data);
+    return parsed.envelope.data;
+  })()
+    .catch((error) => {
+      if (authEpoch === epoch) {
+        clearTokens();
+        window.dispatchEvent(new Event(SESSION_INVALIDATED_EVENT));
+      }
+      throw error;
+    })
+    .finally(() => {
+      refreshPromise = null;
+    });
+
+  return refreshPromise;
+}
+
+async function request<T>(path: string, options: RequestInit = {}, query?: Query, allowRefresh = true): Promise<T> {
   const headers = new Headers(options.headers);
   if (!headers.has("Content-Type") && options.body) headers.set("Content-Type", "application/json");
   const token = getAccessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
 
   const response = await fetch(url(path, query), { ...options, headers });
-  const envelope = (await response.json().catch(() => ({}))) as ApiEnvelope<T>;
+  const parsed = await parseResponse<T>(response);
 
-  if (!response.ok || envelope.success === false) {
-    const message = envelope.error?.message || `HTTP ${response.status}`;
-    throw new ApiError(message, response.status, envelope.error?.code);
+  if (parsed.error) {
+    const isCredentialEndpoint =
+      path === "/api/v1/auth/register" ||
+      path === "/api/v1/auth/login" ||
+      path === "/api/v1/auth/refresh" ||
+      path === "/api/v1/auth/logout";
+    if (parsed.error.status === 401 && allowRefresh && !isCredentialEndpoint && getRefreshToken()) {
+      // The request may have been sent with an access token that another
+      // concurrent request has already refreshed. Retry with the new access
+      // token instead of rotating the successor refresh token again.
+      if (token && getAccessToken() && getAccessToken() !== token) {
+        return request<T>(path, options, query, false);
+      }
+      await refreshTokensSingleFlight();
+      return request<T>(path, options, query, false);
+    }
+    if (parsed.error.status === 401 && parsed.error.code === "SESSION_REVOKED") {
+      clearTokens();
+      window.dispatchEvent(new Event(SESSION_INVALIDATED_EVENT));
+    } else if (parsed.error.status === 403 && path.startsWith("/api/v1/admin/")) {
+      window.dispatchEvent(new Event(AUTHORIZATION_CHANGED_EVENT));
+    }
+    throw parsed.error;
   }
 
-  return envelope.data as T;
+  return parsed.envelope.data as T;
 }
 
 export const api = {
@@ -319,10 +477,15 @@ export const api = {
       body: JSON.stringify({ refresh_token })
     });
   },
-  logout(refresh_token: string) {
+  async logout(refresh_token?: string) {
+    if (refreshPromise) {
+      await refreshPromise.catch(() => undefined);
+    }
+    const tokenToRevoke = getRefreshToken() ?? refresh_token;
+    if (!tokenToRevoke) return { message: "Logged out locally" };
     return request<{ message: string }>("/api/v1/auth/logout", {
       method: "POST",
-      body: JSON.stringify({ refresh_token })
+      body: JSON.stringify({ refresh_token: tokenToRevoke })
     });
   },
   me() {
@@ -378,20 +541,14 @@ export const api = {
   rental(id: number) {
     return request<Rental>(`/api/v1/rentals/${id}`);
   },
-  rentalCredentials(id: number) {
-    return request<RentalCredentials>(`/api/v1/me/rentals/${id}/credentials`);
+  rentalCredentials(id: number, signal?: AbortSignal) {
+    return request<RentalCredentials>(`/api/v1/me/rentals/${id}/credentials`, { signal });
   },
   payRentalWithBalance(id: number) {
     return request<WalletPaymentResponse>(`/api/v1/me/rentals/${id}/pay-with-balance`, { method: "POST" });
   },
   cancelRental(id: number) {
     return request<{ message: string }>(`/api/v1/rentals/${id}/cancel`, { method: "POST" });
-  },
-  extendRental(id: number, duration_hours: number) {
-    return request<{ message: string }>(`/api/v1/rentals/${id}/extend`, {
-      method: "POST",
-      body: JSON.stringify({ duration_hours })
-    });
   },
   createPayment(rental_id: number) {
     return request<Payment>("/api/v1/payments", {
@@ -440,7 +597,7 @@ export const api = {
       body: JSON.stringify(payload)
     });
   },
-  adminUpdateAccount(id: number, payload: { status?: number; price_per_hour?: number; security_deposit?: number }) {
+  adminUpdateAccount(id: number, payload: { price_per_hour?: number; security_deposit?: number }) {
     return request<{ message: string }>(`/api/v1/admin/accounts/${id}`, {
       method: "PATCH",
       body: JSON.stringify(payload)
@@ -452,9 +609,15 @@ export const api = {
   adminUsers() {
     return request<{ users: User[] }>("/api/v1/admin/users");
   },
-  adminUpdateUser(id: number, payload: { trust_score?: number; is_blocked?: boolean; balance?: number; role?: string }) {
+  adminUpdateUser(id: number, payload: AdminUserPatch) {
     return request<{ message: string }>(`/api/v1/admin/users/${id}`, {
       method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+  },
+  adminAdjustBalance(id: number, payload: AdminBalanceAdjustmentInput) {
+    return request<AdminBalanceAdjustmentResponse>(`/api/v1/admin/users/${id}/balance-adjustments`, {
+      method: "POST",
       body: JSON.stringify(payload)
     });
   },
@@ -463,6 +626,9 @@ export const api = {
   },
   adminRentals(query?: Query) {
     return request<AdminRentalsResponse>("/api/v1/admin/rentals", {}, query);
+  },
+  adminRentalDetail(rentalId: number) {
+    return request<AdminRentalDetail>(`/api/v1/admin/rentals/${rentalId}`);
   },
   adminRefundReasonCodes() {
     return request<{ reason_codes: RefundReasonCodeOption[] }>("/api/v1/admin/refund-reason-codes");

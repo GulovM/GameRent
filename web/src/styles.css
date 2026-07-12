@@ -1247,6 +1247,39 @@ td small {
   font-weight: 800;
 }
 
+.admin-detail-drawer {
+  max-width: 720px;
+}
+
+.admin-detail-body {
+  display: grid;
+  gap: 18px;
+}
+
+.admin-detail-section {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-detail-section h3 {
+  margin: 0;
+}
+
+.admin-ledger-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.admin-ledger-summary-card {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
 .admin-refund-list {
   display: grid;
   gap: 16px;
@@ -1656,4 +1689,27 @@ td small {
     transition: none !important;
     animation: none !important;
   }
+}
+.admin-balance-adjustment {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-soft, rgba(255, 255, 255, 0.03));
+}
+
+.admin-balance-adjustment .form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.admin-balance-adjustment label {
+  display: grid;
+  gap: 6px;
+}
+
+.success-text {
+  color: var(--success, #2fb171);
 }

@@ -12,6 +12,7 @@ var (
 	ErrPasswordTooShort    = errors.New("password must be at least 8 characters long")
 	ErrUserBlocked         = errors.New("user is blocked")
 	ErrEmailNotVerified    = errors.New("email is not verified")
+	ErrInvalidRefreshToken = errors.New("invalid refresh token")
 	ErrTokenExpired        = errors.New("refresh token is expired")
 	ErrTokenAlreadyRevoked = errors.New("refresh token is already revoked")
 )

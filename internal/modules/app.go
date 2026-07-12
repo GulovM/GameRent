@@ -53,6 +53,11 @@ func Run() {
 	}
 	defer logger.Close()
 
+	webhookSecret := os.Getenv("PAYMENT_WEBHOOK_SECRET")
+	if err := payment.ValidateWebhookSecret(webhookSecret); err != nil {
+		logger.Fatal("invalid PAYMENT_WEBHOOK_SECRET configuration", zap.Error(err))
+	}
+
 	logger.Debug("initializing postgres connection pool")
 
 	pool, db, err := pkg_postgres_pool.NewConnectionPool(
@@ -119,7 +124,7 @@ func Run() {
 		logger.Fatal("JWT_SECRET is required")
 	}
 
-	jwtTTL := 24 * time.Hour
+	jwtTTL := 15 * time.Minute
 	if rawTTL := os.Getenv("JWT_TTL"); rawTTL != "" {
 		parsedTTL, err := time.ParseDuration(rawTTL)
 		if err != nil {
@@ -141,7 +146,10 @@ func Run() {
 	gameService := game.NewPostgresService(gameRepo)
 	accountService := account.NewPostgresService(accountRepo)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	paymentService := payment.NewPaymentService(paymentRepo)
+	paymentService, err := payment.NewPaymentServiceWithWebhookSecret(paymentRepo, webhookSecret)
+	if err != nil {
+		logger.Fatal("invalid PAYMENT_WEBHOOK_SECRET configuration", zap.Error(err))
+	}
 	paymentHandler := payment.NewHandler(paymentService, logger.Logger)
 
 	authHandler := auth.NewHandler(authService, logger.Logger)
@@ -166,8 +174,8 @@ func Run() {
 
 	apiVersionRouter := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 
-	apiVersionRouter.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
-	apiVersionRouter.RegisterRoutes(userHandler.Routes(jwtSecret, sLogger)...)
+	apiVersionRouter.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool.Pool)...)
+	apiVersionRouter.RegisterRoutes(userHandler.Routes(jwtSecret, sLogger, pool.Pool)...)
 	apiVersionRouter.RegisterRoutes(gameHandler.Routes()...)
 	apiVersionRouter.RegisterRoutes(accountHandler.Routes()...)
 	apiVersionRouter.RegisterRoutes(paymentHandler.Routes()...)

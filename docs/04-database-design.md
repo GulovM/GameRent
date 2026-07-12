@@ -725,7 +725,9 @@ Append-only журнал финансовых фактов.
 * `DEPOSIT_FORFEITED`;
 * `BALANCE_DEBIT`;
 * `BALANCE_REFUND_CREDIT`;
-* `DEPOSIT_REFUND_CREDIT`.
+* `DEPOSIT_REFUND_CREDIT`;
+* `ADMIN_BALANCE_CREDIT`;
+* `ADMIN_BALANCE_DEBIT`.
 
 Все суммы хранятся в integer minor units (`BIGINT`). `float32/float64` для денег не используются.
 
@@ -764,6 +766,8 @@ INDEX(entry_type, created_at)
 ```
 
 `financial_ledger_entries` защищена trigger-функцией append-only: `UPDATE` и `DELETE` запрещены на уровне PostgreSQL.
+
+Admin balance adjustments use the existing ledger as their immutable operation record. The signed API amount is stored as a positive ledger `amount`; credit/debit direction is encoded by `entry_type`. A canonical globally unique `idempotency_key` identifies the operation, `user_id` is the target user, and safe metadata records the actor, previous/new balances and reason. The transaction also updates `users.balance` and inserts audit/security events while holding the target user row lock.
 
 ---
 
@@ -811,6 +815,7 @@ INDEX(entry_type, created_at)
 ```sql
 UNIQUE(rental_id)
 UNIQUE(idempotency_key)
+CHECK(status IN (1, 2, 3, 4))
 
 INDEX(user_id, status)
 INDEX(status, updated_at)
@@ -826,7 +831,7 @@ INDEX(refund_id)
 
 Хранит refund aggregate для уже обработанных wallet refund requests.
 
-На текущем этапе реализован только full refund для wallet-paid rentals по admin/system flow.
+На текущем этапе реализован только full refund для wallet-paid rentals по admin flow.
 
 ## Columns
 

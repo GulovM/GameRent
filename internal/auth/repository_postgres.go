@@ -23,6 +23,7 @@ type Repository interface {
 
 	CreateRefreshToken(ctx context.Context, token *RefreshToken) error
 	GetRefreshToken(ctx context.Context, tokenHash string) (*RefreshToken, error)
+	GetRefreshTokenForUpdate(ctx context.Context, tokenHash string) (*RefreshToken, error)
 	UpdateRefreshToken(ctx context.Context, token *RefreshToken) error
 	DeleteExpiredRefreshTokens(ctx context.Context) error
 }
@@ -89,8 +90,19 @@ func (r *PostgresRepository) CreateRefreshToken(ctx context.Context, token *Refr
 }
 
 func (r *PostgresRepository) GetRefreshToken(ctx context.Context, tokenHash string) (*RefreshToken, error) {
+	return r.getRefreshToken(ctx, tokenHash, false)
+}
+
+func (r *PostgresRepository) GetRefreshTokenForUpdate(ctx context.Context, tokenHash string) (*RefreshToken, error) {
+	return r.getRefreshToken(ctx, tokenHash, true)
+}
+
+func (r *PostgresRepository) getRefreshToken(ctx context.Context, tokenHash string, forUpdate bool) (*RefreshToken, error) {
 	db := database.GetTxOrPool(ctx, r.pool)
 	query := `SELECT id, user_id, token_hash, expires_at, revoked_at, created_at FROM refresh_tokens WHERE token_hash = $1`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
 	var token RefreshToken
 	err := db.QueryRow(ctx, query, tokenHash).Scan(&token.ID, &token.UserID, &token.TokenHash, &token.ExpiresAt, &token.RevokedAt, &token.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -104,8 +116,11 @@ func (r *PostgresRepository) GetRefreshToken(ctx context.Context, tokenHash stri
 
 func (r *PostgresRepository) UpdateRefreshToken(ctx context.Context, token *RefreshToken) error {
 	db := database.GetTxOrPool(ctx, r.pool)
-	query := `UPDATE refresh_tokens SET revoked_at = $1 WHERE id = $2`
-	_, err := db.Exec(ctx, query, token.RevokedAt, token.ID)
+	query := `UPDATE refresh_tokens SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL`
+	tag, err := db.Exec(ctx, query, token.RevokedAt, token.ID)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrTokenAlreadyRevoked
+	}
 	return err
 }
 

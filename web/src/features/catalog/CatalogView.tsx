@@ -1,4 +1,4 @@
-import { Check, ChevronRight, Clock3, Gamepad2, LibraryBig, Lock, Search, ShieldCheck, SlidersHorizontal, X, Zap } from "lucide-react";
+import { Check, ChevronRight, Clock3, Gamepad2, LibraryBig, Lock, Search, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 import type { Account, Rental } from "../../api";
 import { accountStatusLabels, asList, gameNames } from "../../utils/accounts";
 import { money, remaining } from "../../utils/format";
@@ -10,7 +10,6 @@ type CatalogViewProps = {
   duration: number;
   loading: boolean;
   maxPrice: number;
-  onExtendActive: (rental: Rental) => void;
   onOpenRentals: () => void;
   search: string;
   selectAccount: (account: Account) => void;
@@ -36,7 +35,6 @@ export function CatalogView({
   duration,
   loading,
   maxPrice,
-  onExtendActive,
   onOpenRentals,
   search,
   selectAccount,
@@ -67,7 +65,7 @@ export function CatalogView({
             </button>
           </div>
         </div>
-        <LiveRentalCard rental={activeRental} onExtend={onExtendActive} onOpenRentals={onOpenRentals} />
+        <LiveRentalCard rental={activeRental} onOpenRentals={onOpenRentals} />
       </section>
 
       <section className="catalog-section" id="catalog">
@@ -181,11 +179,9 @@ function DurationPicker({ duration, setDuration }: { duration: number; setDurati
 }
 
 function LiveRentalCard({
-  onExtend,
   onOpenRentals,
   rental
 }: {
-  onExtend: (rental: Rental) => void;
   onOpenRentals: () => void;
   rental?: Rental;
 }) {
@@ -202,10 +198,7 @@ function LiveRentalCard({
       </div>
       <strong className="timer">{rental ? remaining(rental.expires_at) : "00:00:00"}</strong>
       <div className="live-actions">
-        <button className="primary-button" disabled={!rental || rental.status !== 2} onClick={() => rental && onExtend(rental)} type="button">
-          <Zap size={18} />
-          Продлить
-        </button>
+        <span className="muted">Paid extension is not available yet.</span>
         <button className="secondary-button" onClick={onOpenRentals} type="button">
           <ShieldCheck size={18} />
           Детали

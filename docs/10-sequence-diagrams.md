@@ -183,9 +183,9 @@ Response
 ### Flow
 
 1. Клиент отправляет Refresh Token.
-2. Проверяется существование токена.
-3. Проверяется срок действия.
-4. Старый Refresh Token помечается отозванным.
+2. Строка токена блокируется `FOR UPDATE` в PostgreSQL-транзакции.
+3. Проверяются срок действия и статус отзыва.
+4. Старый Refresh Token условно помечается отозванным; конкурентный запрос после ожидания отклоняется.
 5. Генерируется новая пара токенов.
 6. Новый Refresh Token сохраняется.
 7. Клиент получает новую пару токенов.
@@ -443,7 +443,7 @@ Rental Service
 
 1. Пользователь оплачивает аренду.
 2. Платёжная система подтверждает платёж.
-3. `Payment Service` проверяет подпись webhook и запускает PostgreSQL transaction.
+3. `Payment Handler` ограничивает raw body до 16 KiB и проверяет обязательный `X-Payment-Signature = hex(HMAC-SHA256(PAYMENT_WEBHOOK_SECRET, raw_body))` до JSON decoding. Затем `Payment Service` сверяет provider/payment/rental/external transaction/amount/currency с PostgreSQL и запускает transaction.
 4. Статус платежа обновляется `PENDING -> SUCCESS`.
 5. Rental и account активируются в той же transaction: `WAITING_PAYMENT -> ACTIVE`, `RESERVED -> RENTED`.
 6. Повтор webhook с тем же `external_transaction_id` для уже активированного состояния является идемпотентным no-op.
@@ -505,10 +505,10 @@ Client Login
 2. `Payment Handler` перехватывает запрос, валидирует подпись и передаёт управление в `Payment Service`.
 3. `Payment Service` запускает транзакцию PostgreSQL через общий `Transaction Manager`.
 4. Статус записи в таблице `payments` изменяется на `2` (`Success`).
-5. `Payment Service` генерирует внутреннее событие `PaymentSucceeded`.
-6. `Rental Service` перехватывает событие внутри транзакции и обновляет статус аренды в таблице `rentals` на `2` (`Active`).
-7. `Account Service` обновляет состояние арендуемого Steam-аккаунта в таблице `accounts` с `3` (`Reserved`) на `4` (`Rented`).
-8. `Security Service` регистрирует новое событие безопасности (`2` — `Rental Started`) с сохранением `IPAddress` и `User-Agent` клиента.
+5. `Payment Service` напрямую обновляет статус аренды в таблице `rentals` на `2` (`Active`) только для неистёкшего `WAITING_PAYMENT`.
+6. `Payment Service` обновляет состояние арендуемого Steam-аккаунта в таблице `accounts` с `3` (`Reserved`) на `4` (`Rented`).
+7. `Payment Service` записывает immutable provider-payment ledger entry и, при ненулевом депозите, один deposit hold и deposit-held ledger entry.
+8. `Payment Service` напрямую записывает событие безопасности (`2` — `Rental Started`) с безопасными metadata, `IPAddress` и ограниченным `User-Agent`.
 9. `Transaction Manager` фиксирует (commit) транзакцию в PostgreSQL.
 10. Webhook возвращает только статус обработки и не выдаёт `SteamCredentials`.
 11. Клиент отдельно запрашивает `GET /api/v1/me/rentals/{rentalId}/credentials`.
@@ -553,12 +553,15 @@ sequenceDiagram
 6. После `CANCELLED` или `EXPIRED` credentials endpoint больше не возвращает `SteamCredentials`.
 7. `Security Service`/audit фиксирует событие без credentials, токенов и Steam данных.
 8. Повторный cancel/expire является no-op и не создаёт duplicate event.
+9. Active-expire выполняется в явной PostgreSQL transaction: неполное обновление rental/account/audit откатывается.
+
+Paid extension отсутствует: `POST /rentals/{id}/extend` завершается `501 EXTENSION_NOT_SUPPORTED` до чтения или изменения rental. Generic admin account PATCH не участвует в lifecycle и меняет только pricing/deposit.
 
 ---
 
 ### 15. Admin Wallet Refund
 
-**Description** Реализованный admin/system flow полного refund для wallet-paid rental. Refund не меняет `payment.status` и `rental.status`, а кредитует `users.balance` через immutable ledger.
+**Description** Реализованный admin flow полного refund для wallet-paid rental. Refund не меняет `payment.status` и `rental.status`, а кредитует `users.balance` через immutable ledger.
 
 ```mermaid
 sequenceDiagram
@@ -588,7 +591,7 @@ sequenceDiagram
 
 **Current behavior**
 
-1. Flow доступен только `ADMIN` API actor и service-level actor `SYSTEM`.
+1. Flow доступен только текущему `ADMIN`, повторно проверенному в PostgreSQL внутри refund transaction.
 2. Работает только для wallet-paid `SUCCESS` payment.
 3. Rental должен быть в `EXPIRED` или `COMPLETED`.
 4. `reason_code` обязателен и валидируется как короткий код.

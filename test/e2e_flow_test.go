@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,7 +180,7 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 	pool, txManager := setupE2ETestDB(t)
 
 	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
-	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-12345")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-at-least-32-bytes")
 
 	logger, _ := zap.NewDevelopment()
 	defer logger.Sync()
@@ -201,7 +203,7 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
-	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool)...)
 	router.RegisterRoutes(paymentHandler.Routes()...)
 	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
 
@@ -300,18 +302,18 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 
 	hourlyPrice, _ := account.NewMoney(150, "USD")
 	depositAmount, _ := account.NewMoney(500, "USD")
-	accEntity, err := account.NewAccount(creds, hourlyPrice, depositAmount, time.Now())
+	accEntity, err := account.NewAccount(creds, hourlyPrice, depositAmount, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("failed to instantiate account: %v", err)
 	}
 	accEntity.ID = 8881
-	accEntity.MarkSecurityChecked(true, true, time.Now())
+	accEntity.MarkSecurityChecked(true, true, time.Now().UTC())
 	accEntity.SyncLibrary([]account.AccountGame{{
 		Game:            account.Game{ID: gameID, SteamAppID: 1091500, Name: "Cyberpunk 2077"},
 		PlaytimeMinutes: 240,
-	}}, time.Now())
+	}}, time.Now().UTC())
 
-	if err := accEntity.Publish(time.Now()); err != nil {
+	if err := accEntity.Publish(time.Now().UTC()); err != nil {
 		t.Fatalf("failed to publish account: %v", err)
 	}
 
@@ -319,7 +321,7 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 		t.Fatalf("failed to save account to database: %v", err)
 	}
 
-	rent, err := rentalService.RentAccount(ctx, userID, accEntity.ID, 3*time.Hour, time.Now())
+	rent, err := rentalService.RentAccount(ctx, userID, accEntity.ID, 3*time.Hour, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("failed to rent account: %v", err)
 	}
@@ -353,14 +355,72 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 
 	webhookReq := payment.WebhookRequest{
 		PaymentID:             strconv.FormatInt(paymentID, 10),
+		RentalID:              strconv.FormatInt(rentalID, 10),
 		ExternalTransactionID: "ext-tx-e2e-8877",
+		Provider:              "internal",
+		Amount:                950,
+		Currency:              "USD",
 		Status:                "success",
 	}
 	webhookReqBytes, _ := json.Marshal(webhookReq)
 
-	mac := hmac.New(sha256.New, []byte("e2e-test-webhook-secret-12345"))
+	mac := hmac.New(sha256.New, []byte("e2e-test-webhook-secret-at-least-32-bytes"))
 	mac.Write(webhookReqBytes)
 	signature := hex.EncodeToString(mac.Sum(nil))
+	signBody := func(body []byte) string {
+		bodyMAC := hmac.New(sha256.New, []byte("e2e-test-webhook-secret-at-least-32-bytes"))
+		_, _ = bodyMAC.Write(body)
+		return hex.EncodeToString(bodyMAC.Sum(nil))
+	}
+	client := &http.Client{}
+	performRawWebhook := func(body []byte, signatureHeader string) (int, []byte) {
+		t.Helper()
+		request, requestErr := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/payments/webhook", bytes.NewReader(body))
+		if requestErr != nil {
+			t.Fatalf("create raw webhook request: %v", requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if signatureHeader != "" {
+			request.Header.Set("X-Payment-Signature", signatureHeader)
+		}
+		response, requestErr := client.Do(request)
+		if requestErr != nil {
+			t.Fatalf("perform raw webhook request: %v", requestErr)
+		}
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(response.Body)
+		return response.StatusCode, responseBody
+	}
+
+	for name, attempt := range map[string]struct {
+		body      []byte
+		signature string
+		status    int
+	}{
+		"missing signature": {body: webhookReqBytes, status: http.StatusUnauthorized},
+		"wrong signature":   {body: webhookReqBytes, signature: strings.Repeat("0", sha256.Size*2), status: http.StatusUnauthorized},
+		"modified raw body": {body: append([]byte(" "), webhookReqBytes...), signature: signature, status: http.StatusUnauthorized},
+		"malformed signed":  {body: []byte(`{"payment_id":`), signature: signBody([]byte(`{"payment_id":`)), status: http.StatusBadRequest},
+		"oversized":         {body: bytes.Repeat([]byte("x"), (16<<10)+1), signature: strings.Repeat("0", sha256.Size*2), status: http.StatusRequestEntityTooLarge},
+	} {
+		statusCode, responseBody := performRawWebhook(attempt.body, attempt.signature)
+		if statusCode != attempt.status {
+			t.Fatalf("%s webhook status=%d want=%d body=%s", name, statusCode, attempt.status, string(responseBody))
+		}
+	}
+	var rejectedPaymentStatus, rejectedRentalStatus, rejectedAccountStatus int16
+	var rejectedLedgerCount, rejectedHoldCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT p.status, r.status, a.status,
+			(SELECT COUNT(*) FROM financial_ledger_entries WHERE payment_id=p.id),
+			(SELECT COUNT(*) FROM deposit_holds WHERE payment_id=p.id)
+		FROM payments p JOIN rentals r ON r.id=p.rental_id JOIN accounts a ON a.id=r.account_id
+		WHERE p.id=$1`, paymentID).Scan(&rejectedPaymentStatus, &rejectedRentalStatus, &rejectedAccountStatus, &rejectedLedgerCount, &rejectedHoldCount); err != nil {
+		t.Fatalf("inspect state after rejected webhooks: %v", err)
+	}
+	if rejectedPaymentStatus != 1 || rejectedRentalStatus != 1 || rejectedAccountStatus != 3 || rejectedLedgerCount != 0 || rejectedHoldCount != 0 {
+		t.Fatalf("rejected webhook mutated state payment=%d rental=%d account=%d ledger=%d holds=%d", rejectedPaymentStatus, rejectedRentalStatus, rejectedAccountStatus, rejectedLedgerCount, rejectedHoldCount)
+	}
 
 	req, err := http.NewRequest("POST", ts.URL+"/api/v1/payments/webhook", bytes.NewBuffer(webhookReqBytes))
 	if err != nil {
@@ -370,7 +430,6 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 	req.Header.Set("X-Payment-Signature", signature)
 	req.Header.Set("User-Agent", "E2E-Test-Client")
 
-	client := &http.Client{}
 	webhookRes, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("failed to perform webhook request: %v", err)
@@ -476,7 +535,17 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 	defer credsRes.Body.Close()
 
 	if credsRes.StatusCode != http.StatusOK {
-		t.Fatalf("expected credentials status 200 OK, got %d", credsRes.StatusCode)
+		var dbStartAt, dbEndAt time.Time
+		var dbStatus int16
+		_ = pool.QueryRow(ctx, "SELECT start_at, end_at, status FROM rentals WHERE id = $1", rentalID).Scan(&dbStartAt, &dbEndAt, &dbStatus)
+		t.Logf("DEBUG DETAILS: rentalID=%d, rentalStatus=%d, dbStartAt=%s, dbEndAt=%s, timeNowUTC=%s, timeNow=%s",
+			rentalID, dbStatus, dbStartAt.Format(time.RFC3339), dbEndAt.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339), time.Now().Format(time.RFC3339))
+
+		bodyBytes, _ := io.ReadAll(credsRes.Body)
+		t.Fatalf("expected credentials status 200 OK, got %d. Body: %s", credsRes.StatusCode, string(bodyBytes))
+	}
+	if cacheControl := credsRes.Header.Get("Cache-Control"); !strings.Contains(cacheControl, "no-store") {
+		t.Fatalf("credentials response missing no-store cache policy: %q", cacheControl)
 	}
 
 	var credsResp struct {
@@ -670,7 +739,7 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 	pool, txManager := setupE2ETestDB(t)
 
 	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
-	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-12345")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-at-least-32-bytes")
 
 	logger, _ := zap.NewDevelopment()
 	defer logger.Sync()
@@ -693,7 +762,7 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
-	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool)...)
 	router.RegisterRoutes(paymentHandler.Routes()...)
 	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
 
@@ -1144,7 +1213,7 @@ func TestE2E_PayRentalWithBalanceEndpoint(t *testing.T) {
 	pool, txManager := setupE2ETestDB(t)
 
 	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
-	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-12345")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-at-least-32-bytes")
 
 	logger, _ := zap.NewDevelopment()
 	defer logger.Sync()
@@ -1167,7 +1236,7 @@ func TestE2E_PayRentalWithBalanceEndpoint(t *testing.T) {
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
-	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool)...)
 	router.RegisterRoutes(paymentHandler.Routes()...)
 	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
 
@@ -1286,7 +1355,7 @@ func TestE2E_AdminWalletRefundEndpoint(t *testing.T) {
 	pool, txManager := setupE2ETestDB(t)
 
 	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
-	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-12345")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-at-least-32-bytes")
 
 	logger, _ := zap.NewDevelopment()
 	defer logger.Sync()
@@ -1309,7 +1378,7 @@ func TestE2E_AdminWalletRefundEndpoint(t *testing.T) {
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
-	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool)...)
 	router.RegisterRoutes(paymentHandler.Routes()...)
 	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
 
@@ -1519,7 +1588,7 @@ func TestE2E_AdminRentalsFiltersEndpoint(t *testing.T) {
 	pool, txManager := setupE2ETestDB(t)
 
 	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
-	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-12345")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-at-least-32-bytes")
 
 	logger, _ := zap.NewDevelopment()
 	defer logger.Sync()
@@ -1542,7 +1611,7 @@ func TestE2E_AdminRentalsFiltersEndpoint(t *testing.T) {
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
-	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger)...)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool)...)
 	router.RegisterRoutes(paymentHandler.Routes()...)
 	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
 
@@ -1752,5 +1821,589 @@ func TestE2E_AdminRentalsFiltersEndpoint(t *testing.T) {
 	invalidPageStatus, _ := doAdminRentalsRequest(adminToken, "page=0&page_size=101")
 	if invalidPageStatus != http.StatusUnprocessableEntity {
 		t.Fatalf("expected invalid pagination status 422, got %d", invalidPageStatus)
+	}
+}
+
+func TestE2E_AdminRentalDetailEndpoint(t *testing.T) {
+	ctx := context.Background()
+
+	pool, txManager := setupE2ETestDB(t)
+
+	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-at-least-32-bytes")
+
+	logger, _ := zap.NewDevelopment()
+	defer logger.Sync()
+	sLogger := &shared_logger.Logger{Logger: logger}
+
+	jwtSecret := "e2e-jwt-secret-key-1234567890123"
+	authRepo := auth.NewPostgresRepository(pool)
+	authService := auth.NewPostgresService(authRepo, txManager, jwtSecret, time.Hour)
+	authHandler := auth.NewHandler(authService, logger)
+
+	paymentRepo := payment.NewPostgresRepository(pool)
+	paymentService := payment.NewPaymentService(paymentRepo)
+	paymentHandler := payment.NewHandler(paymentService, logger)
+
+	accountRepo := account.NewPostgresRepository(pool, "super-secret-32-byte-key-for-aes")
+	userRepo := user.NewPostgresRepository(pool)
+	rentalRepo := rental.NewPostgresRepository(pool)
+	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
+	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+
+	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
+	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool)...)
+	router.RegisterRoutes(paymentHandler.Routes()...)
+	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", router))
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	renterID, renterToken := registerAndLoginE2EUser(t, ts, "detail-renter@example.com", "super-secure-pass-123", "Detail", "Renter")
+	adminID, _ := registerAndLoginE2EUser(t, ts, "detail-admin@example.com", "super-secure-pass-456", "Detail", "Admin")
+	if _, err := pool.Exec(ctx, `UPDATE users SET role = 'ADMIN' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("failed to grant admin role: %v", err)
+	}
+	adminToken := loginE2EUser(t, ts, "detail-admin@example.com", "super-secure-pass-456")
+
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, query := range []struct {
+		sql  string
+		args []any
+	}{
+		{
+			sql: `INSERT INTO accounts (id, login, encrypted_password, status, steam_guard_enabled, inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at)
+				VALUES (9801, 'detail_login', $1, 2, true, true, 250, 700, '765611980009801', $2, $2)`,
+			args: []any{[]byte("enc-pass"), now},
+		},
+		{
+			sql: `INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at, actual_finished_at)
+				VALUES (9901, $1, 9801, 4, $2, $3, 500, 700, $4, $2, $5, $5)`,
+			args: []any{renterID, now.Add(-4 * time.Hour), now.Add(-2 * time.Hour), now.Add(-3 * time.Hour), now},
+		},
+		{
+			sql: `INSERT INTO payments (id, rental_id, user_id, payment_type, provider, status, amount, currency, external_transaction_id, created_at, processed_at)
+				VALUES (9911, 9901, $1, 1, 'balance', 2, 1200, 'USD', 'safe-admin-detail-check', $2, $2)`,
+			args: []any{renterID, now.Add(-4 * time.Hour)},
+		},
+		{
+			sql: `INSERT INTO deposit_holds (id, rental_id, user_id, payment_id, amount, currency, status, held_at, refunded_at, created_at, updated_at, idempotency_key)
+				VALUES (9921, 9901, $1, 9911, 700, 'USD', 4, $2, $3, $2, $3, 'hold-9901')`,
+			args: []any{renterID, now.Add(-4 * time.Hour), now},
+		},
+		{
+			sql: `INSERT INTO refunds (id, payment_id, rental_id, user_id, account_id, source_type, refund_kind, status, reason_code, requested_by_user_id, requested_by_role, amount_principal, amount_deposit, amount_total, currency, idempotency_key, correlation_id, metadata, processed_at, created_at, updated_at)
+				VALUES (9931, 9911, 9901, $1, 9801, 1, 1, 3, 'ADMIN_CORRECTION', $2, 'ADMIN', 100, 0, 100, 'USD', 'refund-failed-9901', 'corr-failed-9901', '{}'::jsonb, NULL, $3, $3)`,
+			args: []any{renterID, adminID, now.Add(-90 * time.Minute)},
+		},
+		{
+			sql: `INSERT INTO refunds (id, payment_id, rental_id, user_id, account_id, source_type, refund_kind, status, reason_code, requested_by_user_id, requested_by_role, amount_principal, amount_deposit, amount_total, currency, idempotency_key, correlation_id, metadata, processed_at, created_at, updated_at)
+				VALUES (9932, 9911, 9901, $1, 9801, 1, 1, 2, 'SERVICE_UNAVAILABLE', $2, 'ADMIN', 500, 700, 1200, 'USD', 'refund-completed-9901', 'corr-completed-9901', '{}'::jsonb, $4, $3, $4)`,
+			args: []any{renterID, adminID, now.Add(-60 * time.Minute), now.Add(-55 * time.Minute)},
+		},
+	} {
+		if _, err := pool.Exec(ctx, query.sql, query.args...); err != nil {
+			t.Fatalf("failed to seed admin rental detail data: %v", err)
+		}
+	}
+
+	for entryID, entry := range map[int64]struct {
+		entryType int16
+		amount    int64
+	}{
+		9941: {entryType: 5, amount: 1200},
+		9942: {entryType: 6, amount: 500},
+		9943: {entryType: 7, amount: 700},
+		9944: {entryType: 2, amount: 700},
+		9945: {entryType: 3, amount: 700},
+		9946: {entryType: 4, amount: 100},
+	} {
+		if _, err := pool.Exec(ctx, `INSERT INTO financial_ledger_entries (id, entry_type, user_id, rental_id, payment_id, account_id, amount, currency, provider, external_transaction_id, idempotency_key, correlation_id, metadata, created_at)
+			VALUES ($1, $2, $3, 9901, 9911, 9801, $4, 'USD', 'balance', 'ext-9901', $5, $6, '{"debug":"secret"}'::jsonb, $7)`,
+			entryID, entry.entryType, renterID, entry.amount, fmt.Sprintf("ledger-%d", entryID), fmt.Sprintf("corr-%d", entryID), now.Add(time.Duration(entryID-9946)*time.Minute)); err != nil {
+			t.Fatalf("failed to seed ledger entries: %v", err)
+		}
+	}
+
+	doRequest := func(token, path string) (int, []byte) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer res.Body.Close()
+		body, _ := io.ReadAll(res.Body)
+		return res.StatusCode, body
+	}
+
+	if status, _ := doRequest(renterToken, "/api/v1/admin/rentals/9901"); status != http.StatusForbidden {
+		t.Fatalf("expected non-admin detail status 403, got %d", status)
+	}
+	if status, _ := doRequest(adminToken, "/api/v1/admin/rentals/not-a-number"); status != http.StatusUnprocessableEntity {
+		t.Fatalf("expected invalid rentalId status 422, got %d", status)
+	}
+	if status, _ := doRequest(adminToken, "/api/v1/admin/rentals/999999"); status != http.StatusNotFound {
+		t.Fatalf("expected unknown rental status 404, got %d", status)
+	}
+
+	status, body := doRequest(adminToken, "/api/v1/admin/rentals/9901")
+	if status != http.StatusOK {
+		t.Fatalf("expected admin detail status 200, got %d body=%s", status, string(body))
+	}
+	for _, forbidden := range []string{"steam_login", "encrypted_password", "idempotency_key", "metadata", "correlation_id", "token", "provider_payload", "webhook_signature", "password"} {
+		if bytes.Contains(bytes.ToLower(body), bytes.ToLower([]byte(forbidden))) {
+			t.Fatalf("detail response leaked forbidden field %q: %s", forbidden, string(body))
+		}
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Rental struct {
+				ID     float64 `json:"id"`
+				Status float64 `json:"status"`
+			} `json:"rental"`
+			Payment struct {
+				ID       float64 `json:"id"`
+				Status   float64 `json:"status"`
+				Provider string  `json:"provider"`
+				Amount   float64 `json:"amount"`
+				Currency string  `json:"currency"`
+			} `json:"payment"`
+			Deposit struct {
+				Amount   float64 `json:"amount"`
+				Currency string  `json:"currency"`
+				Status   string  `json:"status"`
+			} `json:"deposit"`
+			RefundSummary struct {
+				Count                  float64 `json:"count"`
+				LatestRefundStatus     string  `json:"latest_refund_status"`
+				TotalRefundedPrincipal struct {
+					Amount float64 `json:"amount"`
+				} `json:"total_refunded_principal"`
+				TotalRefundedDeposit struct {
+					Amount float64 `json:"amount"`
+				} `json:"total_refunded_deposit"`
+			} `json:"refund_summary"`
+			LedgerSummary struct {
+				CountsByDisplayType map[string]float64 `json:"counts_by_display_type"`
+				TotalsByDisplayType map[string]struct {
+					Amount float64 `json:"amount"`
+				} `json:"totals_by_display_type"`
+				LatestEntries []map[string]any `json:"latest_entries"`
+			} `json:"ledger_summary"`
+			SupportFlags struct {
+				EligibleWalletRefund   bool   `json:"eligible_wallet_refund"`
+				RefundIneligibleReason string `json:"refund_ineligible_reason"`
+			} `json:"support_flags"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("failed to decode detail response: %v", err)
+	}
+	if !resp.Success || int64(resp.Data.Rental.ID) != 9901 || int64(resp.Data.Payment.ID) != 9911 {
+		t.Fatalf("unexpected detail payload: %s", string(body))
+	}
+	if resp.Data.Payment.Provider != "balance" || resp.Data.Payment.Status != 2 || resp.Data.Payment.Amount != 1200 || resp.Data.Payment.Currency != "USD" {
+		t.Fatalf("unexpected payment detail: %s", string(body))
+	}
+	if resp.Data.Deposit.Amount != 700 || resp.Data.Deposit.Currency != "USD" || resp.Data.Deposit.Status != "REFUNDED" {
+		t.Fatalf("unexpected deposit detail: %s", string(body))
+	}
+	if resp.Data.RefundSummary.Count != 2 || resp.Data.RefundSummary.LatestRefundStatus != "COMPLETED" || resp.Data.RefundSummary.TotalRefundedPrincipal.Amount != 500 || resp.Data.RefundSummary.TotalRefundedDeposit.Amount != 700 {
+		t.Fatalf("unexpected refund summary: %s", string(body))
+	}
+	if len(resp.Data.LedgerSummary.LatestEntries) != 5 {
+		t.Fatalf("expected 5 latest ledger entries, got %d: %s", len(resp.Data.LedgerSummary.LatestEntries), string(body))
+	}
+	for _, field := range []string{"id", "display_type", "amount", "currency", "created_at"} {
+		if _, ok := resp.Data.LedgerSummary.LatestEntries[0][field]; !ok {
+			t.Fatalf("ledger entry missing safe field %q: %s", field, string(body))
+		}
+	}
+	for _, forbidden := range []string{"metadata", "idempotency_key", "correlation_id", "provider", "external_transaction_id"} {
+		if _, ok := resp.Data.LedgerSummary.LatestEntries[0][forbidden]; ok {
+			t.Fatalf("ledger entry leaked field %q: %s", forbidden, string(body))
+		}
+	}
+	if resp.Data.LedgerSummary.CountsByDisplayType["BALANCE_REFUND_CREDIT"] != 1 || resp.Data.LedgerSummary.TotalsByDisplayType["BALANCE_REFUND_CREDIT"].Amount != 500 {
+		t.Fatalf("unexpected ledger aggregates: %s", string(body))
+	}
+
+	listStatus, listBody := doRequest(adminToken, "/api/v1/admin/rentals?page=1&page_size=10&rental_id=9901")
+	if listStatus != http.StatusOK {
+		t.Fatalf("expected filtered list status 200, got %d body=%s", listStatus, string(listBody))
+	}
+	var listResp struct {
+		Data struct {
+			Summary struct {
+				EligibleWalletRefundCount float64 `json:"eligible_wallet_refund_count"`
+			} `json:"summary"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listBody, &listResp); err != nil {
+		t.Fatalf("failed to decode filtered list response: %v", err)
+	}
+	if resp.Data.SupportFlags.EligibleWalletRefund != (listResp.Data.Summary.EligibleWalletRefundCount > 0) {
+		t.Fatalf("detail eligibility does not match list logic detail=%v list=%v", resp.Data.SupportFlags.EligibleWalletRefund, listResp.Data.Summary.EligibleWalletRefundCount)
+	}
+	if resp.Data.SupportFlags.RefundIneligibleReason != "REFUND_ALREADY_COMPLETED" {
+		t.Fatalf("unexpected refund ineligible reason: %s", string(body))
+	}
+}
+
+func TestE2E_AdminBalanceAdjustmentEndpoint(t *testing.T) {
+	ctx := context.Background()
+	pool, txManager := setupE2ETestDB(t)
+
+	t.Setenv("ENCRYPTION_KEY", "super-secret-32-byte-key-for-aes")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "e2e-test-webhook-secret-at-least-32-bytes")
+	logger, _ := zap.NewDevelopment()
+	defer logger.Sync()
+	sLogger := &shared_logger.Logger{Logger: logger}
+
+	jwtSecret := "e2e-jwt-secret-key-1234567890123"
+	authRepo := auth.NewPostgresRepository(pool)
+	authService := auth.NewPostgresService(authRepo, txManager, jwtSecret, time.Hour)
+	authHandler := auth.NewHandler(authService, logger)
+	userRepo := user.NewPostgresRepository(pool)
+	userService := user.NewPostgresService(userRepo)
+	userHandler := user.NewHandler(userService, logger)
+	paymentRepo := payment.NewPostgresRepository(pool)
+	paymentService := payment.NewPaymentService(paymentRepo)
+	paymentHandler := payment.NewHandler(paymentService, logger)
+	accountRepo := account.NewPostgresRepository(pool, "super-secret-32-byte-key-for-aes")
+	rentalService := rental.NewService(rental.NewPostgresRepository(pool), accountRepo, userRepo, paymentRepo, txManager)
+	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+
+	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
+	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
+	router.RegisterRoutes(authHandler.Routes(jwtSecret, rateLimiter, sLogger, pool)...)
+	router.RegisterRoutes(userHandler.Routes(jwtSecret, sLogger, pool)...)
+	router.RegisterRoutes(paymentHandler.Routes()...)
+	router.RegisterRoutes(apiHandler.Routes(jwtSecret, sLogger)...)
+	mux := http.NewServeMux()
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", router))
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	targetID, targetToken := registerAndLoginE2EUser(t, ts, "adjust-target@example.com", "super-secure-pass-123", "Target", "User")
+	adminID, _ := registerAndLoginE2EUser(t, ts, "adjust-admin@example.com", "super-secure-pass-456", "Admin", "User")
+	if _, err := pool.Exec(ctx, `UPDATE users SET role='ADMIN' WHERE id=$1`, adminID); err != nil {
+		t.Fatalf("grant admin role: %v", err)
+	}
+	adminToken := loginE2EUser(t, ts, "adjust-admin@example.com", "super-secure-pass-456")
+	if _, err := pool.Exec(ctx, `UPDATE users SET balance=1000 WHERE id=$1`, targetID); err != nil {
+		t.Fatalf("seed target balance: %v", err)
+	}
+
+	doJSON := func(method, path, token string, payload any) (int, []byte) {
+		t.Helper()
+		body, _ := json.Marshal(payload)
+		req, err := http.NewRequest(method, ts.URL+path, bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("create request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("perform request: %v", err)
+		}
+		defer res.Body.Close()
+		responseBody, _ := io.ReadAll(res.Body)
+		return res.StatusCode, responseBody
+	}
+
+	payload := map[string]any{
+		"amount":          500,
+		"currency":        "USD",
+		"reason_code":     "MANUAL_COMPENSATION",
+		"comment":         "Support-approved correction",
+		"idempotency_key": "e2e-adjustment-001",
+	}
+	status, body := doJSON(http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/balance-adjustments", targetID), targetToken, payload)
+	if status != http.StatusForbidden {
+		t.Fatalf("expected RENT adjustment rejection, got %d body=%s", status, string(body))
+	}
+
+	status, body = doJSON(http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/balance-adjustments", targetID), adminToken, payload)
+	if status != http.StatusCreated {
+		t.Fatalf("expected adjustment creation, got %d body=%s", status, string(body))
+	}
+	var created struct {
+		Data payment.AdminBalanceAdjustmentResult `json:"data"`
+	}
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatalf("decode adjustment response: %v", err)
+	}
+	if created.Data.NewBalance != 1500 || created.Data.Amount != 500 || created.Data.LedgerEntryID == 0 || created.Data.IdempotentReplay {
+		t.Fatalf("unexpected adjustment response: %s", string(body))
+	}
+
+	status, replayBody := doJSON(http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/balance-adjustments", targetID), adminToken, payload)
+	if status != http.StatusOK {
+		t.Fatalf("expected replay success, got %d body=%s", status, string(replayBody))
+	}
+	var replay struct {
+		Data payment.AdminBalanceAdjustmentResult `json:"data"`
+	}
+	if err := json.Unmarshal(replayBody, &replay); err != nil {
+		t.Fatalf("decode replay response: %v", err)
+	}
+	if !replay.Data.IdempotentReplay || replay.Data.LedgerEntryID != created.Data.LedgerEntryID || replay.Data.NewBalance != 1500 {
+		t.Fatalf("unexpected replay response: %s", string(replayBody))
+	}
+
+	const pricingAccountID int64 = 99001
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id, login, encrypted_password, status, steam_guard_enabled, inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at)
+		VALUES ($1, 'pricing_guard', $2, 2, true, true, 100, 50, '765611980099001', NOW(), NOW())`, pricingAccountID, []byte("enc-pass")); err != nil {
+		t.Fatalf("seed account pricing fixture: %v", err)
+	}
+	const lifecycleRentalID int64 = 99002
+	lifecycleStart := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	lifecycleEnd := lifecycleStart.Add(2 * time.Hour)
+	if _, err := pool.Exec(ctx, `UPDATE accounts SET status=4 WHERE id=$1`, pricingAccountID); err != nil {
+		t.Fatalf("mark lifecycle fixture rented: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at)
+		VALUES ($1, $2, $3, 2, $4, $5, 100, 50, $6, $4, $4)`, lifecycleRentalID, targetID, pricingAccountID, lifecycleStart, lifecycleEnd, lifecycleStart.Add(15*time.Minute)); err != nil {
+		t.Fatalf("seed active lifecycle fixture: %v", err)
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/accounts/%d", pricingAccountID), adminToken, map[string]any{"price_per_hour": 200, "security_deposit": 75})
+	if status != http.StatusOK {
+		t.Fatalf("valid current admin account update failed, status=%d body=%s", status, string(body))
+	}
+	invalidAccountPatches := []map[string]any{
+		{"price_per_hour": 0},
+		{"price_per_hour": -1},
+		{"security_deposit": -1},
+		{"price_per_hour": int64(math.MaxInt64)},
+		{"security_deposit": int64(math.MaxInt64)},
+		{"status": 2},
+		{"status": 99},
+		{"balance": 1},
+	}
+	for _, invalidPayload := range invalidAccountPatches {
+		status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/accounts/%d", pricingAccountID), adminToken, invalidPayload)
+		if status != http.StatusUnprocessableEntity {
+			t.Fatalf("invalid account patch accepted payload=%v status=%d body=%s", invalidPayload, status, string(body))
+		}
+	}
+	status, body = doJSON(http.MethodPost, fmt.Sprintf("/api/v1/rentals/%d/extend", lifecycleRentalID), targetToken, map[string]any{"duration_hours": 1})
+	if status != http.StatusNotImplemented {
+		t.Fatalf("unsafe extension was not disabled, status=%d body=%s", status, string(body))
+	}
+	var unchangedEnd time.Time
+	if err := pool.QueryRow(ctx, `SELECT end_at FROM rentals WHERE id=$1`, lifecycleRentalID).Scan(&unchangedEnd); err != nil {
+		t.Fatalf("load lifecycle end_at: %v", err)
+	}
+	if !unchangedEnd.Equal(lifecycleEnd) {
+		t.Fatalf("disabled extension mutated end_at: got=%s want=%s", unchangedEnd, lifecycleEnd)
+	}
+	var unchangedAccountStatus int16
+	if err := pool.QueryRow(ctx, `SELECT status FROM accounts WHERE id=$1`, pricingAccountID).Scan(&unchangedAccountStatus); err != nil {
+		t.Fatalf("load lifecycle account status: %v", err)
+	}
+	if unchangedAccountStatus != 4 {
+		t.Fatalf("generic account patch changed rented account status: got=%d want=4", unchangedAccountStatus)
+	}
+	invalidAccountCreates := []map[string]any{
+		{"steam_id64": "765611980099002", "steam_login": "bad-deposit", "steam_password": "secret", "price_per_hour": 100, "security_deposit": -1},
+		{"steam_id64": "765611980099003", "steam_login": "overflow", "steam_password": "secret", "price_per_hour": int64(math.MaxInt64), "security_deposit": 0},
+		{"steam_id64": "765611980099004", "steam_login": "unknown", "steam_password": "secret", "price_per_hour": 100, "security_deposit": 0, "balance": 1},
+	}
+	for _, invalidPayload := range invalidAccountCreates {
+		status, body = doJSON(http.MethodPost, "/api/v1/admin/accounts", adminToken, invalidPayload)
+		if status != http.StatusUnprocessableEntity {
+			t.Fatalf("invalid account create accepted payload=%v status=%d body=%s", invalidPayload, status, string(body))
+		}
+	}
+	doRawJSON := func(method, path, payload string) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, ts.URL+path, strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("create raw request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("perform raw request: %v", err)
+		}
+		defer res.Body.Close()
+		responseBody, _ := io.ReadAll(res.Body)
+		return res.StatusCode, responseBody
+	}
+	for _, rawPayload := range []string{`{"price_per_hour":`, `{"price_per_hour":200}{"security_deposit":75}`} {
+		status, body = doRawJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/accounts/%d", pricingAccountID), rawPayload)
+		if status != http.StatusUnprocessableEntity {
+			t.Fatalf("malformed or trailing account patch accepted payload=%q status=%d body=%s", rawPayload, status, string(body))
+		}
+	}
+	var configuredPrice, configuredDeposit int64
+	if err := pool.QueryRow(ctx, `SELECT hourly_price, deposit_amount FROM accounts WHERE id=$1`, pricingAccountID).Scan(&configuredPrice, &configuredDeposit); err != nil {
+		t.Fatalf("read guarded account pricing: %v", err)
+	}
+	if configuredPrice != 200 || configuredDeposit != 75 {
+		t.Fatalf("invalid pricing payload mutated account: price=%d deposit=%d", configuredPrice, configuredDeposit)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE accounts SET hourly_price=$1, deposit_amount=0 WHERE id=$2`, int64(math.MaxInt64/2+1), pricingAccountID); err != nil {
+		t.Fatalf("seed legacy overflow pricing: %v", err)
+	}
+	status, body = doJSON(http.MethodPost, "/api/v1/rentals/calculate", targetToken, map[string]any{"account_id": pricingAccountID, "duration_hours": 2})
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("overflowing rental quote was accepted, status=%d body=%s", status, string(body))
+	}
+
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"balance": 999999})
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("generic admin patch accepted balance, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"deleted_at": nil})
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("generic admin patch accepted deleted_at, status=%d body=%s", status, string(body))
+	}
+	for name, selfPayload := range map[string]map[string]any{
+		"self promotion":  {"role": "ADMIN"},
+		"self unblocking": {"is_blocked": false},
+		"self demotion":   {"role": "RENT"},
+		"self blocking":   {"is_blocked": true},
+		"self trust edit": {"trust_score": 999},
+	} {
+		status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", adminID), adminToken, selfPayload)
+		if status != http.StatusConflict {
+			t.Fatalf("expected %s rejection, status=%d body=%s", name, status, string(body))
+		}
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"role": "ADMIN", "is_blocked": true, "trust_score": 450})
+	if status != http.StatusOK {
+		t.Fatalf("valid current admin could not update another user, status=%d body=%s", status, string(body))
+	}
+	var activeTargetRefreshTokens int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM refresh_tokens WHERE user_id=$1 AND revoked_at IS NULL`, targetID).Scan(&activeTargetRefreshTokens); err != nil {
+		t.Fatalf("count target refresh tokens after privilege update: %v", err)
+	}
+	if activeTargetRefreshTokens != 0 {
+		t.Fatalf("privilege update left %d active target refresh tokens", activeTargetRefreshTokens)
+	}
+	var securityAuditCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM audit_logs WHERE actor_user_id=$1 AND entity_type='USER' AND entity_id=$2 AND action='USER_SECURITY_STATE_UPDATED'`, adminID, targetID).Scan(&securityAuditCount); err != nil {
+		t.Fatalf("count privilege audit events: %v", err)
+	}
+	if securityAuditCount != 1 {
+		t.Fatalf("privilege update audit count=%d, want 1", securityAuditCount)
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"role": "RENT", "is_blocked": false})
+	if status != http.StatusOK {
+		t.Fatalf("valid current admin could not restore target role, status=%d body=%s", status, string(body))
+	}
+
+	secondPayload := map[string]any{
+		"amount":          200,
+		"currency":        "USD",
+		"reason_code":     "MANUAL_COMPENSATION",
+		"idempotency_key": "e2e-adjustment-002",
+	}
+	status, body = doJSON(http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/balance-adjustments", targetID), adminToken, secondPayload)
+	if status != http.StatusCreated {
+		t.Fatalf("second adjustment failed, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/users/%d", targetID), targetToken, map[string]any{"first_name": "Updated", "last_name": "Profile"})
+	if status != http.StatusOK {
+		t.Fatalf("profile update failed, status=%d body=%s", status, string(body))
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE users SET role='RENT' WHERE id=$1`, adminID); err != nil {
+		t.Fatalf("demote admin after token issuance: %v", err)
+	}
+	status, body = doJSON(http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/balance-adjustments", targetID), adminToken, payload)
+	if status != http.StatusForbidden {
+		t.Fatalf("stale ADMIN token replay was accepted after demotion, status=%d body=%s", status, string(body))
+	}
+	staleAdminPayload := map[string]any{
+		"amount":          100,
+		"currency":        "USD",
+		"reason_code":     "MANUAL_COMPENSATION",
+		"idempotency_key": "e2e-adjustment-stale-admin-001",
+	}
+	status, body = doJSON(http.MethodPost, fmt.Sprintf("/api/v1/admin/users/%d/balance-adjustments", targetID), adminToken, staleAdminPayload)
+	if status != http.StatusForbidden {
+		t.Fatalf("stale ADMIN token was accepted after demotion, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", adminID), adminToken, map[string]any{"role": "ADMIN"})
+	if status != http.StatusForbidden {
+		t.Fatalf("demoted admin restored own role, status=%d body=%s", status, string(body))
+	}
+	for _, stalePayload := range []map[string]any{{"role": "ADMIN"}, {"is_blocked": true}, {"is_blocked": false}, {"deleted_at": nil}} {
+		status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, stalePayload)
+		if status != http.StatusForbidden {
+			t.Fatalf("demoted admin changed another user, status=%d body=%s", status, string(body))
+		}
+	}
+	status, body = doJSON(http.MethodPatch, "/api/v1/admin/accounts/999999", adminToken, map[string]any{"price_per_hour": 1})
+	if status != http.StatusForbidden {
+		t.Fatalf("demoted admin reached account financial configuration, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPost, "/api/v1/admin/accounts", adminToken, map[string]any{"steam_id64": "76561198000000000", "steam_login": "stale", "steam_password": "stale", "price_per_hour": 1, "security_deposit": 1})
+	if status != http.StatusForbidden {
+		t.Fatalf("demoted admin reached account creation, status=%d body=%s", status, string(body))
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE users SET role='ADMIN', is_blocked=true WHERE id=$1`, adminID); err != nil {
+		t.Fatalf("block admin after token issuance: %v", err)
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", adminID), adminToken, map[string]any{"is_blocked": false})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("blocked admin unblocked themselves, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"role": "ADMIN"})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("blocked admin changed another user, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"deleted_at": nil})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("blocked admin reached another user delete payload, status=%d body=%s", status, string(body))
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE users SET is_blocked=false, deleted_at=NOW() WHERE id=$1`, adminID); err != nil {
+		t.Fatalf("delete admin after token issuance: %v", err)
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", adminID), adminToken, map[string]any{"deleted_at": nil})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("deleted admin reached undelete payload handling, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"is_blocked": true})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("deleted admin changed another user, status=%d body=%s", status, string(body))
+	}
+	status, body = doJSON(http.MethodPatch, fmt.Sprintf("/api/v1/admin/users/%d", targetID), adminToken, map[string]any{"deleted_at": nil})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("deleted admin reached another user delete payload, status=%d body=%s", status, string(body))
+	}
+
+	var balance, ledgerCount, auditCount, securityCount int64
+	if err := pool.QueryRow(ctx, `SELECT balance FROM users WHERE id=$1`, targetID).Scan(&balance); err != nil {
+		t.Fatalf("read final target balance: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM financial_ledger_entries WHERE user_id=$1 AND entry_type IN (8,9)`, targetID).Scan(&ledgerCount); err != nil {
+		t.Fatalf("count adjustment ledger: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM audit_logs WHERE entity_type='user_balance' AND entity_id=$1 AND action='admin_balance_adjustment'`, targetID).Scan(&auditCount); err != nil {
+		t.Fatalf("count adjustment audits: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM security_events WHERE user_id=$1 AND event_type=15`, targetID).Scan(&securityCount); err != nil {
+		t.Fatalf("count adjustment security events: %v", err)
+	}
+	if balance != 1700 || ledgerCount != 2 || auditCount != 2 || securityCount != 2 {
+		t.Fatalf("unexpected final state balance=%d ledger=%d audit=%d security=%d", balance, ledgerCount, auditCount, securityCount)
 	}
 }

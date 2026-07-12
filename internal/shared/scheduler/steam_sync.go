@@ -14,7 +14,7 @@ type SteamSyncRepository interface {
 	GetAccountsForSync(ctx context.Context) ([]int64, error)
 	GetAccountSyncDetails(ctx context.Context, accountID int64) (string, string, error)
 	SyncAccountGames(ctx context.Context, accountID int64, games []repo.AccountGameSyncInfo) error
-	BanAccount(ctx context.Context, accountID int64) error
+	DisableAccountIfIdle(ctx context.Context, accountID int64) error
 }
 
 type FakeSteamClient struct {
@@ -142,7 +142,7 @@ func NewSteamSyncWorker(
 					zap.String("login", login),
 					zap.String("steam_id64", steamID64),
 				)
-				err = r.BanAccount(ctx, accountID)
+				err = r.DisableAccountIfIdle(ctx, accountID)
 				if err != nil {
 					log.Error("failed to ban account in database",
 						zap.Int64("account_id", accountID),

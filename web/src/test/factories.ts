@@ -1,5 +1,6 @@
 import type {
   Account,
+  AdminRentalDetail,
   AdminRentalRefundSummary,
   AdminRentalSummary,
   FinancialBalance,
@@ -104,6 +105,69 @@ export function makeAdminSummary(overrides: Partial<AdminRentalSummary> = {}): A
       REQUESTED: 0,
       COMPLETED: 2,
       FAILED: 0
+    },
+    ...overrides
+  };
+}
+
+export function makeAdminRentalDetail(overrides: Partial<AdminRentalDetail> = {}): AdminRentalDetail {
+  return {
+    rental: {
+      id: 1,
+      user_id: 101,
+      account_id: 1,
+      status: 3,
+      start_at: "2026-07-10T10:00:00Z",
+      end_at: "2026-07-10T12:00:00Z",
+      rental_price: { amount: 500, currency: "USD" },
+      deposit_amount: { amount: 700, currency: "USD" },
+      payment_expires_at: "2026-07-10T10:15:00Z",
+      created_at: "2026-07-10T09:59:00Z",
+      updated_at: "2026-07-10T12:00:00Z"
+    },
+    payment: {
+      id: 11,
+      status: 2,
+      provider: "balance",
+      amount: 1200,
+      currency: "USD",
+      created_at: "2026-07-10T10:00:00Z"
+    },
+    deposit: {
+      amount: 700,
+      currency: "USD",
+      status: "HELD",
+      held_at: "2026-07-10T10:00:00Z"
+    },
+    refund_summary: {
+      count: 1,
+      latest_refund_status: "COMPLETED",
+      total_refunded_principal: { amount: 500, currency: "USD" },
+      total_refunded_deposit: { amount: 700, currency: "USD" },
+      latest_processed_at: "2026-07-10T13:00:00Z"
+    },
+    ledger_summary: {
+      counts_by_display_type: {
+        BALANCE_REFUND_CREDIT: 1
+      },
+      totals_by_display_type: {
+        BALANCE_REFUND_CREDIT: { amount: 1200, currency: "USD" }
+      },
+      latest_entries: [
+        {
+          id: 1001,
+          display_type: "BALANCE_REFUND_CREDIT",
+          amount: 1200,
+          currency: "USD",
+          created_at: "2026-07-10T13:00:00Z"
+        }
+      ]
+    },
+    support_flags: {
+      eligible_wallet_refund: false,
+      refund_ineligible_reason: "REFUND_ALREADY_COMPLETED",
+      has_active_credentials_access: false,
+      payment_window_expired: true
     },
     ...overrides
   };

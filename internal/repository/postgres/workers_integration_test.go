@@ -278,7 +278,11 @@ func TestCleanupAndWebhookRaceStayConsistent(t *testing.T) {
 		<-start
 		_, webhookErr = service.ProcessWebhook(context.Background(), payment.WebhookRequest{
 			PaymentID:             strconv.FormatInt(paymentID, 10),
+			RentalID:              strconv.FormatInt(rentalID, 10),
 			ExternalTransactionID: "cleanup-race-ext",
+			Provider:              "internal",
+			Amount:                1000,
+			Currency:              "USD",
 			Status:                "success",
 		}, "127.0.0.1", "test")
 	}()
@@ -361,7 +365,7 @@ func seedActiveRental(t *testing.T, pool *pkg_postgres_pool.ConnectionPool, endA
 }
 
 func TestExpireRental_ActiveRentalLifecycle(t *testing.T) {
-	pool, _ := setupWorkersTestDB(t)
+	pool, txManager := setupWorkersTestDB(t)
 	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
 	userID, accountID, rentalID, paymentID := seedActiveRental(t, pool, now.Add(-time.Minute))
 	repo := NewRepository(pool)
@@ -396,8 +400,8 @@ func TestExpireRental_ActiveRentalLifecycle(t *testing.T) {
 
 	credentialsRepo := rental.NewPostgresRepository(pool.Pool)
 	accountRepo := account.NewPostgresRepository(pool.Pool, "super-secret-32-byte-key-for-aes")
-	service := rental.NewService(credentialsRepo, accountRepo, nil, nil, nil)
-	creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, now)
+	service := rental.NewService(credentialsRepo, accountRepo, nil, nil, txManager)
+	creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, rental.CredentialRequestContext{}, now)
 	if !errors.Is(err, rental.ErrCredentialsNotAvailable) {
 		t.Fatalf("expected credentials denial after expire, got creds=%+v err=%v", creds, err)
 	}
@@ -438,8 +442,58 @@ func TestExpireRental_IdempotentOnReplay(t *testing.T) {
 	}
 }
 
-func TestExpireVsCredentialsRequest_DeniesAfterExpiration(t *testing.T) {
+func TestDisableAccountIfIdle_PreservesExclusiveRentalConsistency(t *testing.T) {
 	pool, _ := setupWorkersTestDB(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	repo := NewRepository(pool)
+
+	_, reservedAccountID, waitingRentalID, _ := seedWaitingPaymentReservation(t, pool, now.Add(time.Hour))
+	if err := repo.DisableAccountIfIdle(context.Background(), reservedAccountID); !errors.Is(err, ErrAccountLifecycleConflict) {
+		t.Fatalf("reserved account disable err=%v want=%v", err, ErrAccountLifecycleConflict)
+	}
+	assertRentalAccountStatuses(t, pool, waitingRentalID, reservedAccountID, int16(rental.StatusWaitingPayment), int16(account.StatusReserved))
+
+	_, rentedAccountID, activeRentalID, _ := seedActiveRental(t, pool, now.Add(time.Hour))
+	if err := repo.DisableAccountIfIdle(context.Background(), rentedAccountID); !errors.Is(err, ErrAccountLifecycleConflict) {
+		t.Fatalf("rented account disable err=%v want=%v", err, ErrAccountLifecycleConflict)
+	}
+	assertRentalAccountStatuses(t, pool, activeRentalID, rentedAccountID, int16(rental.StatusActive), int16(account.StatusRented))
+
+	idleAccountID := atomic.AddInt64(&workersTestCounter, 10)
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO accounts (id, login, encrypted_password, status, steam_guard_enabled, inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at)
+		VALUES ($1, 'idle-disable', $2, 2, true, true, 100, 0, $3, $4, $4)`, idleAccountID, []byte("enc-pass"), strconv.FormatInt(76561198000000000+idleAccountID, 10), now); err != nil {
+		t.Fatalf("seed idle account: %v", err)
+	}
+	if err := repo.DisableAccountIfIdle(context.Background(), idleAccountID); err != nil {
+		t.Fatalf("disable idle account: %v", err)
+	}
+	var disabledStatus int16
+	var deletedAt *time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT status, deleted_at FROM accounts WHERE id=$1`, idleAccountID).Scan(&disabledStatus, &deletedAt); err != nil {
+		t.Fatalf("load disabled idle account: %v", err)
+	}
+	if disabledStatus != int16(account.StatusDisabled) || deletedAt == nil {
+		t.Fatalf("idle account not disabled: status=%d deleted_at=%v", disabledStatus, deletedAt)
+	}
+}
+
+func assertRentalAccountStatuses(t *testing.T, pool *pkg_postgres_pool.ConnectionPool, rentalID, accountID int64, wantRental, wantAccount int16) {
+	t.Helper()
+	var rentalStatus, accountStatus int16
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM rentals WHERE id=$1`, rentalID).Scan(&rentalStatus); err != nil {
+		t.Fatalf("load rental status: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM accounts WHERE id=$1`, accountID).Scan(&accountStatus); err != nil {
+		t.Fatalf("load account status: %v", err)
+	}
+	if rentalStatus != wantRental || accountStatus != wantAccount {
+		t.Fatalf("inconsistent lifecycle tuple: rental=%d want=%d account=%d want=%d", rentalStatus, wantRental, accountStatus, wantAccount)
+	}
+}
+
+func TestExpireVsCredentialsRequest_DeniesAfterExpiration(t *testing.T) {
+	pool, txManager := setupWorkersTestDB(t)
 	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
 	userID, accountID, rentalID, _ := seedActiveRental(t, pool, now.Add(-time.Minute))
 	repo := NewRepository(pool)
@@ -451,10 +505,232 @@ func TestExpireVsCredentialsRequest_DeniesAfterExpiration(t *testing.T) {
 
 	credentialsRepo := rental.NewPostgresRepository(pool.Pool)
 	accountRepo := account.NewPostgresRepository(pool.Pool, "super-secret-32-byte-key-for-aes")
-	service := rental.NewService(credentialsRepo, accountRepo, nil, nil, nil)
-	creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, now.Add(time.Second))
+	service := rental.NewService(credentialsRepo, accountRepo, nil, nil, txManager)
+	creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, rental.CredentialRequestContext{}, now.Add(time.Second))
 	if !errors.Is(err, rental.ErrCredentialsNotAvailable) {
 		t.Fatalf("expected credentials denial after committed expiration, got creds=%+v err=%v", creds, err)
+	}
+}
+
+type blockingCredentialRepository struct {
+	inner         rental.Repository
+	eventInserted chan struct{}
+	release       chan struct{}
+	once          sync.Once
+}
+
+func (r *blockingCredentialRepository) CreateRental(ctx context.Context, value *rental.Rental) error {
+	return r.inner.CreateRental(ctx, value)
+}
+
+func (r *blockingCredentialRepository) GetRental(ctx context.Context, id int64) (*rental.Rental, error) {
+	return r.inner.GetRental(ctx, id)
+}
+
+func (r *blockingCredentialRepository) GetRentalCredentials(ctx context.Context, rentalID, userID int64, now time.Time) (*rental.RentalCredentialsRecord, error) {
+	return r.inner.GetRentalCredentials(ctx, rentalID, userID, now)
+}
+
+func (r *blockingCredentialRepository) RecordCredentialIssued(ctx context.Context, event rental.CredentialIssueEvent) error {
+	if err := r.inner.RecordCredentialIssued(ctx, event); err != nil {
+		return err
+	}
+	r.once.Do(func() { close(r.eventInserted) })
+	select {
+	case <-r.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *blockingCredentialRepository) CancelWaitingPaymentRental(ctx context.Context, rentalID, userID int64, reason string, now time.Time) (bool, error) {
+	return r.inner.CancelWaitingPaymentRental(ctx, rentalID, userID, reason, now)
+}
+
+func prepareEncryptedCredentials(t *testing.T, pool *pkg_postgres_pool.ConnectionPool, accountID int64) *account.PostgresRepository {
+	t.Helper()
+	repo := account.NewPostgresRepository(pool.Pool, "super-secret-32-byte-key-for-aes")
+	encrypted, err := repo.Encrypt("credential-race-password")
+	if err != nil {
+		t.Fatalf("encrypt race credential: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), "UPDATE accounts SET encrypted_password = $1 WHERE id = $2", encrypted, accountID); err != nil {
+		t.Fatalf("store encrypted race credential: %v", err)
+	}
+	return repo
+}
+
+func TestCredentialIssuanceBeforeCleanupIsSerialized(t *testing.T) {
+	pool, txManager := setupWorkersTestDB(t)
+	boundary := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	userID, accountID, rentalID, _ := seedActiveRental(t, pool, boundary)
+	accountRepo := prepareEncryptedCredentials(t, pool, accountID)
+	inner := rental.NewPostgresRepository(pool.Pool)
+	blockingRepo := &blockingCredentialRepository{
+		inner:         inner,
+		eventInserted: make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	service := rental.NewService(blockingRepo, accountRepo, nil, nil, txManager)
+	cleanupRepo := NewRepository(pool)
+
+	credentialResult := make(chan *rental.RentalCredentials, 1)
+	credentialErr := make(chan error, 1)
+	go func() {
+		creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, rental.CredentialRequestContext{}, boundary.Add(-time.Second))
+		credentialResult <- creds
+		credentialErr <- err
+	}()
+
+	select {
+	case <-blockingRepo.eventInserted:
+	case err := <-credentialErr:
+		t.Fatalf("credential issuance failed before transactional audit insert: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("credential issuance did not reach transactional audit insert")
+	}
+
+	changed, err := cleanupRepo.ExpireRental(context.Background(), rentalID, accountID, boundary.Add(time.Second))
+	if err != nil {
+		t.Fatalf("cleanup while credential transaction holds locks failed: %v", err)
+	}
+	if changed {
+		t.Fatal("cleanup bypassed credential transaction row locks")
+	}
+
+	close(blockingRepo.release)
+	if err := <-credentialErr; err != nil {
+		t.Fatalf("credential issuance failed: %v", err)
+	}
+	if creds := <-credentialResult; creds == nil || creds.Password != "credential-race-password" {
+		t.Fatalf("unexpected credential result: %+v", creds)
+	}
+
+	changed, err = cleanupRepo.ExpireRental(context.Background(), rentalID, accountID, boundary.Add(time.Second))
+	if err != nil || !changed {
+		t.Fatalf("cleanup did not expire rental after credential commit: changed=%v err=%v", changed, err)
+	}
+
+	var issuedEvents, expiredEvents int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FILTER (WHERE event_type = 7), COUNT(*) FILTER (WHERE event_type = 10) FROM security_events WHERE rental_id = $1`, rentalID).Scan(&issuedEvents, &expiredEvents); err != nil {
+		t.Fatalf("load serialized security events: %v", err)
+	}
+	if issuedEvents != 1 || expiredEvents != 1 {
+		t.Fatalf("unexpected serialized security events: issued=%d expired=%d", issuedEvents, expiredEvents)
+	}
+}
+
+func TestConcurrentCleanupVersusCredentialIssuanceHasNoStaleDisclosure(t *testing.T) {
+	pool, txManager := setupWorkersTestDB(t)
+	boundary := time.Date(2026, 7, 13, 13, 0, 0, 0, time.UTC)
+	userID, accountID, rentalID, _ := seedActiveRental(t, pool, boundary)
+	accountRepo := prepareEncryptedCredentials(t, pool, accountID)
+	service := rental.NewService(rental.NewPostgresRepository(pool.Pool), accountRepo, nil, nil, txManager)
+	cleanupRepo := NewRepository(pool)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var creds *rental.RentalCredentials
+	var credentialErr error
+	var cleanupChanged bool
+	var cleanupErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		creds, credentialErr = service.GetRentalCredentials(context.Background(), userID, rentalID, rental.CredentialRequestContext{}, boundary.Add(-time.Second))
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		cleanupChanged, cleanupErr = cleanupRepo.ExpireRental(context.Background(), rentalID, accountID, boundary.Add(time.Second))
+	}()
+	close(start)
+	wg.Wait()
+
+	if cleanupErr != nil {
+		t.Fatalf("concurrent cleanup failed: %v", cleanupErr)
+	}
+	if cleanupChanged {
+		if !errors.Is(credentialErr, rental.ErrCredentialsNotAvailable) || creds != nil {
+			t.Fatalf("cleanup committed first but credentials were disclosed: creds=%+v err=%v", creds, credentialErr)
+		}
+	} else {
+		if credentialErr != nil || creds == nil {
+			t.Fatalf("credential transaction won locks but did not issue consistently: creds=%+v err=%v", creds, credentialErr)
+		}
+		changed, err := cleanupRepo.ExpireRental(context.Background(), rentalID, accountID, boundary.Add(time.Second))
+		if err != nil || !changed {
+			t.Fatalf("follow-up cleanup failed after credential commit: changed=%v err=%v", changed, err)
+		}
+	}
+
+	var rentalStatus int16
+	var issuedEvents int
+	if err := pool.QueryRow(context.Background(), "SELECT status FROM rentals WHERE id = $1", rentalID).Scan(&rentalStatus); err != nil {
+		t.Fatalf("load final rental status: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM security_events WHERE rental_id = $1 AND event_type = 7", rentalID).Scan(&issuedEvents); err != nil {
+		t.Fatalf("load credential event count: %v", err)
+	}
+	if rentalStatus != int16(rental.StatusExpired) {
+		t.Fatalf("expected final expired rental, got %d", rentalStatus)
+	}
+	if (creds == nil && issuedEvents != 0) || (creds != nil && issuedEvents != 1) {
+		t.Fatalf("credential disclosure and audit disagree: creds=%+v issued_events=%d", creds, issuedEvents)
+	}
+}
+
+func TestCredentialAuditInsertFailureRollsBackAndDisclosesNothing(t *testing.T) {
+	pool, txManager := setupWorkersTestDB(t)
+	now := time.Date(2026, 7, 13, 14, 0, 0, 0, time.UTC)
+	userID, accountID, rentalID, _ := seedActiveRental(t, pool, now.Add(time.Hour))
+	accountRepo := prepareEncryptedCredentials(t, pool, accountID)
+
+	if _, err := pool.Exec(context.Background(), `
+		CREATE OR REPLACE FUNCTION reject_credential_issue_event() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.event_type = 7 THEN
+				RAISE EXCEPTION 'credential audit rejected for test';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("install credential audit failure function: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS trg_reject_credential_issue_event ON security_events"); err != nil {
+		t.Fatalf("drop stale credential audit failure trigger: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `CREATE TRIGGER trg_reject_credential_issue_event
+		BEFORE INSERT ON security_events
+		FOR EACH ROW EXECUTE FUNCTION reject_credential_issue_event()`); err != nil {
+		t.Fatalf("install credential audit failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS trg_reject_credential_issue_event ON security_events")
+		_, _ = pool.Exec(context.Background(), "DROP FUNCTION IF EXISTS reject_credential_issue_event()")
+	})
+
+	service := rental.NewService(rental.NewPostgresRepository(pool.Pool), accountRepo, nil, nil, txManager)
+	creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, rental.CredentialRequestContext{}, now)
+	if err == nil {
+		t.Fatalf("expected credential audit failure, got credentials=%+v", creds)
+	}
+	if creds != nil {
+		t.Fatalf("credential audit failure disclosed credentials: %+v", creds)
+	}
+
+	var eventCount int
+	var rentalStatus int16
+	if err := pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM security_events WHERE rental_id = $1 AND event_type = 7", rentalID).Scan(&eventCount); err != nil {
+		t.Fatalf("load credential audit events: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), "SELECT status FROM rentals WHERE id = $1", rentalID).Scan(&rentalStatus); err != nil {
+		t.Fatalf("load rental after audit rollback: %v", err)
+	}
+	if eventCount != 0 || rentalStatus != int16(rental.StatusActive) {
+		t.Fatalf("audit failure did not roll back cleanly: events=%d rental_status=%d", eventCount, rentalStatus)
 	}
 }
 

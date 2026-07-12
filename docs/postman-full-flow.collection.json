@@ -96,7 +96,8 @@
     },
     {
       "key": "paymentWebhookSecret",
-      "value": ""
+      "value": "",
+      "description": "Required: set the same explicit secret of at least 32 bytes as PAYMENT_WEBHOOK_SECRET. There is no fallback."
     }
   ],
   "item": [
@@ -471,6 +472,9 @@
                   "  payment_id: pm.collectionVariables.get('paymentId'),",
                   "  rental_id: pm.collectionVariables.get('rentalId'),",
                   "  external_transaction_id: pm.collectionVariables.get('externalTransactionId'),",
+				  "  provider: 'internal',",
+				  "  amount: Number(pm.collectionVariables.get('pricePerHour')) * Number(pm.collectionVariables.get('durationHours')) + Number(pm.collectionVariables.get('securityDeposit')),",
+				  "  currency: 'USD',",
                   "  status: 'success'",
                   "});",
                   "pm.variables.set('webhookPayload', payload);",
@@ -887,7 +891,7 @@
                 "login"
               ]
             },
-            "description": "Этот пользователь должен иметь роль ADMIN. Обычно это зависит от ADMIN_EMAILS на сервере."
+            "description": "Этот пользователь должен быть явно provisioned как ADMIN или назначен действующим администратором, затем войти заново."
           },
           "response": []
         },
@@ -1367,6 +1371,9 @@
                   "  payment_id: pm.collectionVariables.get('paymentId'),",
                   "  rental_id: pm.collectionVariables.get('rentalId'),",
                   "  external_transaction_id: pm.collectionVariables.get('externalTransactionId'),",
+				  "  provider: 'internal',",
+				  "  amount: Number(pm.collectionVariables.get('pricePerHour')) * Number(pm.collectionVariables.get('durationHours')) + Number(pm.collectionVariables.get('securityDeposit')),",
+				  "  currency: 'USD',",
                   "  status: 'success'",
                   "});",
                   "pm.variables.set('webhookPayload', payload);",
@@ -1407,7 +1414,7 @@
                 "webhook"
               ]
             },
-            "description": "Активирует payment/rental/account. Если paymentWebhookSecret пустой, коллекция всё равно сработает с текущей реализацией сервиса."
+            "description": "Активирует payment/rental/account только с обязательной корректной HMAC-подписью. paymentWebhookSecret должен совпадать с PAYMENT_WEBHOOK_SECRET и содержать не менее 32 байт."
           },
           "response": []
         },
@@ -1522,7 +1529,7 @@
           "response": []
         },
         {
-          "name": "Extend Active Rental",
+          "name": "Paid Extension Unsupported (Expected 501)",
           "request": {
             "method": "POST",
             "header": [
@@ -1549,7 +1556,8 @@
                 "{{rentalId}}",
                 "extend"
               ]
-            }
+            },
+            "description": "Paid extension is intentionally disabled. Expected response: 501 EXTENSION_NOT_SUPPORTED; rental end_at must remain unchanged."
           },
           "response": []
         }

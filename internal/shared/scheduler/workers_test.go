@@ -41,7 +41,7 @@ type MockSteamSyncRepository struct {
 	GetAccountsForSyncFunc    func(ctx context.Context) ([]int64, error)
 	GetAccountSyncDetailsFunc func(ctx context.Context, accountID int64) (string, string, error)
 	SyncAccountGamesFunc      func(ctx context.Context, accountID int64, games []repo.AccountGameSyncInfo) error
-	BanAccountFunc            func(ctx context.Context, accountID int64) error
+	DisableAccountIfIdleFunc  func(ctx context.Context, accountID int64) error
 }
 
 func (m *MockSteamSyncRepository) GetAccountsForSync(ctx context.Context) ([]int64, error) {
@@ -56,8 +56,8 @@ func (m *MockSteamSyncRepository) SyncAccountGames(ctx context.Context, accountI
 	return m.SyncAccountGamesFunc(ctx, accountID, games)
 }
 
-func (m *MockSteamSyncRepository) BanAccount(ctx context.Context, accountID int64) error {
-	return m.BanAccountFunc(ctx, accountID)
+func (m *MockSteamSyncRepository) DisableAccountIfIdle(ctx context.Context, accountID int64) error {
+	return m.DisableAccountIfIdleFunc(ctx, accountID)
 }
 
 type MockSteamClient struct {
@@ -245,7 +245,7 @@ func TestSteamSyncWorker_VACBanned(t *testing.T) {
 		GetAccountSyncDetailsFunc: func(ctx context.Context, aID int64) (string, string, error) {
 			return loginName, steamID64Val, nil
 		},
-		BanAccountFunc: func(ctx context.Context, aID int64) error {
+		DisableAccountIfIdleFunc: func(ctx context.Context, aID int64) error {
 			if aID != accountID {
 				t.Errorf("expected account ID %d, got %d", accountID, aID)
 			}
@@ -275,6 +275,6 @@ func TestSteamSyncWorker_VACBanned(t *testing.T) {
 	}
 
 	if !banCalled {
-		t.Errorf("expected BanAccount to be called")
+		t.Errorf("expected DisableAccountIfIdle to be called")
 	}
 }

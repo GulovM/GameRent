@@ -90,26 +90,30 @@ func (r *PostgresRepository) GetRentalCredentials(ctx context.Context, rentalID,
 			r.account_id,
 			r.status,
 			r.payment_expires_at,
+			p.id,
 			a.status,
 			a.login,
 			a.encrypted_password,
 			a.steam_id64
 		FROM rentals r
 		JOIN accounts a ON a.id = r.account_id
+		JOIN payments p ON p.rental_id = r.id
+			AND p.user_id = r.user_id
+			AND p.status = $6
 		WHERE r.id = $1
 			AND r.user_id = $2
 			AND r.status = $3
+			AND r.start_at <= $4
 			AND r.end_at > $4
-			AND r.payment_expires_at > $4
 			AND a.status = $5
-			AND EXISTS (
+			AND NOT EXISTS (
 				SELECT 1
-				FROM payments p
-				WHERE p.rental_id = r.id
-					AND p.user_id = r.user_id
-					AND p.status = $6
+				FROM refunds f
+				WHERE f.rental_id = r.id
+					AND f.user_id = r.user_id
+					AND f.status IN (1, 2)
 			)
-		FOR UPDATE OF r, a
+		FOR UPDATE OF r, a, p
 	`
 
 	var rec RentalCredentialsRecord
@@ -119,6 +123,7 @@ func (r *PostgresRepository) GetRentalCredentials(ctx context.Context, rentalID,
 		&rec.AccountID,
 		&rec.RentalStatus,
 		&rec.PaymentExpiresAt,
+		&rec.PaymentID,
 		&rec.AccountStatus,
 		&rec.Login,
 		&rec.EncryptedPassword,
@@ -132,6 +137,23 @@ func (r *PostgresRepository) GetRentalCredentials(ctx context.Context, rentalID,
 	}
 
 	return &rec, nil
+}
+
+func (r *PostgresRepository) RecordCredentialIssued(ctx context.Context, event CredentialIssueEvent) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var ipAddress any
+	if event.IPAddress != "" {
+		ipAddress = event.IPAddress
+	}
+	_, err := db.Exec(ctx, `
+		INSERT INTO security_events (
+			user_id, account_id, rental_id, event_type, ip_address, user_agent, success, metadata, created_at
+		) VALUES (
+			$1, $2, $3, 7, $4, $5, true,
+			jsonb_build_object('event', 'rental_credentials_issued', 'rental_id', $3::bigint, 'user_id', $1::bigint),
+			$6
+		)`, event.UserID, event.AccountID, event.RentalID, ipAddress, event.UserAgent, event.CreatedAt.UTC())
+	return err
 }
 
 func (r *PostgresRepository) CancelWaitingPaymentRental(ctx context.Context, rentalID, userID int64, reason string, now time.Time) (bool, error) {

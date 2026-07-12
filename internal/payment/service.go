@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,11 @@ var (
 	ErrWebhookNotSuccessful        = errors.New("webhook status is not successful")
 	ErrWebhookInvalidTransition    = errors.New("payment, rental or account is not in an activatable state")
 	ErrWebhookExternalTxMismatch   = errors.New("external_transaction_id does not match the stored payment")
+	ErrWebhookInvalidPayload       = errors.New("invalid webhook payload")
+	ErrWebhookIdentifierMismatch   = errors.New("webhook identifiers do not match the stored payment")
+	ErrWebhookFinancialMismatch    = errors.New("webhook financial facts do not match the stored payment")
+	ErrWebhookProviderUnsupported  = errors.New("webhook provider is not supported")
+	ErrInvalidWebhookSecret        = errors.New("PAYMENT_WEBHOOK_SECRET must be an explicit non-placeholder value of at least 32 bytes without surrounding whitespace")
 	ErrPaymentAlreadyProcessed     = errors.New("payment already processed")
 	ErrRentalNotEligible           = errors.New("rental is not eligible for activation")
 	ErrAccountNotReserved          = errors.New("account is not reserved")
@@ -39,6 +45,7 @@ var (
 	ErrInvalidLedgerPagination     = errors.New("invalid ledger pagination")
 	ErrInvalidRefundPagination     = errors.New("invalid refund pagination")
 	ErrInvalidAdminRentalFilters   = errors.New("invalid admin rental filters")
+	ErrAdminRentalNotFound         = errors.New("admin rental not found")
 )
 
 type Service interface {
@@ -48,6 +55,8 @@ type Service interface {
 	ListUserLedger(ctx context.Context, userID int64, page, pageSize int) (*UserLedgerPage, error)
 	ListUserRefunds(ctx context.Context, userID int64, page, pageSize int) (*UserRefundPage, error)
 	ListAdminRentals(ctx context.Context, filters AdminRentalListFilter) (*AdminRentalPage, error)
+	GetAdminRentalDetail(ctx context.Context, rentalID int64) (*AdminRentalDetail, error)
+	AdjustAdminBalance(ctx context.Context, actorUserID int64, actorRole string, targetUserID int64, input AdminBalanceAdjustmentInput, clientIP, userAgent string, now time.Time) (*AdminBalanceAdjustmentResult, error)
 	PayRentalWithBalance(ctx context.Context, userID, rentalID int64, clientIP, userAgent string, now time.Time) (*WalletPaymentResult, error)
 	RefundWalletPayment(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*WalletRefundResult, error)
 	ReleaseDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, now time.Time) (*DepositSettlementResult, error)
@@ -129,15 +138,37 @@ var walletRefundReasonCodeSet = func() map[string]struct{} {
 }()
 
 func NewPaymentService(repo Repository) *PaymentService {
-	webhookSecret := os.Getenv("PAYMENT_WEBHOOK_SECRET")
-	if webhookSecret == "" {
-		webhookSecret = "payment-webhook-secret-placeholder"
-	}
-
 	return &PaymentService{
 		repo:          repo,
-		webhookSecret: webhookSecret,
+		webhookSecret: os.Getenv("PAYMENT_WEBHOOK_SECRET"),
 	}
+}
+
+func NewPaymentServiceWithWebhookSecret(repo Repository, webhookSecret string) (*PaymentService, error) {
+	if err := ValidateWebhookSecret(webhookSecret); err != nil {
+		return nil, err
+	}
+	return &PaymentService{repo: repo, webhookSecret: webhookSecret}, nil
+}
+
+func ValidateWebhookSecret(webhookSecret string) error {
+	if webhookSecret == "" || strings.TrimSpace(webhookSecret) != webhookSecret || len([]byte(webhookSecret)) < 32 {
+		return ErrInvalidWebhookSecret
+	}
+	normalized := strings.ToLower(webhookSecret)
+	for _, unsafe := range []string{"placeholder", "change-me", "changeme", "default", "example", "local-payment-webhook-secret", "your-secret", "<generate"} {
+		if strings.Contains(normalized, unsafe) {
+			return ErrInvalidWebhookSecret
+		}
+	}
+	uniqueBytes := make(map[byte]struct{})
+	for index := 0; index < len(webhookSecret); index++ {
+		uniqueBytes[webhookSecret[index]] = struct{}{}
+	}
+	if len(uniqueBytes) < 8 {
+		return ErrInvalidWebhookSecret
+	}
+	return nil
 }
 
 func WalletRefundReasonOptions() []WalletRefundReasonOption {
@@ -156,30 +187,51 @@ func IsAllowedWalletRefundReasonCode(reasonCode string) bool {
 }
 
 func (s *PaymentService) VerifySignature(payload []byte, signature string) bool {
-	if s.webhookSecret == "" || signature == "" {
-		return true
+	if ValidateWebhookSecret(s.webhookSecret) != nil || len(signature) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range signature {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	providedSignature, err := hex.DecodeString(signature)
+	if err != nil || len(providedSignature) != sha256.Size {
+		return false
 	}
 	mac := hmac.New(sha256.New, []byte(s.webhookSecret))
-	mac.Write(payload)
-	expectedSignature := hex.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(signature), []byte(expectedSignature))
+	_, _ = mac.Write(payload)
+	return hmac.Equal(providedSignature, mac.Sum(nil))
 }
 
 func (s *PaymentService) ProcessWebhook(ctx context.Context, req WebhookRequest, clientIP, userAgent string) (*WebhookResult, error) {
-	if !strings.EqualFold(strings.TrimSpace(req.Status), "success") {
-		return nil, ErrWebhookNotSuccessful
+	paymentID, rentalID, err := validateWebhookRequest(req)
+	if err != nil {
+		return nil, err
 	}
-	if strings.TrimSpace(req.PaymentID) == "" && strings.TrimSpace(req.ExternalTransactionID) == "" {
-		return nil, ErrWebhookMissingIdentifier
+	if req.Status != "success" {
+		return nil, ErrWebhookNotSuccessful
 	}
 
 	now := time.Now()
 	result := &WebhookResult{}
 
-	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
-		state, err := s.loadWebhookState(txCtx, req)
+	err = s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		state, err := s.loadWebhookState(txCtx, paymentID, req.Provider, req.ExternalTransactionID)
 		if err != nil {
 			return err
+		}
+		if state.PaymentID != paymentID || state.RentalID != rentalID {
+			return ErrWebhookIdentifierMismatch
+		}
+		if state.Provider != webhookPaymentProvider || state.Provider != req.Provider {
+			return ErrWebhookProviderUnsupported
+		}
+		if state.Amount != req.Amount || state.Currency != req.Currency {
+			return ErrWebhookFinancialMismatch
+		}
+		if state.RentalPrice <= 0 || state.DepositAmount < 0 || state.RentalPrice > math.MaxInt64-state.DepositAmount || state.RentalPrice+state.DepositAmount != state.Amount {
+			return ErrWebhookFinancialMismatch
 		}
 
 		result.PaymentID = state.PaymentID
@@ -187,7 +239,7 @@ func (s *PaymentService) ProcessWebhook(ctx context.Context, req WebhookRequest,
 		result.AccountID = state.AccountID
 
 		if state.Status == 2 {
-			if state.Provider != walletPaymentProvider && req.ExternalTransactionID != "" && state.ExternalTransactionID != req.ExternalTransactionID {
+			if state.ExternalTransactionID != req.ExternalTransactionID {
 				return ErrWebhookExternalTxMismatch
 			}
 			if state.RentalStatus != 2 || state.AccountStatus != 4 {
@@ -201,9 +253,6 @@ func (s *PaymentService) ProcessWebhook(ctx context.Context, req WebhookRequest,
 		if state.Status != 1 {
 			return ErrWebhookNotSuccessful
 		}
-		if req.ExternalTransactionID == "" {
-			return ErrWebhookMissingExternalTxID
-		}
 		if state.RentalStatus != 1 || state.AccountStatus != 3 {
 			return fmt.Errorf("%w: payment=%d rental=%d account=%d", ErrWebhookInvalidTransition, state.Status, state.RentalStatus, state.AccountStatus)
 		}
@@ -214,7 +263,11 @@ func (s *PaymentService) ProcessWebhook(ctx context.Context, req WebhookRequest,
 				if lockErr != nil {
 					return lockErr
 				}
-				if updated.RentalStatus != 2 || updated.AccountStatus != 4 {
+				if updated.PaymentID != state.PaymentID || updated.RentalID != state.RentalID || updated.Provider != state.Provider ||
+					updated.ExternalTransactionID != req.ExternalTransactionID || updated.Amount != state.Amount || updated.Currency != state.Currency {
+					return ErrWebhookIdentifierMismatch
+				}
+				if updated.Status != 2 || updated.RentalStatus != 2 || updated.AccountStatus != 4 {
 					return ErrWebhookInvalidTransition
 				}
 				result.PaymentID = updated.PaymentID
@@ -287,7 +340,7 @@ func (s *PaymentService) recordFinancialFacts(ctx context.Context, state *Webhoo
 		return fmt.Errorf("marshal provider payment ledger metadata: %w", err)
 	}
 
-	totalAmount := state.RentalPrice + state.DepositAmount
+	totalAmount := state.Amount
 	if err := s.repo.RecordProviderPaymentReceived(ctx, FinancialLedgerEntry{
 		UserID:                state.UserID,
 		RentalID:              state.RentalID,
@@ -591,7 +644,7 @@ func (s *PaymentService) PayRentalWithBalance(ctx context.Context, userID, renta
 }
 
 func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*WalletRefundResult, error) {
-	if actorRole != "ADMIN" && actorRole != "SYSTEM" {
+	if actorRole != "ADMIN" {
 		return nil, ErrAdminRequired
 	}
 	reasonCode = strings.TrimSpace(reasonCode)
@@ -601,6 +654,12 @@ func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID in
 
 	result := &WalletRefundResult{}
 	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.RequireCurrentAdmin(txCtx, actorUserID); err != nil {
+			if errors.Is(err, ErrAdminRequired) {
+				return err
+			}
+			return fmt.Errorf("authorize current admin for wallet refund: %w", err)
+		}
 		state, err := s.repo.LockWalletRefundState(txCtx, rentalID)
 		if err != nil {
 			if errors.Is(err, ErrWalletRefundNotFound) {
@@ -631,9 +690,6 @@ func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID in
 		}
 
 		requestedByUserID := &actorUserID
-		if actorRole == "SYSTEM" {
-			requestedByUserID = nil
-		}
 		refundRecord, _, err := s.repo.CreateRefund(txCtx, RefundRecord{
 			PaymentID:         state.PaymentID,
 			RentalID:          state.RentalID,
@@ -817,6 +873,12 @@ func (s *PaymentService) ReleaseDeposit(ctx context.Context, actorUserID int64, 
 
 	result := &DepositSettlementResult{}
 	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.RequireCurrentAdmin(txCtx, actorUserID); err != nil {
+			if errors.Is(err, ErrAdminRequired) {
+				return err
+			}
+			return fmt.Errorf("authorize current admin for deposit release: %w", err)
+		}
 		state, err := s.loadDepositSettlementState(txCtx, rentalID)
 		if err != nil {
 			return err
@@ -914,6 +976,12 @@ func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, 
 
 	result := &DepositSettlementResult{}
 	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.RequireCurrentAdmin(txCtx, actorUserID); err != nil {
+			if errors.Is(err, ErrAdminRequired) {
+				return err
+			}
+			return fmt.Errorf("authorize current admin for deposit forfeit: %w", err)
+		}
 		state, err := s.loadDepositSettlementState(txCtx, rentalID)
 		if err != nil {
 			return err
@@ -1144,26 +1212,47 @@ func walletRefundDepositStatus(holdStatus int16, depositAmount int64, hasDeposit
 	}
 }
 
-func (s *PaymentService) loadWebhookState(ctx context.Context, req WebhookRequest) (*WebhookPaymentState, error) {
-	if req.PaymentID != "" {
-		paymentID, err := strconv.ParseInt(req.PaymentID, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid payment_id format: %w", err)
-		}
-		state, err := s.repo.LockPaymentForWebhookByID(ctx, paymentID)
-		if err == nil {
-			return state, nil
-		}
-		if !errors.Is(err, ErrPaymentNotFound) {
-			return nil, err
-		}
+func validateWebhookRequest(req WebhookRequest) (paymentID, rentalID int64, err error) {
+	if req.PaymentID == "" || len(req.PaymentID) > 19 || req.RentalID == "" || len(req.RentalID) > 19 ||
+		req.ExternalTransactionID == "" || len(req.ExternalTransactionID) > 128 || !isSafeWebhookExternalTransactionID(req.ExternalTransactionID) ||
+		req.Provider != webhookPaymentProvider || req.Amount <= 0 || len(req.Currency) != 3 || strings.TrimSpace(req.Currency) != req.Currency ||
+		req.Status == "" || len(req.Status) > 16 || strings.TrimSpace(req.Status) != req.Status {
+		return 0, 0, ErrWebhookInvalidPayload
 	}
-
-	if strings.TrimSpace(req.ExternalTransactionID) == "" {
-		return nil, ErrPaymentNotFound
+	paymentID, err = strconv.ParseInt(req.PaymentID, 10, 64)
+	if err != nil || paymentID <= 0 {
+		return 0, 0, ErrWebhookInvalidPayload
 	}
+	rentalID, err = strconv.ParseInt(req.RentalID, 10, 64)
+	if err != nil || rentalID <= 0 {
+		return 0, 0, ErrWebhookInvalidPayload
+	}
+	return paymentID, rentalID, nil
+}
 
-	return s.loadWebhookStateByExternalTransaction(ctx, webhookPaymentProvider, strings.TrimSpace(req.ExternalTransactionID))
+func isSafeWebhookExternalTransactionID(value string) bool {
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.' || character == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (s *PaymentService) loadWebhookState(ctx context.Context, paymentID int64, provider, externalTransactionID string) (*WebhookPaymentState, error) {
+	stateByExternalID, err := s.loadWebhookStateByExternalTransaction(ctx, provider, externalTransactionID)
+	if err == nil {
+		if stateByExternalID.PaymentID != paymentID {
+			return nil, ErrWebhookIdentifierMismatch
+		}
+		return stateByExternalID, nil
+	}
+	if !errors.Is(err, ErrPaymentNotFound) {
+		return nil, err
+	}
+	return s.repo.LockPaymentForWebhookByID(ctx, paymentID)
 }
 
 func (s *PaymentService) loadWebhookStateByExternalTransaction(ctx context.Context, provider, externalTransactionID string) (*WebhookPaymentState, error) {

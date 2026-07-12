@@ -23,8 +23,7 @@ type Repository interface {
 	CreateAccount(ctx context.Context, a *Account) error
 	GetAccount(ctx context.Context, id int64) (*Account, error)
 	GetAccountForUpdate(ctx context.Context, id int64) (*Account, error)
-	UpdateAccount(ctx context.Context, a *Account) error
-	DeleteAccount(ctx context.Context, id int64) error
+	ReserveAccount(ctx context.Context, id int64, now time.Time) error
 	ListAccounts(ctx context.Context, limit, offset int) ([]*Account, error)
 	SearchAccounts(ctx context.Context, limit, offset int, search string, gameID int64, minPrice, maxPrice int64, status string) ([]*Account, error)
 	SyncAccountGames(ctx context.Context, accountID int64, games []AccountGame) error
@@ -320,38 +319,21 @@ func (r *PostgresRepository) SyncAccountGames(ctx context.Context, accountID int
 	return nil
 }
 
-func (r *PostgresRepository) UpdateAccount(ctx context.Context, a *Account) error {
+func (r *PostgresRepository) ReserveAccount(ctx context.Context, id int64, now time.Time) error {
 	db := database.GetTxOrPool(ctx, r.pool)
-
-	statusVal := mapStatusToDB(a.Status)
-
-	query := `UPDATE accounts SET 
-		login = $1, encrypted_password = $2, status = $3, 
-		steam_guard_enabled = $4, inventory_verified = $5, last_security_check = $6, 
-		hourly_price = $7, deposit_amount = $8, profile_url = $9, avatar_url = $10, 
-		library_synced_at = $11, updated_at = $12, deleted_at = $13, steam_id64 = $14
-		WHERE id = $15`
-
-	_, err := db.Exec(ctx, query,
-		a.Credentials.Login, a.Credentials.EncryptedPassword, statusVal,
-		a.SteamGuardEnabled, a.InventoryVerified, a.LastSecurityCheck,
-		a.HourlyPrice.Amount, a.DepositAmount.Amount, a.ProfileURL, a.AvatarURL,
-		a.LibrarySyncedAt, a.UpdatedAt, a.DeletedAt, a.Credentials.SteamID64,
-		a.ID,
+	tag, err := db.Exec(ctx, `
+		UPDATE accounts
+		SET status = $2, updated_at = $3
+		WHERE id = $1 AND status = $4 AND deleted_at IS NULL`,
+		id, int16(StatusReserved), now, int16(StatusAvailable),
 	)
 	if err != nil {
 		return err
 	}
-
-	return r.SyncAccountGames(ctx, a.ID, a.Games)
-}
-
-func (r *PostgresRepository) DeleteAccount(ctx context.Context, id int64) error {
-	db := database.GetTxOrPool(ctx, r.pool)
-	now := time.Now()
-	query := `UPDATE accounts SET deleted_at = $1, status = 6, updated_at = $1 WHERE id = $2`
-	_, err := db.Exec(ctx, query, now, id)
-	return err
+	if tag.RowsAffected() == 0 {
+		return ErrInvalidState
+	}
+	return nil
 }
 
 func (r *PostgresRepository) ListAccounts(ctx context.Context, limit, offset int) ([]*Account, error) {

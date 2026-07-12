@@ -139,13 +139,21 @@ REDIS_PORT=6379
 REDIS_PASSWORD=
 
 JWT_SECRET=your-jwt-token-signing-secret-key-here
-JWT_TTL=24h
-ADMIN_EMAILS=admin@example.com
+JWT_TTL=15m
 ENCRYPTION_KEY=your-32-byte-aes-encryption-key-here
 
 STEAM_API_KEY=
 STEAM_BASE_URL=https://api.steampowered.com
-PAYMENT_WEBHOOK_SECRET=local-payment-webhook-secret
+# Required; use a unique random value of at least 32 bytes, including for local development.
+PAYMENT_WEBHOOK_SECRET=<generate-a-random-secret>
+```
+
+For local development, generate a secret explicitly and place the resulting value in your ignored `.env` file (do not commit the generated value):
+
+```powershell
+$bytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+[Convert]::ToBase64String($bytes)
 ```
 
 Для Docker Compose `POSTGRES_HOST`, `POSTGRES_PORT`, `REDIS_HOST`, `REDIS_PORT` и `GOOSE_DBSTRING` переопределяются внутри `docker-compose.yml`, потому что контейнеры общаются друг с другом по service name: `postgres`, `redis`, `api`.
@@ -157,16 +165,7 @@ PAYMENT_WEBHOOK_SECRET=local-payment-webhook-secret
 - `RENT` - клиент. Может регистрироваться, логиниться, смотреть каталог, арендовать аккаунты, создавать платежи, оставлять отзывы и смотреть свои данные.
 - `ADMIN` - администратор. Может создавать и менять игровые аккаунты, управлять пользователями, смотреть audit logs и административные списки.
 
-При регистрации роль выбирается так:
-
-- если email есть в `ADMIN_EMAILS`, пользователь получает `ADMIN`;
-- все остальные получают `RENT`.
-
-Пример:
-
-```env
-ADMIN_EMAILS=admin@example.com,owner@example.com
-```
+Публичная регистрация всегда создаёт пользователя с ролью `RENT`. Первый администратор создаётся отдельным provisioning-процессом, а последующие назначения `ADMIN` выполняет уже действующий администратор через admin user API. После повышения требуется новый вход: ранее выданный `RENT` access token не получает административные права.
 
 ## Сборка
 
@@ -377,12 +376,18 @@ X-Payment-Signature: <hmac_sha256_hex>
 
 {
   "payment_id": "1",
+  "rental_id": "1",
   "external_transaction_id": "local-tx-1",
+  "provider": "internal",
+  "amount": 1500,
+  "currency": "USD",
   "status": "success"
 }
 ```
 
-Успешный webhook переводит `payment PENDING -> SUCCESS`, `rental WAITING_PAYMENT -> ACTIVE`, `account RESERVED -> RENTED` в одной PostgreSQL transaction. Повтор webhook с тем же `external_transaction_id` для уже обработанного платежа является идемпотентным. Webhook не возвращает Steam credentials.
+`X-Payment-Signature` is the 64-character lowercase hexadecimal encoding of `HMAC-SHA256(PAYMENT_WEBHOOK_SECRET, raw_request_body)`. The secret is mandatory, must be at least 32 bytes, and has no fallback. The API rejects missing/invalid signatures with `401`, payloads over 16 KiB with `413`, non-JSON content types with `415`, and malformed, unknown-field, duplicate-field, or trailing JSON before payment processing.
+
+Успешный webhook переводит `payment PENDING -> SUCCESS`, `rental WAITING_PAYMENT -> ACTIVE`, `account RESERVED -> RENTED` в одной PostgreSQL transaction. Provider, payment, rental, external transaction, amount and currency must exactly match stored state. Повтор webhook с тем же `external_transaction_id` для уже обработанного платежа является идемпотентным. Webhook не возвращает Steam credentials.
 
 Wallet payment использует тот же lifecycle `PENDING -> SUCCESS`, `WAITING_PAYMENT -> ACTIVE`, `RESERVED -> RENTED`, но без provider webhook: списывает `users.balance` атомарно внутри backend transaction и не возвращает credentials автоматически.
 

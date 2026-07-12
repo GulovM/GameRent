@@ -3,6 +3,8 @@ package rental
 import (
 	"context"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,17 +19,19 @@ func (m mockTxManager) WithinTransaction(ctx context.Context, fn func(ctx contex
 }
 
 type mockRentalRepo struct {
-	createFunc     func(ctx context.Context, r *Rental) error
-	cancelFunc     func(ctx context.Context, rentalID, userID int64, reason string, now time.Time) (bool, error)
-	created        *Rental
-	credentialsRec *RentalCredentialsRecord
-	credentialsErr error
-	cancelCalled   bool
-	cancelRentalID int64
-	cancelUserID   int64
-	cancelReason   string
-	cancelChanged  bool
-	cancelErr      error
+	createFunc         func(ctx context.Context, r *Rental) error
+	cancelFunc         func(ctx context.Context, rentalID, userID int64, reason string, now time.Time) (bool, error)
+	created            *Rental
+	credentialsRec     *RentalCredentialsRecord
+	credentialsErr     error
+	credentialEvent    *CredentialIssueEvent
+	credentialEventErr error
+	cancelCalled       bool
+	cancelRentalID     int64
+	cancelUserID       int64
+	cancelReason       string
+	cancelChanged      bool
+	cancelErr          error
 }
 
 func (m *mockRentalRepo) CreateRental(ctx context.Context, r *Rental) error {
@@ -47,6 +51,11 @@ func (m *mockRentalRepo) GetRentalCredentials(ctx context.Context, rentalID, use
 		return nil, m.credentialsErr
 	}
 	return m.credentialsRec, nil
+}
+
+func (m *mockRentalRepo) RecordCredentialIssued(ctx context.Context, event CredentialIssueEvent) error {
+	m.credentialEvent = &event
+	return m.credentialEventErr
 }
 
 func (m *mockRentalRepo) CancelWaitingPaymentRental(ctx context.Context, rentalID, userID int64, reason string, now time.Time) (bool, error) {
@@ -79,14 +88,13 @@ func (m *mockAccountRepo) GetAccountForUpdate(ctx context.Context, id int64) (*a
 	}
 	return m.account, nil
 }
-func (m *mockAccountRepo) UpdateAccount(ctx context.Context, a *account.Account) error {
-	m.updated = a
+func (m *mockAccountRepo) ReserveAccount(ctx context.Context, id int64, now time.Time) error {
+	m.updated = m.account
 	if m.updateErr != nil {
 		return m.updateErr
 	}
 	return nil
 }
-func (m *mockAccountRepo) DeleteAccount(ctx context.Context, id int64) error { return nil }
 func (m *mockAccountRepo) ListAccounts(ctx context.Context, limit, offset int) ([]*account.Account, error) {
 	return nil, nil
 }
@@ -201,6 +209,44 @@ func TestService_RentAccount_PaymentFailureReturnsError(t *testing.T) {
 	}
 }
 
+func TestCalculateRentalTotalRejectsOverflow(t *testing.T) {
+	tests := []struct {
+		name    string
+		hourly  int64
+		deposit int64
+		hours   int64
+	}{
+		{name: "multiplication", hourly: math.MaxInt64/2 + 1, hours: 2},
+		{name: "deposit addition", hourly: math.MaxInt64, deposit: 1, hours: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := CalculateRentalTotal(tt.hourly, tt.deposit, tt.hours); !errors.Is(err, ErrRentalPriceOverflow) {
+				t.Fatalf("expected ErrRentalPriceOverflow, got %v", err)
+			}
+		})
+	}
+}
+
+func TestService_RentAccount_OverflowDoesNotCreateFinancialState(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	price, _ := account.NewMoney(math.MaxInt64/2+1, "USD")
+	deposit, _ := account.NewMoney(0, "USD")
+	acc := &account.Account{ID: 55, HourlyPrice: price, DepositAmount: deposit, Status: account.StatusAvailable}
+	rentalRepo := &mockRentalRepo{}
+	accountRepo := &mockAccountRepo{account: acc}
+	paymentRepo := &mockPaymentRepo{}
+	service := NewService(rentalRepo, accountRepo, &mockUserRepo{user: &user.User{ID: 77, Balance: math.MaxInt64}}, paymentRepo, mockTxManager{})
+
+	got, err := service.RentAccount(context.Background(), 77, 55, 2*time.Hour, now)
+	if !errors.Is(err, ErrRentalPriceOverflow) {
+		t.Fatalf("expected ErrRentalPriceOverflow, got rental=%+v err=%v", got, err)
+	}
+	if accountRepo.updated != nil || rentalRepo.created != nil || paymentRepo.createCalled {
+		t.Fatalf("overflow created state: account=%+v rental=%+v payment_called=%t", accountRepo.updated, rentalRepo.created, paymentRepo.createCalled)
+	}
+}
+
 func TestService_GetRentalCredentials_ReturnsCredentialsOnlyForEligibleRental(t *testing.T) {
 	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
 	price, _ := account.NewMoney(200, "USD")
@@ -227,7 +273,7 @@ func TestService_GetRentalCredentials_ReturnsCredentialsOnlyForEligibleRental(t 
 	}
 	service := NewService(rentalRepo, accountRepo, &mockUserRepo{}, &mockPaymentRepo{}, mockTxManager{})
 
-	creds, err := service.GetRentalCredentials(context.Background(), 77, 101, now)
+	creds, err := service.GetRentalCredentials(context.Background(), 77, 101, CredentialRequestContext{IPAddress: "127.0.0.1", UserAgent: "test-agent"}, now)
 	if err != nil {
 		t.Fatalf("GetRentalCredentials failed: %v", err)
 	}
@@ -236,6 +282,37 @@ func TestService_GetRentalCredentials_ReturnsCredentialsOnlyForEligibleRental(t 
 	}
 	if !accountRepo.decryptCalled {
 		t.Fatalf("expected decrypt to be called after checks")
+	}
+	if rentalRepo.credentialEvent == nil || rentalRepo.credentialEvent.UserID != 77 || rentalRepo.credentialEvent.AccountID != 55 || rentalRepo.credentialEvent.RentalID != 101 {
+		t.Fatalf("expected credential issuance event inside service flow, got %+v", rentalRepo.credentialEvent)
+	}
+}
+
+func TestService_GetRentalCredentials_AuditFailureReturnsNoCredentials(t *testing.T) {
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	rentalRepo := &mockRentalRepo{
+		credentialsRec: &RentalCredentialsRecord{
+			RentalID:          104,
+			UserID:            77,
+			AccountID:         55,
+			RentalStatus:      StatusActive,
+			AccountStatus:     int16(account.StatusRented),
+			PaymentID:         900,
+			PaymentExpiresAt:  now.Add(-time.Hour),
+			Login:             "steam_login",
+			EncryptedPassword: []byte("enc-pass"),
+			SteamID64:         "76561198000000001",
+		},
+		credentialEventErr: errors.New("security event insert failed"),
+	}
+	service := NewService(rentalRepo, &mockAccountRepo{}, &mockUserRepo{}, &mockPaymentRepo{}, mockTxManager{})
+
+	creds, err := service.GetRentalCredentials(context.Background(), 77, 104, CredentialRequestContext{}, now)
+	if err == nil || !strings.Contains(err.Error(), "record credential issuance") {
+		t.Fatalf("expected audit failure, got credentials=%+v err=%v", creds, err)
+	}
+	if creds != nil {
+		t.Fatalf("audit failure disclosed credentials: %+v", creds)
 	}
 }
 
@@ -260,7 +337,7 @@ func TestService_GetRentalCredentials_DeniesIneligibleRentalWithoutDecrypt(t *te
 	}
 	service := NewService(rentalRepo, accountRepo, &mockUserRepo{}, &mockPaymentRepo{}, mockTxManager{})
 
-	creds, err := service.GetRentalCredentials(context.Background(), 77, 102, now)
+	creds, err := service.GetRentalCredentials(context.Background(), 77, 102, CredentialRequestContext{}, now)
 	if !errors.Is(err, ErrCredentialsNotAvailable) {
 		t.Fatalf("expected ErrCredentialsNotAvailable, got %v", err)
 	}
@@ -293,7 +370,7 @@ func TestService_GetRentalCredentials_DeniesExpiredRentalWithoutDecrypt(t *testi
 	}
 	service := NewService(rentalRepo, accountRepo, &mockUserRepo{}, &mockPaymentRepo{}, mockTxManager{})
 
-	creds, err := service.GetRentalCredentials(context.Background(), 77, 103, now)
+	creds, err := service.GetRentalCredentials(context.Background(), 77, 103, CredentialRequestContext{}, now)
 	if !errors.Is(err, ErrCredentialsNotAvailable) {
 		t.Fatalf("expected ErrCredentialsNotAvailable, got %v", err)
 	}
@@ -342,5 +419,46 @@ func TestService_CancelRental_UsesErrorsIsForWrappedCannotCancel(t *testing.T) {
 	_, err := service.CancelRental(context.Background(), 77, 101, "too late", time.Now())
 	if !errors.Is(err, ErrCannotCancel) {
 		t.Fatalf("expected wrapped ErrCannotCancel to match with errors.Is, got %v", err)
+	}
+}
+
+func TestService_GetRentalCredentials_PaymentExpiredActivePaidAllowsCredentials(t *testing.T) {
+	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	price, _ := account.NewMoney(200, "USD")
+	deposit, _ := account.NewMoney(1000, "USD")
+	acc := &account.Account{ID: 55, HourlyPrice: price, DepositAmount: deposit, Status: account.StatusRented}
+	accountRepo := &mockAccountRepo{account: acc, decryptFunc: func(ciphertext []byte) (string, error) {
+		if string(ciphertext) != "enc-pass" {
+			t.Fatalf("unexpected ciphertext passed to decrypt: %q", string(ciphertext))
+		}
+		return "steam_secret_password", nil
+	}}
+	rentalRepo := &mockRentalRepo{
+		credentialsRec: &RentalCredentialsRecord{
+			RentalID:          101,
+			UserID:            77,
+			AccountID:         55,
+			RentalStatus:      StatusActive,
+			AccountStatus:     int16(account.StatusRented),
+			PaymentExpiresAt:  now.Add(-5 * time.Minute), // Expired in the past!
+			Login:             "steam_login",
+			EncryptedPassword: []byte("enc-pass"),
+			SteamID64:         "76561198000000001",
+		},
+	}
+	service := NewService(rentalRepo, accountRepo, &mockUserRepo{}, &mockPaymentRepo{}, mockTxManager{})
+
+	creds, err := service.GetRentalCredentials(context.Background(), 77, 101, CredentialRequestContext{}, now)
+	if err != nil {
+		t.Fatalf("GetRentalCredentials failed: %v", err)
+	}
+	if creds.AccountID != 55 {
+		t.Fatalf("expected AccountID 55, got %d", creds.AccountID)
+	}
+	if creds.Login != "steam_login" || creds.Password != "steam_secret_password" || creds.SteamID64 != "76561198000000001" {
+		t.Fatalf("unexpected credentials returned: %+v", creds)
+	}
+	if !accountRepo.decryptCalled {
+		t.Fatalf("expected decrypt to be called after checks")
 	}
 }

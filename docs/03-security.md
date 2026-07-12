@@ -75,9 +75,9 @@
 
 ---
 
-### 4.2. No Direct Credential Exposure
+### 4.2. Controlled Credential Exposure
 
-Логин и пароль Steam не отображаются пользователю в UI системы.
+Логин и пароль Steam не входят в обычные account/rental/payment responses. Они кратковременно отображаются только владельцу активной, оплаченной и неистёкшей аренды после отдельного запроса credentials endpoint. Frontend не сохраняет их в `localStorage`/`sessionStorage`, очищает при logout, смене session/user, экрана или rental, expiry, blur/visibility change и unmount, а также отменяет и инвалидирует незавершённые запросы.
 
 ---
 
@@ -126,6 +126,14 @@ Steam credentials:
 - ADMIN
 
 Доступ строго ограничен на уровне API.
+
+Public registration always creates `RENT`; `ADMIN` is assigned only by explicit provisioning or by an existing administrator. Authenticated requests reload the current user state from PostgreSQL. Missing, deleted and blocked users are rejected. Administrative access requires both a signed `ADMIN` token claim and the current PostgreSQL role `ADMIN`, so neither a stale demoted token nor a pre-promotion `RENT` token can authorize an admin action. Every administrative financial mutation and every admin user privilege mutation revalidates and locks the current administrator again inside the same PostgreSQL transaction before replay detection or state changes.
+
+A stale ADMIN token cannot be used after demotion, blocking or deletion. Role/block changes atomically revoke the target user's active refresh tokens and create an audit record. Admin user updates cannot target the acting administrator, so self-promotion, self-unblocking, self-demotion, self-blocking and self trust-score changes are rejected. User delete/undelete is not exposed by the current admin API.
+
+Payment provider callbacks are authenticated independently of JWT. `PAYMENT_WEBHOOK_SECRET` is required at startup in every environment, must be an explicit non-placeholder value of at least 32 bytes, and has no default or fallback. `X-Payment-Signature` contains the lowercase hexadecimal HMAC-SHA256 of the exact raw request body. Missing, malformed and invalid signatures are rejected before JSON decoding or business logic, and signature values and raw payloads are never logged. Webhook bodies are limited to 16 KiB and decoded with a strict single-object schema.
+
+Credential issuance starts a PostgreSQL transaction, locks the rental/account/successful-payment tuple, revalidates ownership, active rental window, rented account state and absence of a blocking refund, decrypts locally, inserts the secret-free `rental_credentials_issued` security event, and commits before the HTTP response is written. Audit failure rolls the transaction back and no credentials are returned. Expiration cleanup uses conflicting rental/account row locks, so cleanup and disclosure cannot both commit against stale lifecycle state.
 
 ---
 

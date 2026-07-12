@@ -1,11 +1,15 @@
 import { DatabaseZap } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Account,
+  AdminBalanceAdjustmentInput,
+  AdminBalanceAdjustmentResponse,
+  AdminRentalDetail,
   AdminRentalFilters,
   AdminRentalSummary,
   AdminRentalRefundSummary,
   AdminWalletRefundResponse,
+  AdminUserPatch,
   api,
   AuditLog,
   clearTokens,
@@ -32,9 +36,9 @@ import { RentalsView } from "./features/rentals/RentalsView";
 import {
   canRequestCredentials,
   findPaymentForRental,
+  isRentalExpiredByTime,
   RENTAL_POLL_INTERVAL_MS,
   RENTAL_STATUS_ACTIVE,
-  RENTAL_STATUS_CANCELLED,
   RENTAL_STATUS_WAITING_PAYMENT
 } from "./features/rentals/rentalStatus";
 import type { AdminAccountPatch, Toast, View } from "./types/app";
@@ -42,6 +46,8 @@ import { isUnauthorized, messageForApiError, messageForWalletPaymentError } from
 import { asList, normalizeAccount, statusFromNumber } from "./utils/accounts";
 
 const DEFAULT_ADMIN_RENTAL_FILTERS: AdminRentalFilters = {};
+const SESSION_INVALIDATED_EVENT = "gamerent:session-invalidated";
+const AUTHORIZATION_CHANGED_EVENT = "gamerent:authorization-changed";
 
 function useTicker() {
   const [, setTick] = useState(0);
@@ -71,6 +77,10 @@ export default function App() {
   const [adminRentalFilters, setAdminRentalFilters] = useState<AdminRentalFilters>(DEFAULT_ADMIN_RENTAL_FILTERS);
   const [adminRentalsLoading, setAdminRentalsLoading] = useState(false);
   const [adminRentalsError, setAdminRentalsError] = useState<string | null>(null);
+  const [adminRentalDetail, setAdminRentalDetail] = useState<AdminRentalDetail | null>(null);
+  const [adminRentalDetailLoading, setAdminRentalDetailLoading] = useState(false);
+  const [adminRentalDetailError, setAdminRentalDetailError] = useState<string | null>(null);
+  const [openAdminRentalDetailId, setOpenAdminRentalDetailId] = useState<number | null>(null);
   const [adminRefundReasonCodes, setAdminRefundReasonCodes] = useState<RefundReasonCodeOption[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [user, setUser] = useState<User | null>(null);
@@ -93,6 +103,43 @@ export default function App() {
   const [walletPaymentLoadingRentalId, setWalletPaymentLoadingRentalId] = useState<number | null>(null);
   const [walletPaymentError, setWalletPaymentError] = useState<{ rentalId: number; message: string } | null>(null);
   const rentalRefreshRef = useRef<Promise<void> | null>(null);
+  const credentialRequestRef = useRef<AbortController | null>(null);
+  const credentialGenerationRef = useRef(0);
+  const mountedRef = useRef(true);
+  const currentViewRef = useRef(view);
+  const currentUserIDRef = useRef<number | null>(user?.id ?? null);
+  const selectedRentalIDRef = useRef<number | null>(selectedRentalId);
+  const rentalsRef = useRef(rentals);
+  const paymentsRef = useRef(payments);
+
+  currentViewRef.current = view;
+  currentUserIDRef.current = user?.id ?? null;
+  selectedRentalIDRef.current = selectedRentalId;
+  rentalsRef.current = rentals;
+  paymentsRef.current = payments;
+
+  const invalidateCredentialRequest = useCallback((clearState = true) => {
+    credentialGenerationRef.current += 1;
+    credentialRequestRef.current?.abort();
+    credentialRequestRef.current = null;
+    if (clearState && mountedRef.current) {
+      setCredentials(null);
+      setCredentialsError(null);
+      setCredentialsLoading(false);
+    }
+  }, []);
+
+  const changeView = useCallback((nextView: View) => {
+    invalidateCredentialRequest();
+    currentViewRef.current = nextView;
+    setView(nextView);
+  }, [invalidateCredentialRequest]);
+
+  const selectRental = useCallback((rentalID: number | null) => {
+    invalidateCredentialRequest();
+    selectedRentalIDRef.current = rentalID;
+    setSelectedRentalId(rentalID);
+  }, [invalidateCredentialRequest]);
 
   useEffect(() => {
     window.location.hash = view;
@@ -133,6 +180,7 @@ export default function App() {
   }
 
   function clearPrivateState() {
+    invalidateCredentialRequest();
     setUser(null);
     setRentals([]);
     setPayments([]);
@@ -146,12 +194,14 @@ export default function App() {
     setAdminRentalFilters(DEFAULT_ADMIN_RENTAL_FILTERS);
     setAdminRentalsLoading(false);
     setAdminRentalsError(null);
+    setAdminRentalDetail(null);
+    setAdminRentalDetailLoading(false);
+    setAdminRentalDetailError(null);
+    setOpenAdminRentalDetailId(null);
     setAdminRefundReasonCodes([]);
     setAdminUsers([]);
+    selectedRentalIDRef.current = null;
     setSelectedRentalId(null);
-    setCredentials(null);
-    setCredentialsError(null);
-    setCredentialsLoading(false);
     setBalanceLoading(false);
     setWalletPaymentLoadingRentalId(null);
     setWalletPaymentError(null);
@@ -161,9 +211,38 @@ export default function App() {
     clearTokens();
     clearPrivateState();
     setAuthOpen(true);
-    setView("catalog");
+    changeView("catalog");
     setToast({ type: "error", message: "Session expired. Sign in again." });
   }
+
+  useEffect(() => {
+    const onSessionInvalidated = () => handleAuthFailure();
+    const onAuthorizationChanged = () => {
+      void api
+        .me()
+        .then((currentUser) => {
+          setUser(currentUser);
+          if (currentUser.role !== "ADMIN") {
+            setAdminUsers([]);
+            setAuditLogs([]);
+            setAdminRentals([]);
+            setAdminRentalsSummary(null);
+            setAdminRentalsPagination(null);
+            changeView("catalog");
+            setToast({ type: "error", message: "Your permissions changed. Admin access was removed." });
+          }
+        })
+        .catch((error) => {
+          if (isUnauthorized(error)) handleAuthFailure();
+        });
+    };
+    window.addEventListener(SESSION_INVALIDATED_EVENT, onSessionInvalidated);
+    window.addEventListener(AUTHORIZATION_CHANGED_EVENT, onAuthorizationChanged);
+    return () => {
+      window.removeEventListener(SESSION_INVALIDATED_EVENT, onSessionInvalidated);
+      window.removeEventListener(AUTHORIZATION_CHANGED_EVENT, onAuthorizationChanged);
+    };
+  }, []);
 
   async function refreshRentalData(options?: { silent?: boolean }) {
     if (!getAccessToken()) return;
@@ -190,6 +269,8 @@ export default function App() {
           setBalance(balanceRes);
         }
       } catch (error) {
+        setCredentials(null);
+        setCredentialsError(null);
         if (isUnauthorized(error)) {
           handleAuthFailure();
           return;
@@ -234,7 +315,7 @@ export default function App() {
       setWalletPaymentError(null);
 
       if (meRes.role === "ADMIN") {
-        setView("admin");
+        changeView("admin");
         const [adminAccountsRes, adminRentalsRes, usersRes, auditRes, publicAccountsRes, refundReasonCodesRes] = await Promise.all([
           api.adminAccounts(),
           api.adminRentals(buildAdminRentalsQuery(adminRentalsPage, adminRentalFilters)),
@@ -321,7 +402,7 @@ export default function App() {
 
   useEffect(() => {
     if (!rentals.length) {
-      setSelectedRentalId(null);
+      selectRental(null);
       return;
     }
     if (selectedRentalId && rentals.some((item) => item.id === selectedRentalId)) {
@@ -332,21 +413,89 @@ export default function App() {
       rentals.find((item) => item.status === RENTAL_STATUS_WAITING_PAYMENT) ??
       rentals.find((item) => item.status === RENTAL_STATUS_ACTIVE) ??
       rentals[0];
-    setSelectedRentalId(nextRental.id);
-  }, [rentals, selectedRentalId]);
+    selectRental(nextRental.id);
+  }, [rentals, selectedRentalId, selectRental]);
 
   useEffect(() => {
-    setCredentials(null);
-    setCredentialsError(null);
     setWalletPaymentError(null);
   }, [selectedRentalId]);
 
   useEffect(() => {
     if (!selectedRental || !canRequestCredentials(selectedRental, selectedRentalPayment)) {
-      setCredentials(null);
-      setCredentialsError(null);
+      invalidateCredentialRequest();
     }
-  }, [selectedRental, selectedRentalPayment]);
+  }, [invalidateCredentialRequest, selectedRental, selectedRentalPayment]);
+
+  useEffect(() => {
+    invalidateCredentialRequest();
+  }, [invalidateCredentialRequest, user?.id]);
+
+  // 60-second auto-clear timer for credentials
+  useEffect(() => {
+    if (!credentials) return;
+    const timer = window.setTimeout(() => {
+      invalidateCredentialRequest();
+    }, 60000); // 60 seconds
+
+    return () => window.clearTimeout(timer);
+  }, [credentials, invalidateCredentialRequest]);
+
+  // Reactive rental expiry check
+  useEffect(() => {
+    if (!credentials || !selectedRental) return;
+
+    if (isRentalExpiredByTime(selectedRental)) {
+      invalidateCredentialRequest();
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      if (isRentalExpiredByTime(selectedRental)) {
+        invalidateCredentialRequest();
+      }
+    }, 1000); // check every second
+
+    return () => window.clearInterval(interval);
+  }, [credentials, invalidateCredentialRequest, selectedRental]);
+
+  useEffect(() => {
+    if (!selectedRental) return;
+    let timer: number | undefined;
+    const scheduleExpiryInvalidation = () => {
+      const expiresIn = new Date(selectedRental.expires_at).getTime() - Date.now();
+      if (expiresIn <= 0) {
+        invalidateCredentialRequest();
+        return;
+      }
+      timer = window.setTimeout(scheduleExpiryInvalidation, Math.min(expiresIn, 2_147_483_647));
+    };
+    scheduleExpiryInvalidation();
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [invalidateCredentialRequest, selectedRental]);
+
+  // Clear credentials on navigation (view changes)
+  useEffect(() => {
+    invalidateCredentialRequest();
+  }, [invalidateCredentialRequest, view]);
+
+  // Clear credentials on unmount and register security event listeners (tab switch / blur)
+  useEffect(() => {
+    const handleClearCredentials = () => {
+      invalidateCredentialRequest();
+    };
+
+    window.addEventListener("blur", handleClearCredentials);
+    document.addEventListener("visibilitychange", handleClearCredentials);
+
+    return () => {
+      mountedRef.current = false;
+      window.removeEventListener("blur", handleClearCredentials);
+      document.removeEventListener("visibilitychange", handleClearCredentials);
+      invalidateCredentialRequest(false);
+    };
+  }, [invalidateCredentialRequest]);
 
   useEffect(() => {
     if (!user || adminMode || !hasWaitingPaymentRental) {
@@ -370,12 +519,12 @@ export default function App() {
     try {
       const rental = await api.createRental({ account_id: account.id, duration_hours: duration });
       setRentals((current) => [rental, ...current]);
-      setSelectedRentalId(rental.id);
+      selectRental(rental.id);
       setCredentials(null);
       setCredentialsError(null);
       setAccounts((current) => current.map((item) => (item.id === account.id ? { ...item, status: "Reserved" } : item)));
       setSelectedAccount(null);
-      setView("rentals");
+      changeView("rentals");
       await refreshRentalData({ silent: true });
       setToast({ type: "ok", message: "Аренда создана" });
     } catch (error) {
@@ -385,24 +534,11 @@ export default function App() {
     }
   }
 
-  async function handleExtend(rental: Rental) {
-    try {
-      await api.extendRental(rental.id, 1);
-      setRentals((current) =>
-        current.map((item) =>
-          item.id === rental.id ? { ...item, expires_at: new Date(new Date(item.expires_at).getTime() + 3600000).toISOString() } : item
-        )
-      );
-      setToast({ type: "ok", message: "Аренда продлена на 1 час" });
-    } catch (error) {
-      setToast({ type: "error", message: error instanceof Error ? error.message : "Не удалось продлить аренду" });
-    }
-  }
-
   async function handleCancel(rental: Rental) {
     try {
       await api.cancelRental(rental.id);
-      setRentals((current) => current.map((item) => (item.id === rental.id ? { ...item, status: RENTAL_STATUS_CANCELLED } : item)));
+      const [, accountsRes] = await Promise.all([refreshRentalData({ silent: true }), api.accounts({ page: 1, page_size: 40 })]);
+      setAccounts(asList(accountsRes.accounts).map(normalizeAccount));
       if (selectedRentalId === rental.id) {
         setCredentials(null);
         setCredentialsError(null);
@@ -416,26 +552,49 @@ export default function App() {
   async function handleLoadCredentials(rental: Rental) {
     const payment = findPaymentForRental(payments, rental.id);
     if (!canRequestCredentials(rental, payment)) {
-      setCredentials(null);
+      invalidateCredentialRequest();
       setCredentialsError("Credentials are unavailable until the rental is active and paid.");
       return;
     }
 
-    setSelectedRentalId(rental.id);
+    selectRental(rental.id);
+    const controller = new AbortController();
+    credentialRequestRef.current = controller;
+    const generation = credentialGenerationRef.current;
+    const requestUserID = currentUserIDRef.current;
     setCredentialsLoading(true);
     setCredentialsError(null);
     try {
-      const nextCredentials = await api.rentalCredentials(rental.id);
+      const nextCredentials = await api.rentalCredentials(rental.id, controller.signal);
+      const currentRental = rentalsRef.current.find((item) => item.id === rental.id);
+      const currentPayment = findPaymentForRental(paymentsRef.current, rental.id);
+      if (
+        controller.signal.aborted ||
+        credentialGenerationRef.current !== generation ||
+        currentUserIDRef.current !== requestUserID ||
+        currentViewRef.current !== "rentals" ||
+        selectedRentalIDRef.current !== rental.id ||
+        !currentRental ||
+        !canRequestCredentials(currentRental, currentPayment)
+      ) {
+        return;
+      }
       setCredentials(nextCredentials);
     } catch (error) {
+      if (controller.signal.aborted || credentialGenerationRef.current !== generation) {
+        return;
+      }
       if (isUnauthorized(error)) {
         handleAuthFailure();
         return;
       }
-      setCredentials(null);
+      invalidateCredentialRequest();
       setCredentialsError(messageForApiError(error, "Failed to load credentials"));
     } finally {
-      setCredentialsLoading(false);
+      if (credentialGenerationRef.current === generation && mountedRef.current) {
+        credentialRequestRef.current = null;
+        setCredentialsLoading(false);
+      }
     }
   }
 
@@ -444,7 +603,7 @@ export default function App() {
       return;
     }
 
-    setSelectedRentalId(rental.id);
+    selectRental(rental.id);
     setWalletPaymentLoadingRentalId(rental.id);
     setWalletPaymentError(null);
 
@@ -498,19 +657,6 @@ export default function App() {
       setNotifications((current) => current.map((notification) => (notification.id === item.id ? { ...notification, read: true } : notification)));
     } catch (error) {
       setToast({ type: "error", message: error instanceof Error ? error.message : "Не удалось отметить уведомление" });
-    }
-  }
-
-  async function handleToggleAccount(account: Account) {
-    const enable = account.status === "Disabled";
-    const nextStatus = enable ? 2 : 6;
-    try {
-      await api.adminUpdateAccount(account.id, { status: nextStatus });
-      setAccounts((current) => current.map((item) => (item.id === account.id ? { ...item, status: statusFromNumber(nextStatus) } : item)));
-      setToast({ type: "ok", message: enable ? "Аккаунт включен" : "Аккаунт отключен" });
-    } catch (error) {
-      setToast({ type: "error", message: error instanceof Error ? error.message : "Не удалось изменить статус аккаунта" });
-      throw error;
     }
   }
 
@@ -582,7 +728,6 @@ export default function App() {
           item.id === account.id
             ? {
                 ...item,
-                status: patch.status === undefined ? item.status : statusFromNumber(patch.status),
                 price_per_hour:
                   patch.price_per_hour === undefined ? item.price_per_hour : { ...item.price_per_hour, amount: patch.price_per_hour },
                 security_deposit:
@@ -601,7 +746,7 @@ export default function App() {
     }
   }
 
-  async function handleUpdateAdminUser(targetUser: User, patch: { trust_score?: number; is_blocked?: boolean; balance?: number; role?: string }) {
+  async function handleUpdateAdminUser(targetUser: User, patch: AdminUserPatch) {
     setLoading(true);
     try {
       await api.adminUpdateUser(targetUser.id, patch);
@@ -613,6 +758,22 @@ export default function App() {
       await loadPrivateData();
     } catch (error) {
       setToast({ type: "error", message: error instanceof Error ? error.message : "Не удалось обновить пользователя" });
+      throw error;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleAdminBalanceAdjustment(targetUser: User, input: AdminBalanceAdjustmentInput): Promise<AdminBalanceAdjustmentResponse> {
+    setLoading(true);
+    try {
+      const result = await api.adminAdjustBalance(targetUser.id, input);
+      setAdminUsers((current) => current.map((item) => (item.id === targetUser.id ? { ...item, balance: result.new_balance } : item)));
+      setToast({ type: "ok", message: `Balance adjusted to ${result.new_balance} ${result.currency}` });
+      void loadPrivateData();
+      return result;
+    } catch (error) {
+      setToast({ type: "error", message: error instanceof Error ? error.message : "Failed to adjust user balance" });
       throw error;
     } finally {
       setLoading(false);
@@ -669,37 +830,81 @@ export default function App() {
     await refreshAdminRentals(1, DEFAULT_ADMIN_RENTAL_FILTERS);
   }
 
+  async function refreshAdminRentalDetail(rentalId: number) {
+    setAdminRentalDetailLoading(true);
+    setAdminRentalDetailError(null);
+    try {
+      const result = await api.adminRentalDetail(rentalId);
+      setAdminRentalDetail(result);
+      setOpenAdminRentalDetailId(rentalId);
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        handleAuthFailure();
+        return;
+      }
+      setAdminRentalDetail(null);
+      setAdminRentalDetailError(messageForApiError(error, "Failed to load admin rental detail"));
+      throw error;
+    } finally {
+      setAdminRentalDetailLoading(false);
+    }
+  }
+
+  async function handleOpenAdminRentalDetail(rentalId: number) {
+    setOpenAdminRentalDetailId(rentalId);
+    await refreshAdminRentalDetail(rentalId);
+  }
+
+  function handleCloseAdminRentalDetail() {
+    setOpenAdminRentalDetailId(null);
+    setAdminRentalDetail(null);
+    setAdminRentalDetailError(null);
+    setAdminRentalDetailLoading(false);
+  }
+
   async function handleAdminWalletRefund(rentalId: number, reasonCode: string): Promise<AdminWalletRefundResponse> {
     try {
       const result = await api.adminWalletRefund(rentalId, reasonCode);
       await refreshAdminRentals();
+      if (openAdminRentalDetailId === rentalId) {
+        await refreshAdminRentalDetail(rentalId).catch(() => undefined);
+      }
       return result;
     } catch (error) {
       if (isUnauthorized(error)) {
         handleAuthFailure();
       } else if (isApiError(error) && (error.status === 404 || error.status === 409)) {
         await refreshAdminRentals().catch(() => undefined);
+        if (openAdminRentalDetailId === rentalId) {
+          await refreshAdminRentalDetail(rentalId).catch(() => undefined);
+        }
       }
       throw error;
     }
   }
 
   async function handleLogout() {
+    invalidateCredentialRequest();
     const refresh = getRefreshToken();
-    clearTokens();
-    clearPrivateState();
-    setView("catalog");
-    if (refresh) {
-      void api.logout(refresh).catch(() => undefined);
+    setLoading(true);
+    try {
+      if (refresh) await api.logout(refresh);
+    } catch {
+      // Local logout must still complete if server revocation is unavailable.
+    } finally {
+      clearTokens();
+      clearPrivateState();
+      changeView("catalog");
+      setLoading(false);
+      setToast({ type: "ok", message: "Сессия завершена" });
     }
-    setToast({ type: "ok", message: "Сессия завершена" });
   }
 
   const effectiveView = adminMode ? "admin" : view;
 
   return (
     <div className="app-shell">
-      <AppHeader adminMode={adminMode} onLogin={() => setAuthOpen(true)} onLogout={handleLogout} setView={setView} user={user} view={effectiveView} />
+      <AppHeader adminMode={adminMode} onLogin={() => setAuthOpen(true)} onLogout={handleLogout} setView={changeView} user={user} view={effectiveView} />
 
       {backendError && (
         <div className="offline-banner">
@@ -716,8 +921,7 @@ export default function App() {
             duration={duration}
             loading={loading}
             maxPrice={maxPrice}
-            onExtendActive={handleExtend}
-            onOpenRentals={() => setView("rentals")}
+            onOpenRentals={() => changeView("rentals")}
             search={search}
             selectAccount={setSelectedAccount}
             setDuration={setDuration}
@@ -736,11 +940,10 @@ export default function App() {
             credentialsError={credentialsError}
             credentialsLoading={credentialsLoading}
             onCancel={handleCancel}
-            onExtend={handleExtend}
             onLoadCredentials={handleLoadCredentials}
             onPayWithBalance={handlePayWithBalance}
             onRefreshStatus={() => refreshRentalData()}
-            onSelectRental={setSelectedRentalId}
+            onSelectRental={selectRental}
             payments={payments}
             rentals={rentals}
             rentalsRefreshing={rentalsRefreshing}
@@ -756,6 +959,9 @@ export default function App() {
         {effectiveView === "admin" && (
           <AdminView
             accounts={accounts}
+            adminRentalDetail={adminRentalDetail}
+            adminRentalDetailError={adminRentalDetailError}
+            adminRentalDetailLoading={adminRentalDetailLoading}
             adminRentals={adminRentals}
             adminRentalFilters={adminRentalFilters}
             adminRentalsError={adminRentalsError}
@@ -764,8 +970,10 @@ export default function App() {
             adminRentalsSummary={adminRentalsSummary}
             refundReasonOptions={adminRefundReasonCodes}
             auditLogs={auditLogs}
+            onCloseAdminRentalDetail={handleCloseAdminRentalDetail}
             onAdminRentalFiltersChange={handleAdminRentalFiltersChange}
             onAdminRentalFiltersReset={handleAdminRentalFiltersReset}
+            onAdjustBalance={handleAdminBalanceAdjustment}
             onCreateAccount={handleCreateAccount}
             onNextRefundPage={() => {
               if (!adminRentalsPagination || adminRentalsPage >= adminRentalsPagination.total_pages) {
@@ -779,9 +987,9 @@ export default function App() {
               }
               return refreshAdminRentals(adminRentalsPage - 1);
             }}
+            onOpenAdminRentalDetail={handleOpenAdminRentalDetail}
             onWalletRefund={handleAdminWalletRefund}
             onSync={handleSyncAccount}
-            onToggleAccount={handleToggleAccount}
             onUpdateAccount={handleUpdateAccount}
             onUpdateUser={handleUpdateAdminUser}
             user={user}
@@ -790,7 +998,7 @@ export default function App() {
         )}
       </main>
 
-      {!adminMode && <MobileNav setView={setView} view={effectiveView} />}
+      {!adminMode && <MobileNav setView={changeView} view={effectiveView} />}
 
       {selectedAccount && (
         <CheckoutDrawer
@@ -808,7 +1016,7 @@ export default function App() {
           onAuthenticated={(nextUser) => {
             setUser(nextUser);
             setAuthOpen(false);
-            setView(nextUser.role === "ADMIN" ? "admin" : "rentals");
+            changeView(nextUser.role === "ADMIN" ? "admin" : "rentals");
             void loadPrivateData();
           }}
           onClose={() => setAuthOpen(false)}

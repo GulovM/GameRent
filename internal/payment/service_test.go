@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,7 +14,9 @@ import (
 type mockRepository struct {
 	mu sync.Mutex
 
-	withinTxErr error
+	withinTxErr       error
+	currentAdminErr   error
+	currentAdminCalls int
 
 	statesByID                    map[int64]*WebhookPaymentState
 	statesByExt                   map[string]*WebhookPaymentState
@@ -22,8 +25,11 @@ type mockRepository struct {
 	settlementStatesByRental      map[int64]*DepositSettlementState
 	settlementEligibilityByRental map[int64]*DepositSettlementEligibility
 	refundsByKey                  map[string]*RefundRecord
+	adjustmentsByKey              map[string]*AdminBalanceAdjustmentResult
+	adjustmentBalances            map[int64]int64
 	adminRentals                  []AdminRentalEntry
 	adminRentalSummary            AdminRentalSummary
+	adminRentalDetail             *AdminRentalDetail
 
 	markPaymentErr error
 	activateErr    error
@@ -49,14 +55,15 @@ type mockRepository struct {
 	refundCreateCalls   int
 	refundCompleteCalls int
 
-	providerLedgerEntries []FinancialLedgerEntry
-	balanceDebitEntries   []FinancialLedgerEntry
-	balanceRefundEntries  []FinancialLedgerEntry
-	depositHolds          []DepositHold
-	depositLedgerEntries  []FinancialLedgerEntry
-	depositReleaseEntries []FinancialLedgerEntry
-	depositForfeitEntries []FinancialLedgerEntry
-	depositRefundEntries  []FinancialLedgerEntry
+	providerLedgerEntries   []FinancialLedgerEntry
+	balanceDebitEntries     []FinancialLedgerEntry
+	balanceRefundEntries    []FinancialLedgerEntry
+	depositHolds            []DepositHold
+	depositLedgerEntries    []FinancialLedgerEntry
+	depositReleaseEntries   []FinancialLedgerEntry
+	depositForfeitEntries   []FinancialLedgerEntry
+	depositRefundEntries    []FinancialLedgerEntry
+	adjustmentLedgerRecords []AdminBalanceAdjustmentRecord
 }
 
 func newMockRepository(state *WebhookPaymentState) *mockRepository {
@@ -68,6 +75,8 @@ func newMockRepository(state *WebhookPaymentState) *mockRepository {
 		settlementStatesByRental:      map[int64]*DepositSettlementState{},
 		settlementEligibilityByRental: map[int64]*DepositSettlementEligibility{},
 		refundsByKey:                  map[string]*RefundRecord{},
+		adjustmentsByKey:              map[string]*AdminBalanceAdjustmentResult{},
+		adjustmentBalances:            map[int64]int64{},
 	}
 	if state != nil {
 		repo.statesByID[state.PaymentID] = cloneWebhookState(state)
@@ -110,6 +119,8 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 	snapshotSettlementStates := make(map[int64]*DepositSettlementState, len(m.settlementStatesByRental))
 	snapshotSettlementEligibility := make(map[int64]*DepositSettlementEligibility, len(m.settlementEligibilityByRental))
 	snapshotRefundsByKey := make(map[string]*RefundRecord, len(m.refundsByKey))
+	snapshotAdjustmentsByKey := make(map[string]*AdminBalanceAdjustmentResult, len(m.adjustmentsByKey))
+	snapshotAdjustmentBalances := make(map[int64]int64, len(m.adjustmentBalances))
 	snapshotProviderLedger := append([]FinancialLedgerEntry(nil), m.providerLedgerEntries...)
 	snapshotBalanceDebitLedger := append([]FinancialLedgerEntry(nil), m.balanceDebitEntries...)
 	snapshotBalanceRefundLedger := append([]FinancialLedgerEntry(nil), m.balanceRefundEntries...)
@@ -118,6 +129,7 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 	snapshotDepositRelease := append([]FinancialLedgerEntry(nil), m.depositReleaseEntries...)
 	snapshotDepositForfeit := append([]FinancialLedgerEntry(nil), m.depositForfeitEntries...)
 	snapshotDepositRefund := append([]FinancialLedgerEntry(nil), m.depositRefundEntries...)
+	snapshotAdjustmentLedger := append([]AdminBalanceAdjustmentRecord(nil), m.adjustmentLedgerRecords...)
 	for id, state := range m.statesByID {
 		snapshotByID[id] = cloneWebhookState(state)
 	}
@@ -144,6 +156,13 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 		cp := *record
 		snapshotRefundsByKey[key] = &cp
 	}
+	for key, record := range m.adjustmentsByKey {
+		cp := *record
+		snapshotAdjustmentsByKey[key] = &cp
+	}
+	for userID, balance := range m.adjustmentBalances {
+		snapshotAdjustmentBalances[userID] = balance
+	}
 	m.mu.Unlock()
 
 	if m.withinTxErr != nil {
@@ -160,6 +179,8 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 		m.settlementStatesByRental = snapshotSettlementStates
 		m.settlementEligibilityByRental = snapshotSettlementEligibility
 		m.refundsByKey = snapshotRefundsByKey
+		m.adjustmentsByKey = snapshotAdjustmentsByKey
+		m.adjustmentBalances = snapshotAdjustmentBalances
 		m.providerLedgerEntries = snapshotProviderLedger
 		m.balanceDebitEntries = snapshotBalanceDebitLedger
 		m.balanceRefundEntries = snapshotBalanceRefundLedger
@@ -168,9 +189,17 @@ func (m *mockRepository) WithinTransaction(ctx context.Context, fn func(ctx cont
 		m.depositReleaseEntries = snapshotDepositRelease
 		m.depositForfeitEntries = snapshotDepositForfeit
 		m.depositRefundEntries = snapshotDepositRefund
+		m.adjustmentLedgerRecords = snapshotAdjustmentLedger
 		m.mu.Unlock()
 	}
 	return err
+}
+
+func (m *mockRepository) RequireCurrentAdmin(_ context.Context, _ int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentAdminCalls++
+	return m.currentAdminErr
 }
 
 func (m *mockRepository) LockWalletPaymentState(ctx context.Context, rentalID, userID int64) (*WalletPaymentState, error) {
@@ -399,6 +428,13 @@ func (m *mockRepository) ListAdminRentalEntries(ctx context.Context, filters Adm
 
 func (m *mockRepository) SummarizeAdminRentals(ctx context.Context, filters AdminRentalListFilter) (AdminRentalSummary, error) {
 	return m.adminRentalSummary, nil
+}
+
+func (m *mockRepository) GetAdminRentalDetail(ctx context.Context, rentalID int64) (*AdminRentalDetail, error) {
+	if m.adminRentalDetail == nil {
+		return nil, ErrAdminRentalNotFound
+	}
+	return m.adminRentalDetail, nil
 }
 
 func (m *mockRepository) LockWalletRefundState(ctx context.Context, rentalID int64) (*WalletRefundState, error) {
@@ -824,18 +860,6 @@ func (m *mockRepository) InsertAuditLog(ctx context.Context, actorUserID int64, 
 	return nil
 }
 
-func (m *mockRepository) UpdatePaymentSuccess(ctx context.Context, paymentID int64, extTxID string) (int64, int64, int64, string, error) {
-	return 0, 0, 0, "", nil
-}
-
-func (m *mockRepository) ActivateRental(ctx context.Context, rentalID int64) (int64, error) {
-	return 0, nil
-}
-
-func (m *mockRepository) MarkAccountRented(ctx context.Context, accountID int64) (string, []byte, string, error) {
-	return "", nil, "", nil
-}
-
 func (m *mockRepository) CreatePendingPayment(ctx context.Context, rentalID, userID int64, amount int64, currency string) (int64, error) {
 	return 0, nil
 }
@@ -846,6 +870,86 @@ func (m *mockRepository) LogSecurityEvent(ctx context.Context, userID, accountID
 	}
 	m.mu.Lock()
 	m.logCalls++
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *mockRepository) LockBalanceAdjustmentKey(ctx context.Context, canonicalKey string) error {
+	return nil
+}
+
+func (m *mockRepository) GetAdminBalanceAdjustment(ctx context.Context, canonicalKey string) (*AdminBalanceAdjustmentResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record, ok := m.adjustmentsByKey[canonicalKey]
+	if !ok {
+		return nil, ErrBalanceAdjustmentNotFound
+	}
+	cp := *record
+	return &cp, nil
+}
+
+func (m *mockRepository) LockAdminAndUserBalanceForAdjustment(ctx context.Context, actorUserID, userID int64) (*UserBalance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if actorUserID <= 0 {
+		return nil, ErrAdminRequired
+	}
+	balance, ok := m.adjustmentBalances[userID]
+	if !ok {
+		return nil, ErrFinancialUserNotFound
+	}
+	return &UserBalance{UserID: userID, AvailableBalance: balance, Currency: "USD"}, nil
+}
+
+func (m *mockRepository) InsertAdminBalanceAdjustmentLedger(ctx context.Context, record AdminBalanceAdjustmentRecord) (int64, time.Time, error) {
+	if m.ledgerErr != nil {
+		return 0, time.Time{}, m.ledgerErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entryType := ledgerEntryAdminBalanceCredit
+	if record.Amount < 0 {
+		entryType = ledgerEntryAdminBalanceDebit
+	}
+	id := int64(1000 + len(m.adjustmentsByKey) + 1)
+	createdAt := time.Now().UTC()
+	m.adjustmentLedgerRecords = append(m.adjustmentLedgerRecords, record)
+	m.adjustmentsByKey[record.CanonicalIdempotencyKey] = &AdminBalanceAdjustmentResult{
+		AdjustmentID:            id,
+		LedgerEntryID:           id,
+		ActorUserID:             record.ActorUserID,
+		UserID:                  record.TargetUserID,
+		PreviousBalance:         record.PreviousBalance,
+		NewBalance:              record.NewBalance,
+		Amount:                  record.Amount,
+		Currency:                record.Currency,
+		ReasonCode:              record.ReasonCode,
+		Comment:                 record.Comment,
+		IdempotencyKey:          record.ClientIdempotencyKey,
+		CanonicalIdempotencyKey: record.CanonicalIdempotencyKey,
+		CreatedAt:               createdAt,
+		entryType:               entryType,
+	}
+	return id, createdAt, nil
+}
+
+func (m *mockRepository) SetUserBalance(ctx context.Context, userID, balance int64, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.adjustmentBalances[userID]; !ok {
+		return ErrFinancialUserNotFound
+	}
+	m.adjustmentBalances[userID] = balance
+	return nil
+}
+
+func (m *mockRepository) LogAdminBalanceAdjustmentSecurityEvent(ctx context.Context, targetUserID int64, clientIP, userAgent string, metadata []byte) error {
+	if m.logErr != nil {
+		return m.logErr
+	}
+	m.mu.Lock()
+	m.securityEventCalls++
 	m.mu.Unlock()
 	return nil
 }
@@ -896,6 +1000,18 @@ func seedWalletRefundState(repo *mockRepository, state *WalletRefundState) {
 	}
 }
 
+func providerWebhookRequest(paymentID, rentalID, amount int64, currency, externalTransactionID string) WebhookRequest {
+	return WebhookRequest{
+		PaymentID:             strconv.FormatInt(paymentID, 10),
+		RentalID:              strconv.FormatInt(rentalID, 10),
+		ExternalTransactionID: externalTransactionID,
+		Provider:              webhookPaymentProvider,
+		Amount:                amount,
+		Currency:              currency,
+		Status:                "success",
+	}
+}
+
 func TestPaymentService_ProcessWebhook_FirstSuccessActivatesRental(t *testing.T) {
 	repo := newMockRepository(&WebhookPaymentState{
 		PaymentID:        101,
@@ -914,11 +1030,7 @@ func TestPaymentService_ProcessWebhook_FirstSuccessActivatesRental(t *testing.T)
 	})
 	service := NewPaymentService(repo)
 
-	res, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "101",
-		ExternalTransactionID: "ext-tx-1",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	res, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(101, 202, 1500, "USD", "ext-tx-1"), "127.0.0.1", "Go-Test")
 	if err != nil {
 		t.Fatalf("ProcessWebhook failed: %v", err)
 	}
@@ -967,11 +1079,7 @@ func TestPaymentService_ProcessWebhook_DuplicateReplayIsIdempotent(t *testing.T)
 	})
 	service := NewPaymentService(repo)
 
-	res, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "101",
-		ExternalTransactionID: "ext-tx-dup",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	res, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(101, 202, 1500, "USD", "ext-tx-dup"), "127.0.0.1", "Go-Test")
 	if err != nil {
 		t.Fatalf("duplicate webhook should be idempotent: %v", err)
 	}
@@ -986,7 +1094,7 @@ func TestPaymentService_ProcessWebhook_DuplicateReplayIsIdempotent(t *testing.T)
 	}
 }
 
-func TestPaymentService_ProcessWebhook_PaymentIDTakesPrecedenceOverExternalTransactionLookup(t *testing.T) {
+func TestPaymentService_ProcessWebhook_ConflictingIdentifiersAreRejected(t *testing.T) {
 	repo := newMockRepository(&WebhookPaymentState{
 		PaymentID:        151,
 		RentalID:         252,
@@ -1020,24 +1128,13 @@ func TestPaymentService_ProcessWebhook_PaymentIDTakesPrecedenceOverExternalTrans
 	}
 	service := NewPaymentService(repo)
 
-	res, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "151",
-		ExternalTransactionID: "unrelated-ext",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
-	if err != nil {
-		t.Fatalf("ProcessWebhook failed: %v", err)
+	res, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(151, 252, 1500, "USD", "unrelated-ext"), "127.0.0.1", "Go-Test")
+	if !errors.Is(err, ErrWebhookIdentifierMismatch) || res != nil {
+		t.Fatalf("expected identifier conflict, got result=%+v err=%v", res, err)
 	}
-	if res.PaymentID != 151 || res.RentalID != 252 || res.AccountID != 454 || !res.Processed || res.Idempotent {
-		t.Fatalf("unexpected result when payment_id should win lookup: %+v", res)
-	}
-
 	state := repo.statesByID[151]
-	if state.Status != 2 || state.ExternalTransactionID != "unrelated-ext" {
-		t.Fatalf("expected payment selected by payment_id to be updated, got %+v", state)
-	}
-	if other := repo.statesByExt["unrelated-ext"]; other == nil || other.PaymentID != 151 {
-		t.Fatalf("expected external transaction mapping to point at the selected payment, got %+v", other)
+	if state.Status != 1 || state.ExternalTransactionID != "" || repo.markPaymentCalls != 0 {
+		t.Fatalf("identifier conflict mutated payment: %+v", state)
 	}
 }
 
@@ -1059,11 +1156,7 @@ func TestPaymentService_ProcessWebhook_ZeroDepositSkipsDepositRecords(t *testing
 	})
 	service := NewPaymentService(repo)
 
-	_, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "111",
-		ExternalTransactionID: "ext-zero-deposit",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(111, 222, 500, "USD", "ext-zero-deposit"), "127.0.0.1", "Go-Test")
 	if err != nil {
 		t.Fatalf("ProcessWebhook failed: %v", err)
 	}
@@ -1094,11 +1187,7 @@ func TestPaymentService_ProcessWebhook_RollbackOnLedgerFailure(t *testing.T) {
 	repo.ledgerErr = errors.New("ledger insert failed")
 	service := NewPaymentService(repo)
 
-	_, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "121",
-		ExternalTransactionID: "ext-ledger-rb",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(121, 222, 1500, "USD", "ext-ledger-rb"), "127.0.0.1", "Go-Test")
 	if err == nil {
 		t.Fatalf("expected ledger failure")
 	}
@@ -1109,6 +1198,38 @@ func TestPaymentService_ProcessWebhook_RollbackOnLedgerFailure(t *testing.T) {
 	}
 	if len(repo.providerLedgerEntries) != 0 || len(repo.depositHolds) != 0 || len(repo.depositLedgerEntries) != 0 {
 		t.Fatalf("expected rollback to remove financial records, got provider=%d holds=%d deposit=%d", len(repo.providerLedgerEntries), len(repo.depositHolds), len(repo.depositLedgerEntries))
+	}
+}
+
+func TestPaymentService_ProcessWebhook_RollbackOnSecurityEventFailure(t *testing.T) {
+	repo := newMockRepository(&WebhookPaymentState{
+		PaymentID:        125,
+		RentalID:         225,
+		UserID:           325,
+		AccountID:        425,
+		Provider:         webhookPaymentProvider,
+		Status:           1,
+		Amount:           1500,
+		Currency:         "USD",
+		RentalPrice:      500,
+		DepositAmount:    1000,
+		PaymentExpiresAt: time.Now().Add(time.Hour),
+		RentalStatus:     1,
+		AccountStatus:    3,
+	})
+	repo.logErr = errors.New("security event insert failed")
+	service := NewPaymentService(repo)
+
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(125, 225, 1500, "USD", "ext-security-rb"), "127.0.0.1", "Go-Test")
+	if err == nil {
+		t.Fatal("expected security event failure")
+	}
+	state := repo.statesByID[125]
+	if state.Status != 1 || state.RentalStatus != 1 || state.AccountStatus != 3 || state.ExternalTransactionID != "" {
+		t.Fatalf("security event failure did not roll back lifecycle state: %+v", state)
+	}
+	if len(repo.providerLedgerEntries) != 0 || len(repo.depositHolds) != 0 || len(repo.depositLedgerEntries) != 0 {
+		t.Fatalf("security event failure did not roll back financial facts provider=%d holds=%d deposit=%d", len(repo.providerLedgerEntries), len(repo.depositHolds), len(repo.depositLedgerEntries))
 	}
 }
 
@@ -1130,11 +1251,7 @@ func TestPaymentService_ProcessWebhook_FinancialMetadataIsSanitized(t *testing.T
 	})
 	service := NewPaymentService(repo)
 
-	_, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "131",
-		ExternalTransactionID: "ext-metadata",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(131, 232, 1500, "USD", "ext-metadata"), "127.0.0.1", "Go-Test")
 	if err != nil {
 		t.Fatalf("ProcessWebhook failed: %v", err)
 	}
@@ -1145,6 +1262,84 @@ func TestPaymentService_ProcessWebhook_FinancialMetadataIsSanitized(t *testing.T
 		if strings.Contains(metadata, forbidden) {
 			t.Fatalf("financial metadata contains forbidden term %q: %s", forbidden, metadata)
 		}
+	}
+}
+
+func TestPaymentService_ProcessWebhook_BindsProviderIdentifiersAndFinancialFacts(t *testing.T) {
+	baseState := WebhookPaymentState{
+		PaymentID:        171,
+		RentalID:         272,
+		UserID:           373,
+		AccountID:        474,
+		Provider:         webhookPaymentProvider,
+		Status:           1,
+		Amount:           1500,
+		Currency:         "USD",
+		RentalPrice:      500,
+		DepositAmount:    1000,
+		PaymentExpiresAt: time.Now().Add(time.Hour),
+		RentalStatus:     1,
+		AccountStatus:    3,
+	}
+	tests := []struct {
+		name     string
+		request  WebhookRequest
+		expected error
+		mutateDB func(*WebhookPaymentState)
+	}{
+		{name: "wrong rental", request: providerWebhookRequest(171, 999, 1500, "USD", "bound-ext-1"), expected: ErrWebhookIdentifierMismatch},
+		{name: "wrong amount", request: providerWebhookRequest(171, 272, 1499, "USD", "bound-ext-2"), expected: ErrWebhookFinancialMismatch},
+		{name: "wrong currency", request: providerWebhookRequest(171, 272, 1500, "EUR", "bound-ext-3"), expected: ErrWebhookFinancialMismatch},
+		{name: "missing external id", request: providerWebhookRequest(171, 272, 1500, "USD", ""), expected: ErrWebhookInvalidPayload},
+		{name: "unsupported request provider", request: func() WebhookRequest {
+			r := providerWebhookRequest(171, 272, 1500, "USD", "bound-ext-4")
+			r.Provider = "balance"
+			return r
+		}(), expected: ErrWebhookInvalidPayload},
+		{name: "wallet payment", request: providerWebhookRequest(171, 272, 1500, "USD", "bound-ext-5"), expected: ErrWebhookProviderUnsupported, mutateDB: func(state *WebhookPaymentState) { state.Provider = walletPaymentProvider }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := baseState
+			if tt.mutateDB != nil {
+				tt.mutateDB(&state)
+			}
+			repo := newMockRepository(&state)
+			result, err := NewPaymentService(repo).ProcessWebhook(context.Background(), tt.request, "127.0.0.1", "Go-Test")
+			if !errors.Is(err, tt.expected) || result != nil {
+				t.Fatalf("expected %v, got result=%+v err=%v", tt.expected, result, err)
+			}
+			if repo.markPaymentCalls != 0 || repo.activateCalls != 0 || repo.rentCalls != 0 || repo.providerLedgerCalls != 0 || repo.depositHoldCalls != 0 {
+				t.Fatalf("mismatched webhook mutated state: %+v", repo.statesByID[171])
+			}
+		})
+	}
+}
+
+func TestPaymentService_ProcessWebhook_FinalReplayRequiresExactExternalTransaction(t *testing.T) {
+	state := &WebhookPaymentState{
+		PaymentID:             181,
+		RentalID:              282,
+		UserID:                383,
+		AccountID:             484,
+		Provider:              webhookPaymentProvider,
+		ExternalTransactionID: "original-ext",
+		Status:                2,
+		Amount:                1500,
+		Currency:              "USD",
+		RentalPrice:           500,
+		DepositAmount:         1000,
+		PaymentExpiresAt:      time.Now().Add(time.Hour),
+		RentalStatus:          2,
+		AccountStatus:         4,
+	}
+	repo := newMockRepository(state)
+	result, err := NewPaymentService(repo).ProcessWebhook(context.Background(), providerWebhookRequest(181, 282, 1500, "USD", "different-ext"), "127.0.0.1", "Go-Test")
+	if !errors.Is(err, ErrWebhookExternalTxMismatch) || result != nil {
+		t.Fatalf("expected exact replay mismatch, got result=%+v err=%v", result, err)
+	}
+	if repo.markPaymentCalls != 0 || repo.providerLedgerCalls != 0 || repo.depositHoldCalls != 0 {
+		t.Fatal("conflicting final replay created financial state")
 	}
 }
 
@@ -1727,17 +1922,15 @@ func TestPaymentService_ProcessWebhook_ExpiredReservationRejected(t *testing.T) 
 		Status:           1,
 		Amount:           1500,
 		Currency:         "USD",
+		RentalPrice:      500,
+		DepositAmount:    1000,
 		PaymentExpiresAt: time.Now().Add(-time.Minute),
 		RentalStatus:     1,
 		AccountStatus:    3,
 	})
 	service := NewPaymentService(repo)
 
-	_, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "101",
-		ExternalTransactionID: "ext-expired",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(101, 202, 1500, "USD", "ext-expired"), "127.0.0.1", "Go-Test")
 	if !errors.Is(err, ErrRentalNotEligible) {
 		t.Fatalf("expected expiry rejection, got %v", err)
 	}
@@ -1756,17 +1949,15 @@ func TestPaymentService_ProcessWebhook_CancelledRentalRejected(t *testing.T) {
 		Status:           1,
 		Amount:           1500,
 		Currency:         "USD",
+		RentalPrice:      500,
+		DepositAmount:    1000,
 		PaymentExpiresAt: time.Now().Add(time.Hour),
 		RentalStatus:     5,
 		AccountStatus:    3,
 	})
 	service := NewPaymentService(repo)
 
-	_, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "101",
-		ExternalTransactionID: "ext-cancelled",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(101, 202, 1500, "USD", "ext-cancelled"), "127.0.0.1", "Go-Test")
 	if !errors.Is(err, ErrWebhookInvalidTransition) {
 		t.Fatalf("expected invalid transition error, got %v", err)
 	}
@@ -1782,17 +1973,15 @@ func TestPaymentService_ProcessWebhook_AccountNotReservedRejected(t *testing.T) 
 		Status:           1,
 		Amount:           1500,
 		Currency:         "USD",
+		RentalPrice:      500,
+		DepositAmount:    1000,
 		PaymentExpiresAt: time.Now().Add(time.Hour),
 		RentalStatus:     1,
 		AccountStatus:    2,
 	})
 	service := NewPaymentService(repo)
 
-	_, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "101",
-		ExternalTransactionID: "ext-account",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(101, 202, 1500, "USD", "ext-account"), "127.0.0.1", "Go-Test")
 	if !errors.Is(err, ErrWebhookInvalidTransition) {
 		t.Fatalf("expected account state error, got %v", err)
 	}
@@ -1808,6 +1997,8 @@ func TestPaymentService_ProcessWebhook_RollbackOnAccountUpdateFailure(t *testing
 		Status:           1,
 		Amount:           1500,
 		Currency:         "USD",
+		RentalPrice:      500,
+		DepositAmount:    1000,
 		PaymentExpiresAt: time.Now().Add(time.Hour),
 		RentalStatus:     1,
 		AccountStatus:    3,
@@ -1815,11 +2006,7 @@ func TestPaymentService_ProcessWebhook_RollbackOnAccountUpdateFailure(t *testing
 	repo.rentErr = errors.New("account update failed")
 	service := NewPaymentService(repo)
 
-	_, err := service.ProcessWebhook(context.Background(), WebhookRequest{
-		PaymentID:             "101",
-		ExternalTransactionID: "ext-rb",
-		Status:                "success",
-	}, "127.0.0.1", "Go-Test")
+	_, err := service.ProcessWebhook(context.Background(), providerWebhookRequest(101, 202, 1500, "USD", "ext-rb"), "127.0.0.1", "Go-Test")
 	if err == nil {
 		t.Fatalf("expected transaction error")
 	}

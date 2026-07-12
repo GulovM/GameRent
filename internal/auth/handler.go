@@ -86,7 +86,7 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 	accessToken, refreshToken, err := h.service.Refresh(r.Context(), req.RefreshToken)
 	if err != nil {
 		h.log.Warn("token refresh failed", zap.Error(err))
-		if errors.Is(err, ErrTokenExpired) || errors.Is(err, ErrTokenAlreadyRevoked) {
+		if errors.Is(err, ErrInvalidRefreshToken) || errors.Is(err, ErrTokenExpired) || errors.Is(err, ErrTokenAlreadyRevoked) || errors.Is(err, ErrUserBlocked) || errors.Is(err, ErrEmailNotVerified) {
 			shared_response.Error(w, http.StatusUnauthorized, "UNAUTHORIZED", err.Error())
 			return
 		}

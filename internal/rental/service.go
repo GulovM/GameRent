@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"time"
 
@@ -19,7 +20,25 @@ var (
 	ErrInsufficientBalance     = errors.New("insufficient balance")
 	ErrUserBlocked             = errors.New("user is blocked")
 	ErrCredentialsNotAvailable = errors.New("rental credentials are not available")
+	ErrInvalidRentalPricing    = errors.New("invalid rental pricing")
+	ErrRentalPriceOverflow     = errors.New("rental price exceeds supported range")
 )
+
+// CalculateRentalTotal performs all rental price arithmetic without allowing
+// signed int64 wraparound. Monetary values remain integer minor units.
+func CalculateRentalTotal(hourlyPrice, depositAmount, hours int64) (rentalPrice int64, total int64, err error) {
+	if hourlyPrice <= 0 || depositAmount < 0 || hours <= 0 {
+		return 0, 0, ErrInvalidRentalPricing
+	}
+	if hourlyPrice > math.MaxInt64/hours {
+		return 0, 0, ErrRentalPriceOverflow
+	}
+	rentalPrice = hourlyPrice * hours
+	if rentalPrice > math.MaxInt64-depositAmount {
+		return 0, 0, ErrRentalPriceOverflow
+	}
+	return rentalPrice, rentalPrice + depositAmount, nil
+}
 
 type Service struct {
 	rentalRepo  Repository
@@ -34,9 +53,15 @@ type PaymentRepository interface {
 }
 
 type RentalCredentials struct {
+	AccountID int64
 	Login     string
 	Password  string
 	SteamID64 string
+}
+
+type CredentialRequestContext struct {
+	IPAddress string
+	UserAgent string
 }
 
 type CancelRentalResult struct {
@@ -87,7 +112,10 @@ func (s *Service) RentAccount(ctx context.Context, userID, accountID int64, dura
 			hours = 1
 		}
 
-		totalPriceAmount := acc.HourlyPrice.Amount * hours
+		totalPriceAmount, paymentAmount, err := CalculateRentalTotal(acc.HourlyPrice.Amount, acc.DepositAmount.Amount, hours)
+		if err != nil {
+			return err
+		}
 		pricePaid, err := NewMoney(totalPriceAmount, acc.HourlyPrice.Currency)
 		if err != nil {
 			return err
@@ -98,7 +126,7 @@ func (s *Service) RentAccount(ctx context.Context, userID, accountID int64, dura
 			return err
 		}
 
-		if u.Balance < totalPriceAmount+depositPaid.Amount {
+		if u.Balance < paymentAmount {
 			return ErrInsufficientBalance
 		}
 
@@ -106,7 +134,7 @@ func (s *Service) RentAccount(ctx context.Context, userID, accountID int64, dura
 			return err
 		}
 
-		if err := s.accountRepo.UpdateAccount(ctx, acc); err != nil {
+		if err := s.accountRepo.ReserveAccount(ctx, acc.ID, now); err != nil {
 			return err
 		}
 
@@ -134,7 +162,7 @@ func (s *Service) RentAccount(ctx context.Context, userID, accountID int64, dura
 		if s.paymentRepo == nil {
 			return fmt.Errorf("payment repository is not configured")
 		}
-		if _, err := s.paymentRepo.CreatePendingPayment(ctx, newRental.ID, userID, totalPriceAmount+depositPaid.Amount, acc.HourlyPrice.Currency); err != nil {
+		if _, err := s.paymentRepo.CreatePendingPayment(ctx, newRental.ID, userID, paymentAmount, acc.HourlyPrice.Currency); err != nil {
 			return fmt.Errorf("failed to create pending payment: %w", err)
 		}
 
@@ -148,33 +176,50 @@ func (s *Service) RentAccount(ctx context.Context, userID, accountID int64, dura
 	return rental, nil
 }
 
-func (s *Service) GetRentalCredentials(ctx context.Context, userID, rentalID int64, now time.Time) (*RentalCredentials, error) {
+func (s *Service) GetRentalCredentials(ctx context.Context, userID, rentalID int64, requestContext CredentialRequestContext, now time.Time) (*RentalCredentials, error) {
 	now = now.UTC()
-	rec, err := s.rentalRepo.GetRentalCredentials(ctx, rentalID, userID, now)
-	if err != nil {
-		if errors.Is(err, ErrRentalNotFound) {
-			return nil, ErrCredentialsNotAvailable
+	var credentials *RentalCredentials
+	err := s.txManager.WithinTransaction(ctx, func(ctx context.Context) error {
+		rec, err := s.rentalRepo.GetRentalCredentials(ctx, rentalID, userID, now)
+		if err != nil {
+			if errors.Is(err, ErrRentalNotFound) {
+				return ErrCredentialsNotAvailable
+			}
+			return err
 		}
+
+		if rec.RentalStatus != StatusActive || rec.AccountStatus != int16(account.StatusRented) {
+			return ErrCredentialsNotAvailable
+		}
+
+		password, err := s.accountRepo.Decrypt(rec.EncryptedPassword)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt credentials: %w", err)
+		}
+
+		if err := s.rentalRepo.RecordCredentialIssued(ctx, CredentialIssueEvent{
+			UserID:    userID,
+			AccountID: rec.AccountID,
+			RentalID:  rentalID,
+			IPAddress: requestContext.IPAddress,
+			UserAgent: requestContext.UserAgent,
+			CreatedAt: now,
+		}); err != nil {
+			return fmt.Errorf("record credential issuance: %w", err)
+		}
+
+		credentials = &RentalCredentials{
+			AccountID: rec.AccountID,
+			Login:     rec.Login,
+			Password:  password,
+			SteamID64: rec.SteamID64,
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	if rec.RentalStatus != StatusActive || rec.AccountStatus != int16(account.StatusRented) {
-		return nil, ErrCredentialsNotAvailable
-	}
-	if !rec.PaymentExpiresAt.After(now) {
-		return nil, ErrCredentialsNotAvailable
-	}
-
-	password, err := s.accountRepo.Decrypt(rec.EncryptedPassword)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt credentials: %w", err)
-	}
-
-	return &RentalCredentials{
-		Login:     rec.Login,
-		Password:  password,
-		SteamID64: rec.SteamID64,
-	}, nil
+	return credentials, nil
 }
 
 func (s *Service) CancelRental(ctx context.Context, userID, rentalID int64, reason string, now time.Time) (*CancelRentalResult, error) {

@@ -6,8 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"os"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -31,10 +29,12 @@ func NewPostgresService(repo Repository, txManager database.TxManager, jwtSecret
 	}
 }
 
-func generateRandomString() string {
+func generateRandomString() (string, error) {
 	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (s *PostgresService) Register(ctx context.Context, email, password, firstName, lastName string) (*User, string, string, error) {
@@ -61,7 +61,9 @@ func (s *PostgresService) Register(ctx context.Context, email, password, firstNa
 		}
 		user.FirstName = firstName
 		user.LastName = lastName
-		user.Role = roleForEmail(email)
+		// Public registration never grants privileges. Administrators are
+		// promoted explicitly by an existing administrator.
+		user.Role = RoleRent
 		user.EmailVerified = true
 
 		if err := s.repo.CreateUser(txCtx, user); err != nil {
@@ -73,7 +75,10 @@ func (s *PostgresService) Register(ctx context.Context, email, password, firstNa
 			return err
 		}
 
-		refreshToken = generateRandomString()
+		refreshToken, err = generateRandomString()
+		if err != nil {
+			return err
+		}
 		rt, err := NewRefreshToken(user.ID, hashRefreshToken(refreshToken), 30*24*time.Hour, now)
 		if err != nil {
 			return err
@@ -107,7 +112,10 @@ func (s *PostgresService) Login(ctx context.Context, email, password string) (st
 	}
 
 	now := time.Now()
-	refreshToken := generateRandomString()
+	refreshToken, err := generateRandomString()
+	if err != nil {
+		return "", "", err
+	}
 	rt, err := NewRefreshToken(user.ID, hashRefreshToken(refreshToken), 30*24*time.Hour, now)
 	if err != nil {
 		return "", "", err
@@ -124,9 +132,9 @@ func (s *PostgresService) Refresh(ctx context.Context, refreshToken string) (str
 	var newRefreshToken string
 
 	err := s.txManager.WithinTransaction(ctx, func(txCtx context.Context) error {
-		rt, err := s.repo.GetRefreshToken(txCtx, hashRefreshToken(refreshToken))
+		rt, err := s.repo.GetRefreshTokenForUpdate(txCtx, hashRefreshToken(refreshToken))
 		if err != nil {
-			return errors.New("invalid refresh token")
+			return ErrInvalidRefreshToken
 		}
 
 		now := time.Now()
@@ -148,8 +156,8 @@ func (s *PostgresService) Refresh(ctx context.Context, refreshToken string) (str
 		if err != nil {
 			return err
 		}
-		if user.IsBlocked {
-			return ErrUserBlocked
+		if err := user.CanAuthenticate(); err != nil {
+			return err
 		}
 
 		newAccessToken, err = shared_auth.GenerateTokenWithRole(user.ID, string(user.Role), s.jwtTTL, s.jwtSecret)
@@ -157,7 +165,10 @@ func (s *PostgresService) Refresh(ctx context.Context, refreshToken string) (str
 			return err
 		}
 
-		newRefreshToken = generateRandomString()
+		newRefreshToken, err = generateRandomString()
+		if err != nil {
+			return err
+		}
 		newRT, err := NewRefreshToken(user.ID, hashRefreshToken(newRefreshToken), 30*24*time.Hour, now)
 		if err != nil {
 			return err
@@ -172,29 +183,21 @@ func (s *PostgresService) Refresh(ctx context.Context, refreshToken string) (str
 }
 
 func (s *PostgresService) Logout(ctx context.Context, refreshToken string) error {
-	rt, err := s.repo.GetRefreshToken(ctx, hashRefreshToken(refreshToken))
-	if err != nil {
-		return errors.New("invalid refresh token")
-	}
-	if err := rt.Revoke(time.Now()); err != nil {
-		return err
-	}
-	return s.repo.UpdateRefreshToken(ctx, rt)
+	return s.txManager.WithinTransaction(ctx, func(txCtx context.Context) error {
+		rt, err := s.repo.GetRefreshTokenForUpdate(txCtx, hashRefreshToken(refreshToken))
+		if err != nil {
+			return ErrInvalidRefreshToken
+		}
+		if err := rt.Revoke(time.Now()); err != nil {
+			return err
+		}
+		return s.repo.UpdateRefreshToken(txCtx, rt)
+	})
 }
 
 func hashRefreshToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
-}
-
-func roleForEmail(email string) UserRole {
-	email = strings.ToLower(strings.TrimSpace(email))
-	for _, adminEmail := range strings.Split(os.Getenv("ADMIN_EMAILS"), ",") {
-		if strings.ToLower(strings.TrimSpace(adminEmail)) == email && email != "" {
-			return RoleAdmin
-		}
-	}
-	return RoleRent
 }
 
 func (s *PostgresService) Me(ctx context.Context, userID int64) (*User, error) {

@@ -3,11 +3,14 @@ package payment
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"rent_game_accs/internal/shared/database"
+
+	"github.com/jackc/pgx/v5"
 )
 
 var (
@@ -33,6 +36,7 @@ var (
 		"RELEASED":  {},
 		"FORFEITED": {},
 		"REFUNDED":  {},
+		"UNKNOWN":   {},
 	}
 	adminRefundStatusFilterValues = map[string]int16{
 		"NONE":      0,
@@ -91,6 +95,77 @@ type AdminRentalPage struct {
 	TotalItems int64
 }
 
+type AdminRentalDetail struct {
+	Rental        AdminRentalDetailRental
+	Payment       *AdminRentalDetailPayment
+	Deposit       *AdminRentalDetailDeposit
+	RefundSummary AdminRentalDetailRefundSummary
+	LedgerSummary AdminRentalDetailLedgerSummary
+	SupportFlags  AdminRentalSupportFlags
+}
+
+type AdminRentalDetailRental struct {
+	ID               int64
+	UserID           int64
+	AccountID        int64
+	Status           int16
+	StartAt          time.Time
+	EndAt            time.Time
+	RentalPrice      int64
+	DepositAmount    int64
+	PaymentExpiresAt time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+type AdminRentalDetailPayment struct {
+	ID        int64
+	Status    int16
+	Provider  string
+	Amount    int64
+	Currency  string
+	CreatedAt time.Time
+}
+
+type AdminRentalDetailDeposit struct {
+	Amount      int64
+	Currency    string
+	Status      string
+	HeldAt      *time.Time
+	ReleasedAt  *time.Time
+	ForfeitedAt *time.Time
+	RefundedAt  *time.Time
+}
+
+type AdminRentalDetailRefundSummary struct {
+	Count                int64
+	LatestStatus         string
+	TotalRefundedPrimary int64
+	TotalRefundedDeposit int64
+	LatestProcessedAt    *time.Time
+}
+
+type AdminRentalDetailLedgerSummary struct {
+	CountsByDisplayType map[string]int64
+	TotalsByDisplayType map[string]int64
+	LatestEntries       []AdminRentalSafeLedgerEntry
+}
+
+type AdminRentalSafeLedgerEntry struct {
+	ID          int64
+	DisplayType string
+	Amount      int64
+	Currency    string
+	CreatedAt   time.Time
+}
+
+type AdminRentalSupportFlags struct {
+	EligibleWalletRefund   bool
+	RefundIneligibleReason string
+	HasActiveCredentials   bool
+	PaymentWindowExpired   bool
+}
+
 func newInvalidAdminRentalFiltersError(message string) error {
 	return &adminRentalFilterError{message: message}
 }
@@ -128,6 +203,13 @@ func (s *PaymentService) ListAdminRentals(ctx context.Context, filters AdminRent
 		PageSize:   filters.PageSize,
 		TotalItems: summary.TotalCount,
 	}, nil
+}
+
+func (s *PaymentService) GetAdminRentalDetail(ctx context.Context, rentalID int64) (*AdminRentalDetail, error) {
+	if rentalID <= 0 {
+		return nil, newInvalidAdminRentalFiltersError("rental_id must be a positive integer")
+	}
+	return s.repo.GetAdminRentalDetail(ctx, rentalID)
 }
 
 func validateAdminRentalFilters(filters AdminRentalListFilter) error {
@@ -338,6 +420,250 @@ func (r *PostgresRepository) SummarizeAdminRentals(ctx context.Context, filters 
 	return summary, nil
 }
 
+func (r *PostgresRepository) GetAdminRentalDetail(ctx context.Context, rentalID int64) (*AdminRentalDetail, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	now := time.Now().UTC()
+
+	detail := &AdminRentalDetail{}
+
+	var (
+		paymentID          int64
+		paymentStatus      int16
+		paymentProvider    string
+		paymentAmount      int64
+		paymentCurrency    string
+		paymentCreatedAt   sql.NullTime
+		depositAmount      sql.NullInt64
+		depositCurrency    sql.NullString
+		depositHoldStatus  int16
+		depositHeldAt      sql.NullTime
+		depositReleasedAt  sql.NullTime
+		depositForfeitedAt sql.NullTime
+		depositRefundedAt  sql.NullTime
+	)
+	query := `
+		SELECT
+			r.id,
+			r.user_id,
+			r.account_id,
+			r.status,
+			r.start_at,
+			r.end_at,
+			r.rental_price,
+			r.deposit_amount,
+			r.payment_expires_at,
+			r.created_at,
+			r.updated_at,
+			COALESCE(lp.id, 0),
+			COALESCE(lp.status, 0),
+			COALESCE(lp.provider, ''),
+			COALESCE(lp.amount, 0),
+			COALESCE(lp.currency, ''),
+			lp.created_at,
+			d.amount,
+			d.currency,
+			COALESCE(d.status, 0),
+			d.held_at,
+			d.released_at,
+			d.forfeited_at,
+			d.refunded_at
+		FROM rentals r
+		LEFT JOIN LATERAL (
+			SELECT id, status, provider, amount, currency, created_at
+			FROM payments
+			WHERE rental_id = r.id
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		) lp ON TRUE
+		LEFT JOIN deposit_holds d ON d.rental_id = r.id
+		WHERE r.id = $1`
+	if err := db.QueryRow(ctx, query, rentalID).Scan(
+		&detail.Rental.ID,
+		&detail.Rental.UserID,
+		&detail.Rental.AccountID,
+		&detail.Rental.Status,
+		&detail.Rental.StartAt,
+		&detail.Rental.EndAt,
+		&detail.Rental.RentalPrice,
+		&detail.Rental.DepositAmount,
+		&detail.Rental.PaymentExpiresAt,
+		&detail.Rental.CreatedAt,
+		&detail.Rental.UpdatedAt,
+		&paymentID,
+		&paymentStatus,
+		&paymentProvider,
+		&paymentAmount,
+		&paymentCurrency,
+		&paymentCreatedAt,
+		&depositAmount,
+		&depositCurrency,
+		&depositHoldStatus,
+		&depositHeldAt,
+		&depositReleasedAt,
+		&depositForfeitedAt,
+		&depositRefundedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAdminRentalNotFound
+		}
+		return nil, err
+	}
+
+	if paymentID > 0 {
+		detail.Payment = &AdminRentalDetailPayment{
+			ID:       paymentID,
+			Status:   paymentStatus,
+			Provider: paymentProvider,
+			Amount:   paymentAmount,
+			Currency: paymentCurrency,
+		}
+		if paymentCreatedAt.Valid {
+			detail.Payment.CreatedAt = paymentCreatedAt.Time
+		}
+	}
+
+	if depositAmount.Valid && depositAmount.Int64 > 0 {
+		detail.Deposit = &AdminRentalDetailDeposit{
+			Amount:   depositAmount.Int64,
+			Currency: depositCurrency.String,
+			Status:   adminPublicDepositStatus(depositAmount.Int64, depositHoldStatus),
+		}
+		if depositHeldAt.Valid {
+			value := depositHeldAt.Time
+			detail.Deposit.HeldAt = &value
+		}
+		if depositReleasedAt.Valid {
+			value := depositReleasedAt.Time
+			detail.Deposit.ReleasedAt = &value
+		}
+		if depositForfeitedAt.Valid {
+			value := depositForfeitedAt.Time
+			detail.Deposit.ForfeitedAt = &value
+		}
+		if depositRefundedAt.Valid {
+			value := depositRefundedAt.Time
+			detail.Deposit.RefundedAt = &value
+		}
+	}
+
+	var latestRefundStatusCode int16
+	var latestProcessedAt sql.NullTime
+	refundSummaryQuery := `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(amount_principal) FILTER (WHERE status = $2), 0),
+			COALESCE(SUM(amount_deposit) FILTER (WHERE status = $2), 0),
+			COALESCE((
+				SELECT rf.status
+				FROM refunds rf
+				WHERE rf.rental_id = $1
+				ORDER BY rf.created_at DESC, rf.id DESC
+				LIMIT 1
+			), 0),
+			(
+				SELECT rf.processed_at
+				FROM refunds rf
+				WHERE rf.rental_id = $1
+				ORDER BY rf.created_at DESC, rf.id DESC
+				LIMIT 1
+			)
+		FROM refunds
+		WHERE rental_id = $1`
+	if err := db.QueryRow(ctx, refundSummaryQuery, rentalID, refundStatusCompleted).Scan(
+		&detail.RefundSummary.Count,
+		&detail.RefundSummary.TotalRefundedPrimary,
+		&detail.RefundSummary.TotalRefundedDeposit,
+		&latestRefundStatusCode,
+		&latestProcessedAt,
+	); err != nil {
+		return nil, err
+	}
+	if latestRefundStatusCode == 0 {
+		detail.RefundSummary.LatestStatus = "NONE"
+	} else {
+		detail.RefundSummary.LatestStatus = publicRefundStatus(latestRefundStatusCode)
+	}
+	if latestProcessedAt.Valid {
+		value := latestProcessedAt.Time
+		detail.RefundSummary.LatestProcessedAt = &value
+	}
+
+	detail.LedgerSummary = AdminRentalDetailLedgerSummary{
+		CountsByDisplayType: map[string]int64{},
+		TotalsByDisplayType: map[string]int64{},
+		LatestEntries:       []AdminRentalSafeLedgerEntry{},
+	}
+	ledgerAggregateRows, err := db.Query(ctx, `
+		SELECT entry_type, COUNT(*), COALESCE(SUM(amount), 0)
+		FROM financial_ledger_entries
+		WHERE rental_id = $1
+		GROUP BY entry_type`, rentalID)
+	if err != nil {
+		return nil, err
+	}
+	defer ledgerAggregateRows.Close()
+	for ledgerAggregateRows.Next() {
+		var entryType int16
+		var count int64
+		var total int64
+		if err := ledgerAggregateRows.Scan(&entryType, &count, &total); err != nil {
+			return nil, err
+		}
+		displayType := publicLedgerDisplayType(entryType)
+		detail.LedgerSummary.CountsByDisplayType[displayType] = count
+		detail.LedgerSummary.TotalsByDisplayType[displayType] = total
+	}
+	if err := ledgerAggregateRows.Err(); err != nil {
+		return nil, err
+	}
+
+	ledgerRows, err := db.Query(ctx, `
+		SELECT id, entry_type, amount, currency, created_at
+		FROM financial_ledger_entries
+		WHERE rental_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT 5`, rentalID)
+	if err != nil {
+		return nil, err
+	}
+	defer ledgerRows.Close()
+	for ledgerRows.Next() {
+		var (
+			entry     AdminRentalSafeLedgerEntry
+			entryType int16
+		)
+		if err := ledgerRows.Scan(&entry.ID, &entryType, &entry.Amount, &entry.Currency, &entry.CreatedAt); err != nil {
+			return nil, err
+		}
+		entry.DisplayType = publicLedgerDisplayType(entryType)
+		detail.LedgerSummary.LatestEntries = append(detail.LedgerSummary.LatestEntries, entry)
+	}
+	if err := ledgerRows.Err(); err != nil {
+		return nil, err
+	}
+
+	detail.SupportFlags.PaymentWindowExpired = !detail.Rental.PaymentExpiresAt.After(now)
+	detail.SupportFlags.HasActiveCredentials = detail.Rental.Status == 2 && detail.Rental.EndAt.After(now) && detail.Payment != nil && detail.Payment.Status == 2
+	detail.SupportFlags.EligibleWalletRefund, detail.SupportFlags.RefundIneligibleReason = adminWalletRefundEligibility(
+		detail.Rental.Status,
+		func() int16 {
+			if detail.Payment == nil {
+				return 0
+			}
+			return detail.Payment.Status
+		}(),
+		func() string {
+			if detail.Payment == nil {
+				return ""
+			}
+			return detail.Payment.Provider
+		}(),
+		detail.RefundSummary.LatestStatus,
+	)
+
+	return detail, nil
+}
+
 func adminRentalsBaseQuery(filters AdminRentalListFilter) (string, []any) {
 	base := `
 		SELECT
@@ -407,6 +733,8 @@ func adminRentalsBaseQuery(filters AdminRentalListFilter) (string, []any) {
 			conditions = append(conditions, fmt.Sprintf("(r.deposit_amount > 0 AND COALESCE(d.status, 0) = %d)", depositHoldStatusForfeited))
 		case "REFUNDED":
 			conditions = append(conditions, fmt.Sprintf("(r.deposit_amount > 0 AND COALESCE(d.status, 0) = %d)", depositHoldStatusRefunded))
+		case "UNKNOWN":
+			conditions = append(conditions, "(r.deposit_amount > 0 AND d.status IS NOT NULL AND d.status NOT IN (1, 2, 3, 4))")
 		}
 	}
 	if filters.RefundStatus != "" {
@@ -447,6 +775,22 @@ func adminPublicDepositStatus(depositAmount int64, holdStatus int16) string {
 	case depositHoldStatusRefunded:
 		return "REFUNDED"
 	default:
-		return "NONE"
+		return "UNKNOWN"
 	}
+}
+
+func adminWalletRefundEligibility(rentalStatus int16, paymentStatus int16, paymentProvider string, latestRefundStatus string) (bool, string) {
+	if latestRefundStatus == "COMPLETED" {
+		return false, "REFUND_ALREADY_COMPLETED"
+	}
+	if paymentProvider != walletPaymentProvider {
+		return false, "PAYMENT_PROVIDER_NOT_BALANCE"
+	}
+	if paymentStatus != 2 {
+		return false, "PAYMENT_NOT_SUCCESS"
+	}
+	if rentalStatus != 3 && rentalStatus != 4 {
+		return false, "RENTAL_NOT_EXPIRED_OR_COMPLETED"
+	}
+	return true, ""
 }

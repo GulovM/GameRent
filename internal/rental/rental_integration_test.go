@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,8 @@ import (
 	"rent_game_accs/internal/user"
 	"rent_game_accs/migrations"
 )
+
+const integrationAdminID int64 = 799999
 
 func setupTestDB(t *testing.T) (*pgxpool.Pool, database.TxManager) {
 	if os.Getenv("RUN_INTEGRATION_TESTS") != "1" {
@@ -84,6 +87,9 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, database.TxManager) {
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM accounts")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM games")
 	_, _ = poolConn.Pool.Exec(ctx, "DELETE FROM users")
+	if _, err := poolConn.Pool.Exec(ctx, `INSERT INTO users (id, email, password_hash, role) VALUES ($1, 'integration-current-admin@example.com', 'hash', 'ADMIN')`, integrationAdminID); err != nil {
+		t.Fatalf("failed to seed integration current admin: %v", err)
+	}
 
 	txManager := database.NewTxManager(poolConn.Pool)
 	return poolConn.Pool, txManager
@@ -458,6 +464,18 @@ func seedWaitingPaymentRental(t *testing.T, pool *pgxpool.Pool, userID, accountI
 	seedWaitingPaymentRentalWithAmounts(t, pool, userID, accountID, rentalID, paymentID, 500, 500)
 }
 
+func providerWebhookRequest(paymentID, rentalID, amount int64, externalTransactionID string) payment.WebhookRequest {
+	return payment.WebhookRequest{
+		PaymentID:             strconv.FormatInt(paymentID, 10),
+		RentalID:              strconv.FormatInt(rentalID, 10),
+		ExternalTransactionID: externalTransactionID,
+		Provider:              "internal",
+		Amount:                amount,
+		Currency:              "USD",
+		Status:                "success",
+	}
+}
+
 func seedWaitingPaymentRentalWithAmounts(t *testing.T, pool *pgxpool.Pool, userID, accountID, rentalID, paymentID int64, rentalPrice, depositAmount int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -540,7 +558,7 @@ func TestRentalService_CancelWaitingPaymentLifecycle(t *testing.T) {
 		t.Fatalf("expected account AVAILABLE, got %d", accountStatus)
 	}
 
-	creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, time.Date(2026, 7, 5, 12, 6, 0, 0, time.UTC))
+	creds, err := service.GetRentalCredentials(context.Background(), userID, rentalID, rental.CredentialRequestContext{}, time.Date(2026, 7, 5, 12, 6, 0, 0, time.UTC))
 	if !errors.Is(err, rental.ErrCredentialsNotAvailable) {
 		t.Fatalf("expected credentials denial after cancel, got creds=%+v err=%v", creds, err)
 	}
@@ -587,11 +605,7 @@ func TestRentalService_CancelVsWebhookRaceStaysConsistent(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, webhookErr = paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-			PaymentID:             fmt.Sprintf("%d", paymentID),
-			ExternalTransactionID: "cancel-race-ext",
-			Status:                "success",
-		}, "127.0.0.1", "test")
+		_, webhookErr = paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, 1000, "cancel-race-ext"), "127.0.0.1", "test")
 	}()
 	close(start)
 	wg.Wait()
@@ -630,11 +644,7 @@ func TestPaymentWebhookCreatesLedgerAndDepositHold(t *testing.T) {
 	seedWaitingPaymentRental(t, pool, userID, accountID, rentalID, paymentID)
 
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
-	_, err := paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		PaymentID:             fmt.Sprintf("%d", paymentID),
-		ExternalTransactionID: "ledger-ext-1",
-		Status:                "success",
-	}, "127.0.0.1", "test")
+	_, err := paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, 1000, "ledger-ext-1"), "127.0.0.1", "test")
 	if err != nil {
 		t.Fatalf("ProcessWebhook failed: %v", err)
 	}
@@ -665,11 +675,7 @@ func TestPaymentWebhookCreatesLedgerAndDepositHold(t *testing.T) {
 		t.Fatalf("unexpected provider ledger entry amount=%d provider=%q ext=%q key=%q", amount, provider, externalTx, idempotencyKey)
 	}
 
-	if _, err = paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		PaymentID:             fmt.Sprintf("%d", paymentID),
-		ExternalTransactionID: "ledger-ext-1",
-		Status:                "success",
-	}, "127.0.0.1", "test"); err != nil {
+	if _, err = paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, 1000, "ledger-ext-1"), "127.0.0.1", "test"); err != nil {
 		t.Fatalf("duplicate webhook should be idempotent: %v", err)
 	}
 	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM financial_ledger_entries WHERE payment_id = $1`, paymentID).Scan(&providerEntries); err != nil {
@@ -712,10 +718,7 @@ func TestPaymentWebhookUnknownExternalTransactionDoesNotMutateState(t *testing.T
 	seedWaitingPaymentRental(t, pool, userID, accountID, rentalID, paymentID)
 
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
-	_, err := paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		ExternalTransactionID: "missing-external-tx",
-		Status:                "success",
-	}, "127.0.0.1", "test")
+	_, err := paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(999999, rentalID, 1000, "missing-external-tx"), "127.0.0.1", "test")
 	if !errors.Is(err, payment.ErrPaymentNotFound) {
 		t.Fatalf("expected unknown external transaction to return ErrPaymentNotFound, got %v", err)
 	}
@@ -755,12 +758,9 @@ func TestPaymentWebhookExternalTransactionLookupDoesNotTouchWalletPaidRental(t *
 		t.Fatalf("wallet payment failed: %v", err)
 	}
 
-	_, err := paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		ExternalTransactionID: "provider-should-not-match-wallet",
-		Status:                "success",
-	}, "127.0.0.1", "test")
-	if !errors.Is(err, payment.ErrPaymentNotFound) {
-		t.Fatalf("expected provider lookup to ignore wallet-paid rental, got %v", err)
+	_, err := paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, 1000, "provider-should-not-match-wallet"), "127.0.0.1", "test")
+	if !errors.Is(err, payment.ErrWebhookProviderUnsupported) {
+		t.Fatalf("expected provider webhook to reject wallet-paid rental, got %v", err)
 	}
 
 	var balance int64
@@ -795,11 +795,7 @@ func TestPaymentWebhookZeroDepositSkipsDepositRecords(t *testing.T) {
 	seedWaitingPaymentRentalWithAmounts(t, pool, userID, accountID, rentalID, paymentID, 500, 0)
 
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
-	_, err := paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		PaymentID:             fmt.Sprintf("%d", paymentID),
-		ExternalTransactionID: "zero-deposit-ext",
-		Status:                "success",
-	}, "127.0.0.1", "test")
+	_, err := paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, 500, "zero-deposit-ext"), "127.0.0.1", "test")
 	if err != nil {
 		t.Fatalf("ProcessWebhook failed: %v", err)
 	}
@@ -825,11 +821,7 @@ func TestFinancialLedgerIsImmutable(t *testing.T) {
 	seedWaitingPaymentRental(t, pool, userID, accountID, rentalID, paymentID)
 
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
-	_, err := paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		PaymentID:             fmt.Sprintf("%d", paymentID),
-		ExternalTransactionID: "immutable-ext",
-		Status:                "success",
-	}, "127.0.0.1", "test")
+	_, err := paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, 1000, "immutable-ext"), "127.0.0.1", "test")
 	if err != nil {
 		t.Fatalf("ProcessWebhook failed: %v", err)
 	}
@@ -852,11 +844,7 @@ func TestFinancialLedgerMetadataIsSanitized(t *testing.T) {
 	seedWaitingPaymentRental(t, pool, userID, accountID, rentalID, paymentID)
 
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
-	_, err := paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		PaymentID:             fmt.Sprintf("%d", paymentID),
-		ExternalTransactionID: "metadata-ext",
-		Status:                "success",
-	}, "127.0.0.1", "test")
+	_, err := paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, 1000, "metadata-ext"), "127.0.0.1", "test")
 	if err != nil {
 		t.Fatalf("ProcessWebhook failed: %v", err)
 	}
@@ -888,11 +876,7 @@ func seedHeldDepositSettlementRental(t *testing.T, pool *pgxpool.Pool, userID, a
 	seedWaitingPaymentRentalWithAmounts(t, pool, userID, accountID, rentalID, paymentID, rentalPrice, depositAmount)
 
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
-	if _, err := paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-		PaymentID:             fmt.Sprintf("%d", paymentID),
-		ExternalTransactionID: fmt.Sprintf("settlement-ext-%d", paymentID),
-		Status:                "success",
-	}, "127.0.0.1", "test"); err != nil {
+	if _, err := paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID, rentalID, rentalPrice+depositAmount, fmt.Sprintf("settlement-ext-%d", paymentID)), "127.0.0.1", "test"); err != nil {
 		t.Fatalf("failed to activate rental for settlement: %v", err)
 	}
 
@@ -931,7 +915,7 @@ func TestDepositReleaseCreditsBalanceOnce(t *testing.T) {
 		t.Fatalf("failed to read initial balance: %v", err)
 	}
 
-	result, err := paymentService.ReleaseDeposit(context.Background(), 7001, "ADMIN", rentalID, time.Now().UTC())
+	result, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("ReleaseDeposit failed: %v", err)
 	}
@@ -967,7 +951,7 @@ func TestDepositReleaseCreditsBalanceOnce(t *testing.T) {
 		t.Fatalf("expected one release ledger/security/audit entry, got ledger=%d security=%d audit=%d", ledgerCount, securityCount, auditCount)
 	}
 
-	result, err = paymentService.ReleaseDeposit(context.Background(), 7001, "ADMIN", rentalID, time.Now().UTC())
+	result, err = paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("repeated ReleaseDeposit should be no-op: %v", err)
 	}
@@ -1005,7 +989,7 @@ func TestDepositForfeitDoesNotCreditBalance(t *testing.T) {
 		t.Fatalf("failed to read initial balance: %v", err)
 	}
 
-	result, err := paymentService.ForfeitDeposit(context.Background(), 7002, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
+	result, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("ForfeitDeposit failed: %v", err)
 	}
@@ -1041,7 +1025,7 @@ func TestDepositForfeitDoesNotCreditBalance(t *testing.T) {
 		t.Fatalf("expected one forfeit ledger/security/audit entry, got ledger=%d security=%d audit=%d", ledgerCount, securityCount, auditCount)
 	}
 
-	result, err = paymentService.ForfeitDeposit(context.Background(), 7002, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
+	result, err = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("repeated ForfeitDeposit should be no-op: %v", err)
 	}
@@ -1068,26 +1052,22 @@ func TestDepositSettlementRejectsInvalidStatesAndRoles(t *testing.T) {
 
 	userID, accountID, rentalID, paymentID := int64(9821), int64(9822), int64(9823), int64(9824)
 	seedWaitingPaymentRentalWithAmounts(t, pool, userID, accountID, rentalID, paymentID, 500, 500)
-	if _, err := paymentService.ReleaseDeposit(context.Background(), 7003, "ADMIN", rentalID, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected WAITING_PAYMENT release rejection, got %v", err)
 	}
-	if _, err := paymentService.ForfeitDeposit(context.Background(), 7003, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected WAITING_PAYMENT forfeit rejection, got %v", err)
 	}
 
 	userID2, accountID2, rentalID2, paymentID2 := int64(9831), int64(9832), int64(9833), int64(9834)
 	seedWaitingPaymentRentalWithAmounts(t, pool, userID2, accountID2, rentalID2, paymentID2, 500, 500)
-	if _, err := payment.NewPaymentService(payment.NewPostgresRepository(pool)).ProcessWebhook(context.Background(), payment.WebhookRequest{
-		PaymentID:             fmt.Sprintf("%d", paymentID2),
-		ExternalTransactionID: "active-settlement-reject",
-		Status:                "success",
-	}, "127.0.0.1", "test"); err != nil {
+	if _, err := payment.NewPaymentService(payment.NewPostgresRepository(pool)).ProcessWebhook(context.Background(), providerWebhookRequest(paymentID2, rentalID2, 1000, "active-settlement-reject"), "127.0.0.1", "test"); err != nil {
 		t.Fatalf("failed to activate rental for ACTIVE rejection test: %v", err)
 	}
-	if _, err := paymentService.ReleaseDeposit(context.Background(), 7003, "ADMIN", rentalID2, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected ACTIVE release rejection, got %v", err)
 	}
-	if _, err := paymentService.ForfeitDeposit(context.Background(), 7003, "ADMIN", rentalID2, "damage_confirmed", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, "damage_confirmed", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected ACTIVE forfeit rejection, got %v", err)
 	}
 
@@ -1096,7 +1076,7 @@ func TestDepositSettlementRejectsInvalidStatesAndRoles(t *testing.T) {
 	if _, err := pool.Exec(context.Background(), "UPDATE rentals SET status = 5 WHERE id = $1", rentalID3); err != nil {
 		t.Fatalf("failed to cancel expired rental for test: %v", err)
 	}
-	if _, err := paymentService.ReleaseDeposit(context.Background(), 7003, "ADMIN", rentalID3, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID3, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected CANCELLED release rejection, got %v", err)
 	}
 
@@ -1105,13 +1085,13 @@ func TestDepositSettlementRejectsInvalidStatesAndRoles(t *testing.T) {
 	if _, err := pool.Exec(context.Background(), "UPDATE payments SET status = 3 WHERE id = $1", paymentID4); err != nil {
 		t.Fatalf("failed to fail payment for test: %v", err)
 	}
-	if _, err := paymentService.ReleaseDeposit(context.Background(), 7003, "ADMIN", rentalID4, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID4, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected non-success payment release rejection, got %v", err)
 	}
 
 	userID5, accountID5, rentalID5, paymentID5 := int64(9861), int64(9862), int64(9863), int64(9864)
 	seedHeldDepositSettlementRental(t, pool, userID5, accountID5, rentalID5, paymentID5, 500, 0)
-	if _, err := paymentService.ReleaseDeposit(context.Background(), 7003, "ADMIN", rentalID5, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID5, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected zero-deposit release rejection, got %v", err)
 	}
 
@@ -1134,12 +1114,12 @@ func TestDepositSettlementConcurrentReleaseVsForfeit(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, releaseErr = paymentService.ReleaseDeposit(context.Background(), 7004, "ADMIN", rentalID, time.Now().UTC())
+		_, releaseErr = paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, time.Now().UTC())
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), 7005, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
+		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
 	}()
 
 	close(start)
@@ -1385,18 +1365,14 @@ func TestWalletPaymentWithBalance_ConcurrentAndWebhookRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, webhookErr = paymentService.ProcessWebhook(context.Background(), payment.WebhookRequest{
-			PaymentID:             fmt.Sprintf("%d", paymentID2),
-			ExternalTransactionID: "wallet-webhook-race",
-			Status:                "success",
-		}, "127.0.0.1", "test")
+		_, webhookErr = paymentService.ProcessWebhook(context.Background(), providerWebhookRequest(paymentID2, rentalID2, 1000, "wallet-webhook-race"), "127.0.0.1", "test")
 	}()
 	close(start)
 	wg.Wait()
 	if walletErr != nil {
 		t.Fatalf("unexpected wallet/webhook wallet error: %v", walletErr)
 	}
-	if webhookErr != nil {
+	if webhookErr != nil && !errors.Is(webhookErr, payment.ErrWebhookProviderUnsupported) {
 		t.Fatalf("unexpected wallet/webhook webhook error: %v", webhookErr)
 	}
 
@@ -1426,15 +1402,128 @@ func TestWalletPaymentWithBalance_ConcurrentAndWebhookRace(t *testing.T) {
 	}
 	switch finalProvider {
 	case "balance":
+		if !errors.Is(webhookErr, payment.ErrWebhookProviderUnsupported) {
+			t.Fatalf("wallet won race without provider-webhook rejection: %v", webhookErr)
+		}
 		if finalBalance != 9000 || balanceLedgerCount != 1 || providerLedgerCount != 0 {
 			t.Fatalf("wallet won race but final state is inconsistent balance=%d balanceLedger=%d providerLedger=%d", finalBalance, balanceLedgerCount, providerLedgerCount)
 		}
 	case "internal":
+		if webhookErr != nil {
+			t.Fatalf("provider webhook won race with error: %v", webhookErr)
+		}
 		if finalBalance != 10000 || balanceLedgerCount != 0 || providerLedgerCount != 1 {
 			t.Fatalf("webhook won race but final state is inconsistent balance=%d balanceLedger=%d providerLedger=%d", finalBalance, balanceLedgerCount, providerLedgerCount)
 		}
 	default:
 		t.Fatalf("unexpected final payment provider in race: %q", finalProvider)
+	}
+}
+
+func TestWebhookConcurrentExactReplayCreatesOneFinancialSet(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	userID, accountID, rentalID, paymentID := int64(9961), int64(9962), int64(9963), int64(9964)
+	seedWaitingPaymentRental(t, pool, userID, accountID, rentalID, paymentID)
+	service := payment.NewPaymentService(payment.NewPostgresRepository(pool))
+	request := providerWebhookRequest(paymentID, rentalID, 1000, "concurrent-exact-webhook")
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([]*payment.WebhookResult, 2)
+	errs := make([]error, 2)
+	for i := range results {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			results[index], errs[index] = service.ProcessWebhook(context.Background(), request, "127.0.0.1", "test")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	idempotentCount := 0
+	for i := range results {
+		if errs[i] != nil || results[i] == nil || !results[i].Processed {
+			t.Fatalf("concurrent exact webhook %d failed result=%+v err=%v", i, results[i], errs[i])
+		}
+		if results[i].Idempotent {
+			idempotentCount++
+		}
+	}
+	if idempotentCount != 1 {
+		t.Fatalf("expected exactly one idempotent replay, got %d", idempotentCount)
+	}
+	var ledgerCount, holdCount int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM financial_ledger_entries WHERE payment_id=$1`, paymentID).Scan(&ledgerCount); err != nil {
+		t.Fatalf("count concurrent webhook ledger: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM deposit_holds WHERE payment_id=$1`, paymentID).Scan(&holdCount); err != nil {
+		t.Fatalf("count concurrent webhook holds: %v", err)
+	}
+	if ledgerCount != 2 || holdCount != 1 {
+		t.Fatalf("concurrent replay duplicated financial facts ledger=%d holds=%d", ledgerCount, holdCount)
+	}
+}
+
+func TestWebhookConcurrentExternalTransactionConflictActivatesOnlyOnePayment(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	userID1, accountID1, rentalID1, paymentID1 := int64(9971), int64(9972), int64(9973), int64(9974)
+	userID2, accountID2, rentalID2, paymentID2 := int64(9981), int64(9982), int64(9983), int64(9984)
+	seedWaitingPaymentRental(t, pool, userID1, accountID1, rentalID1, paymentID1)
+	seedWaitingPaymentRental(t, pool, userID2, accountID2, rentalID2, paymentID2)
+	service := payment.NewPaymentService(payment.NewPostgresRepository(pool))
+	requests := []payment.WebhookRequest{
+		providerWebhookRequest(paymentID1, rentalID1, 1000, "shared-provider-transaction"),
+		providerWebhookRequest(paymentID2, rentalID2, 1000, "shared-provider-transaction"),
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			_, errs[index] = service.ProcessWebhook(context.Background(), requests[index], "127.0.0.1", "test")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	successes, conflicts := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, payment.ErrWebhookExternalTxMismatch), errors.Is(err, payment.ErrWebhookIdentifierMismatch):
+			conflicts++
+		default:
+			t.Fatalf("unexpected external transaction race error: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("expected one success and one conflict, successes=%d conflicts=%d errors=%v", successes, conflicts, errs)
+	}
+	var successfulPayments, activeRentals, rentedAccounts, ledgerCount, holdCount int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM payments WHERE id IN ($1,$2) AND status=2`, paymentID1, paymentID2).Scan(&successfulPayments); err != nil {
+		t.Fatalf("count successful payments: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM rentals WHERE id IN ($1,$2) AND status=2`, rentalID1, rentalID2).Scan(&activeRentals); err != nil {
+		t.Fatalf("count active rentals: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM accounts WHERE id IN ($1,$2) AND status=4`, accountID1, accountID2).Scan(&rentedAccounts); err != nil {
+		t.Fatalf("count rented accounts: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM financial_ledger_entries WHERE payment_id IN ($1,$2)`, paymentID1, paymentID2).Scan(&ledgerCount); err != nil {
+		t.Fatalf("count conflict ledger entries: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM deposit_holds WHERE payment_id IN ($1,$2)`, paymentID1, paymentID2).Scan(&holdCount); err != nil {
+		t.Fatalf("count conflict deposit holds: %v", err)
+	}
+	if successfulPayments != 1 || activeRentals != 1 || rentedAccounts != 1 || ledgerCount != 2 || holdCount != 1 {
+		t.Fatalf("conflicting transaction mutated multiple flows payments=%d rentals=%d accounts=%d ledger=%d holds=%d", successfulPayments, activeRentals, rentedAccounts, ledgerCount, holdCount)
 	}
 }
 
@@ -1449,7 +1538,7 @@ func TestWalletRefundCreditsBalanceAndDepositOnce(t *testing.T) {
 		t.Fatalf("failed to read balance before refund: %v", err)
 	}
 
-	result, err := paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	result, err := paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("RefundWalletPayment failed: %v", err)
 	}
@@ -1489,7 +1578,7 @@ func TestWalletRefundCreditsBalanceAndDepositOnce(t *testing.T) {
 		t.Fatalf("unexpected refund side effects principal=%d deposit=%d audit=%d security=%d", principalLedgerCount, depositLedgerCount, auditCount, securityCount)
 	}
 
-	result, err = paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	result, err = paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("refund replay failed: %v", err)
 	}
@@ -1510,7 +1599,7 @@ func TestWalletRefundPrincipalOnlyScenarios(t *testing.T) {
 
 	userID, accountID, rentalID, paymentID := int64(9991), int64(9992), int64(9993), int64(9994)
 	seedWalletPaidRefundableRental(t, pool, userID, accountID, rentalID, paymentID, 10000, 500, 0)
-	result, err := paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	result, err := paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("zero-deposit refund failed: %v", err)
 	}
@@ -1520,10 +1609,10 @@ func TestWalletRefundPrincipalOnlyScenarios(t *testing.T) {
 
 	userID2, accountID2, rentalID2, paymentID2 := int64(9995), int64(9996), int64(9997), int64(9998)
 	seedWalletPaidRefundableRental(t, pool, userID2, accountID2, rentalID2, paymentID2, 10000, 500, 500)
-	if _, err := paymentService.ReleaseDeposit(context.Background(), 7103, "ADMIN", rentalID2, time.Now().UTC()); err != nil {
+	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, time.Now().UTC()); err != nil {
 		t.Fatalf("failed to release deposit before refund test: %v", err)
 	}
-	result, err = paymentService.RefundWalletPayment(context.Background(), userID2, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	result, err = paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("released-hold principal refund failed: %v", err)
 	}
@@ -1533,10 +1622,10 @@ func TestWalletRefundPrincipalOnlyScenarios(t *testing.T) {
 
 	userID3, accountID3, rentalID3, paymentID3 := int64(10001), int64(10002), int64(10003), int64(10004)
 	seedWalletPaidRefundableRental(t, pool, userID3, accountID3, rentalID3, paymentID3, 10000, 500, 500)
-	if _, err := paymentService.ForfeitDeposit(context.Background(), 7104, "ADMIN", rentalID3, "damage_confirmed", time.Now().UTC()); err != nil {
+	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID3, "damage_confirmed", time.Now().UTC()); err != nil {
 		t.Fatalf("failed to forfeit deposit before refund test: %v", err)
 	}
-	result, err = paymentService.RefundWalletPayment(context.Background(), userID3, "ADMIN", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC())
+	result, err = paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("forfeited-hold principal refund failed: %v", err)
 	}
@@ -1551,7 +1640,7 @@ func TestWalletRefundRejectsInvalidEligibilityAndRoles(t *testing.T) {
 
 	userID, accountID, rentalID, paymentID := int64(10011), int64(10012), int64(10013), int64(10014)
 	seedWaitingPaymentRentalWithBalance(t, pool, userID, accountID, rentalID, paymentID, 10000, 500, 500)
-	if _, err := paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
+	if _, err := paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
 		t.Fatalf("expected WAITING_PAYMENT wallet refund rejection, got %v", err)
 	}
 
@@ -1560,13 +1649,13 @@ func TestWalletRefundRejectsInvalidEligibilityAndRoles(t *testing.T) {
 	if _, err := paymentService.PayRentalWithBalance(context.Background(), userID2, rentalID2, "127.0.0.1", "test", time.Now().UTC()); err != nil {
 		t.Fatalf("wallet payment failed for ACTIVE refund rejection test: %v", err)
 	}
-	if _, err := paymentService.RefundWalletPayment(context.Background(), userID2, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
+	if _, err := paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
 		t.Fatalf("expected ACTIVE wallet refund rejection, got %v", err)
 	}
 
 	userID3, accountID3, rentalID3, paymentID3 := int64(10031), int64(10032), int64(10033), int64(10034)
 	seedHeldDepositSettlementRental(t, pool, userID3, accountID3, rentalID3, paymentID3, 500, 500)
-	if _, err := paymentService.RefundWalletPayment(context.Background(), userID3, "ADMIN", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
+	if _, err := paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC()); !errors.Is(err, payment.ErrWalletRefundNotAllowed) {
 		t.Fatalf("expected provider-paid wallet refund rejection, got %v", err)
 	}
 
@@ -1589,12 +1678,12 @@ func TestWalletRefundConcurrentWithDepositSettlement(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, refundErr = paymentService.RefundWalletPayment(context.Background(), userID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
+		_, refundErr = paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", time.Now().UTC())
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		_, releaseErr = paymentService.ReleaseDeposit(context.Background(), 7203, "ADMIN", rentalID, time.Now().UTC())
+		_, releaseErr = paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, time.Now().UTC())
 	}()
 	close(start)
 	wg.Wait()
@@ -1630,12 +1719,12 @@ func TestWalletRefundConcurrentWithDepositSettlement(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, refundErr2 = paymentService.RefundWalletPayment(context.Background(), userID2, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC())
+		_, refundErr2 = paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID2, "SERVICE_UNAVAILABLE", time.Now().UTC())
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), 7205, "ADMIN", rentalID2, "damage_confirmed", time.Now().UTC())
+		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, "damage_confirmed", time.Now().UTC())
 	}()
 	close(start)
 	wg.Wait()

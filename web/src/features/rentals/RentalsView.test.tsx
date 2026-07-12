@@ -39,7 +39,6 @@ function renderRentalsView({
       credentialsError={null}
       credentialsLoading={false}
       onCancel={noopRentalAction}
-      onExtend={noopRentalAction}
       onLoadCredentials={onLoadCredentials}
       onPayWithBalance={onPayWithBalance}
       onRefreshStatus={noopRefresh}
@@ -55,6 +54,19 @@ function renderRentalsView({
 }
 
 describe("RentalsView critical flows", () => {
+  it("renders the user-facing deposit settlement label", () => {
+    renderRentalsView({ rentals: [makeRental({ deposit_status: "RELEASED" })] });
+
+    expect(screen.getAllByText("Депозит возвращён на баланс").length).toBeGreaterThan(0);
+  });
+
+  it("renders UNKNOWN deposit state as a warning instead of no deposit", () => {
+    renderRentalsView({ rentals: [makeRental({ deposit_status: "UNKNOWN" })] });
+
+    expect(screen.getAllByText("Статус депозита неизвестен").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Депозит не удерживается")).not.toBeInTheDocument();
+  });
+
   it("shows an active wallet payment button when balance is sufficient", () => {
     renderRentalsView();
 
@@ -88,7 +100,6 @@ describe("RentalsView critical flows", () => {
           credentialsError={null}
           credentialsLoading={false}
           onCancel={noopRentalAction}
-          onExtend={noopRentalAction}
           onLoadCredentials={noopRentalAction}
           onPayWithBalance={(nextRental) => {
             onPayWithBalance(nextRental.id);
@@ -133,7 +144,6 @@ describe("RentalsView critical flows", () => {
           credentialsError={null}
           credentialsLoading={false}
           onCancel={noopRentalAction}
-          onExtend={noopRentalAction}
           onLoadCredentials={onLoadCredentials}
           onPayWithBalance={() => {
             setPayment((current) => ({ ...current, status: PAYMENT_STATUS_SUCCESS }));
@@ -173,6 +183,8 @@ describe("RentalsView critical flows", () => {
     });
 
     expect(screen.getByLabelText("Get rental credentials")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Продлить" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Отменить" })).toBeDisabled();
   });
 
   it("keeps credentials out of browser storage", async () => {
@@ -191,7 +203,6 @@ describe("RentalsView critical flows", () => {
           credentialsError={null}
           credentialsLoading={false}
           onCancel={noopRentalAction}
-          onExtend={noopRentalAction}
           onLoadCredentials={() => setCredentials({ login: "demo_login", password: "demo_password" })}
           onPayWithBalance={noopRentalAction}
           onRefreshStatus={noopRefresh}

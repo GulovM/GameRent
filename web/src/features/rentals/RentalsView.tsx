@@ -9,6 +9,7 @@ import {
   canRequestCredentials,
   findPaymentForRental,
   getRentalStatusClass,
+  isRentalExpiredByTime,
   RENTAL_STATUS_ACTIVE,
   RENTAL_STATUS_WAITING_PAYMENT,
   rentalStatusLabels
@@ -22,7 +23,6 @@ type RentalsViewProps = {
   credentialsError: string | null;
   credentialsLoading: boolean;
   onCancel: (rental: Rental) => void;
-  onExtend: (rental: Rental) => void;
   onLoadCredentials: (rental: Rental) => void;
   onPayWithBalance: (rental: Rental) => void;
   onRefreshStatus: () => void;
@@ -43,7 +43,6 @@ export function RentalsView({
   credentialsError,
   credentialsLoading,
   onCancel,
-  onExtend,
   onLoadCredentials,
   onPayWithBalance,
   onRefreshStatus,
@@ -92,7 +91,7 @@ export function RentalsView({
       <div className="section-heading">
         <div>
           <h2>Мои аренды</h2>
-          <p>Активные сессии, история, продление, отмена и refund summary.</p>
+          <p>Активные сессии, история, оплата, отмена и refund summary. Paid extension is not available yet.</p>
         </div>
         <button className="secondary-button" disabled={rentalsRefreshing} onClick={onRefreshStatus} type="button">
           <RefreshCcw size={18} />
@@ -130,10 +129,7 @@ export function RentalsView({
                   <button className="secondary-button" onClick={() => onSelectRental(rental.id)} type="button">
                     Details
                   </button>
-                  <button className="secondary-button" disabled={rental.status !== RENTAL_STATUS_ACTIVE} onClick={() => onExtend(rental)} type="button">
-                    Продлить
-                  </button>
-                  <button className="danger-button" disabled={rental.status > RENTAL_STATUS_ACTIVE} onClick={() => onCancel(rental)} type="button">
+                  <button className="danger-button" disabled={rental.status !== RENTAL_STATUS_WAITING_PAYMENT} onClick={() => onCancel(rental)} type="button">
                     Отменить
                   </button>
                   {canLoadCredentials && (

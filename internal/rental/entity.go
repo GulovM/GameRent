@@ -199,7 +199,7 @@ func (r *Rental) Complete(now time.Time) error {
 }
 
 func (r *Rental) Cancel(reason string, now time.Time) error {
-	if r.Status != StatusWaitingPayment && r.Status != StatusActive {
+	if r.Status != StatusWaitingPayment {
 		return ErrCannotCancel
 	}
 	reasonClean := strings.TrimSpace(reason)

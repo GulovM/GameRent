@@ -9,6 +9,7 @@ import (
 	"rent_game_accs/internal/shared/database"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,6 +24,8 @@ const (
 	ledgerEntryBalanceDebit            int16 = 5
 	ledgerEntryBalanceRefundCredit     int16 = 6
 	ledgerEntryDepositRefundCredit     int16 = 7
+	ledgerEntryAdminBalanceCredit      int16 = 8
+	ledgerEntryAdminBalanceDebit       int16 = 9
 	depositHoldStatusHeld              int16 = 1
 	depositHoldStatusReleased          int16 = 2
 	depositHoldStatusForfeited         int16 = 3
@@ -36,10 +39,12 @@ const (
 	securityEventTypeDepositForfeited  int16 = 12
 	securityEventTypeWalletPayment     int16 = 13
 	securityEventTypeWalletRefund      int16 = 14
+	securityEventTypeBalanceAdjustment int16 = 15
 )
 
 type Repository interface {
 	WithinTransaction(ctx context.Context, fn func(ctx context.Context) error) error
+	RequireCurrentAdmin(ctx context.Context, actorUserID int64) error
 	CreatePendingPayment(ctx context.Context, rentalID, userID int64, amount int64, currency string) (paymentID int64, err error)
 	LockWalletPaymentState(ctx context.Context, rentalID, userID int64) (*WalletPaymentState, error)
 	DebitUserBalance(ctx context.Context, userID, amount int64, now time.Time) error
@@ -52,6 +57,13 @@ type Repository interface {
 	CountUserRefundEntries(ctx context.Context, userID int64) (int64, error)
 	ListAdminRentalEntries(ctx context.Context, filters AdminRentalListFilter) ([]AdminRentalEntry, error)
 	SummarizeAdminRentals(ctx context.Context, filters AdminRentalListFilter) (AdminRentalSummary, error)
+	GetAdminRentalDetail(ctx context.Context, rentalID int64) (*AdminRentalDetail, error)
+	LockBalanceAdjustmentKey(ctx context.Context, canonicalKey string) error
+	GetAdminBalanceAdjustment(ctx context.Context, canonicalKey string) (*AdminBalanceAdjustmentResult, error)
+	LockAdminAndUserBalanceForAdjustment(ctx context.Context, actorUserID, targetUserID int64) (*UserBalance, error)
+	InsertAdminBalanceAdjustmentLedger(ctx context.Context, record AdminBalanceAdjustmentRecord) (ledgerEntryID int64, createdAt time.Time, err error)
+	SetUserBalance(ctx context.Context, userID, balance int64, now time.Time) error
+	LogAdminBalanceAdjustmentSecurityEvent(ctx context.Context, targetUserID int64, clientIP, userAgent string, metadata []byte) error
 	LockWalletRefundState(ctx context.Context, rentalID int64) (*WalletRefundState, error)
 	LockPaymentForWebhookByID(ctx context.Context, paymentID int64) (*WebhookPaymentState, error)
 	LockPaymentForWebhookByExternalTransaction(ctx context.Context, provider, externalTransactionID string) (*WebhookPaymentState, error)
@@ -78,9 +90,6 @@ type Repository interface {
 	LogDepositSecurityEvent(ctx context.Context, eventType int16, userID, accountID, rentalID int64, userAgent string, metadata []byte) error
 	LogWalletSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error
 	InsertAuditLog(ctx context.Context, actorUserID int64, entityType string, entityID int64, action string, oldValues, newValues []byte) error
-	UpdatePaymentSuccess(ctx context.Context, paymentID int64, extTxID string) (rentalID, userID int64, amount int64, currency string, err error)
-	ActivateRental(ctx context.Context, rentalID int64) (accountID int64, err error)
-	MarkAccountRented(ctx context.Context, accountID int64) (login string, encPassword []byte, steamID64 string, err error)
 	LogSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error
 }
 
@@ -566,6 +575,10 @@ func publicLedgerDisplayType(entryType int16) string {
 		return "BALANCE_REFUND_CREDIT"
 	case ledgerEntryDepositRefundCredit:
 		return "DEPOSIT_REFUND_CREDIT"
+	case ledgerEntryAdminBalanceCredit:
+		return "ADMIN_BALANCE_CREDIT"
+	case ledgerEntryAdminBalanceDebit:
+		return "ADMIN_BALANCE_DEBIT"
 	default:
 		return "UNKNOWN"
 	}
@@ -694,6 +707,10 @@ func (r *PostgresRepository) MarkPaymentSuccessful(ctx context.Context, paymentI
 		WHERE id = $2 AND status = 1`
 	tag, err := db.Exec(ctx, query, externalTransactionID, paymentID)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrWebhookExternalTxMismatch
+		}
 		return err
 	}
 	if tag.RowsAffected() == 0 {
@@ -1225,46 +1242,6 @@ func (r *PostgresRepository) InsertAuditLog(ctx context.Context, actorUserID int
 		) VALUES ($1, $2, $3, $4, COALESCE($5::jsonb, '{}'::jsonb), COALESCE($6::jsonb, '{}'::jsonb), NOW())`
 	_, err := db.Exec(ctx, query, actorUserID, entityType, entityID, action, oldValues, newValues)
 	return err
-}
-
-func (r *PostgresRepository) UpdatePaymentSuccess(ctx context.Context, paymentID int64, extTxID string) (int64, int64, int64, string, error) {
-	db := database.GetTxOrPool(ctx, r.pool)
-	var rentalID, userID int64
-	var amount int64
-	var currency string
-	query := `
-		UPDATE payments 
-		SET status = 2, external_transaction_id = $1, processed_at = NOW() 
-		WHERE (id = $2 OR rental_id = $2) AND status < 2
-		RETURNING rental_id, user_id, amount, currency`
-	err := db.QueryRow(ctx, query, extTxID, paymentID).Scan(&rentalID, &userID, &amount, &currency)
-	return rentalID, userID, amount, currency, err
-}
-
-func (r *PostgresRepository) ActivateRental(ctx context.Context, rentalID int64) (int64, error) {
-	db := database.GetTxOrPool(ctx, r.pool)
-	var accountID int64
-	query := `
-		UPDATE rentals 
-		SET status = 2 
-		WHERE id = $1 
-		RETURNING account_id`
-	err := db.QueryRow(ctx, query, rentalID).Scan(&accountID)
-	return accountID, err
-}
-
-func (r *PostgresRepository) MarkAccountRented(ctx context.Context, accountID int64) (string, []byte, string, error) {
-	db := database.GetTxOrPool(ctx, r.pool)
-	var login string
-	var encPassword []byte
-	var steamID64 string
-	query := `
-		UPDATE accounts 
-		SET status = 4, updated_at = NOW() 
-		WHERE id = $1 
-		RETURNING login, encrypted_password, steam_id64`
-	err := db.QueryRow(ctx, query, accountID).Scan(&login, &encPassword, &steamID64)
-	return login, encPassword, steamID64, err
 }
 
 func (r *PostgresRepository) LogSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error {

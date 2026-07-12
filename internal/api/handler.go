@@ -9,12 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"rent_game_accs/internal/account"
 	"rent_game_accs/internal/game"
@@ -23,6 +25,7 @@ import (
 	pkg_http_server "rent_game_accs/internal/pkg/transport/http/server"
 	"rent_game_accs/internal/rental"
 	repo_postgres "rent_game_accs/internal/repository/postgres"
+	shared_authorization "rent_game_accs/internal/shared/authorization"
 	shared_logger "rent_game_accs/internal/shared/logger"
 	shared_middleware "rent_game_accs/internal/shared/middleware"
 	shared_response "rent_game_accs/internal/shared/response"
@@ -30,8 +33,8 @@ import (
 
 type SteamSyncRepository interface {
 	GetAccountSyncDetails(ctx context.Context, accountID int64) (string, string, error)
-	SyncAccountGames(ctx context.Context, accountID int64, games []repo_postgres.AccountGameSyncInfo) error
-	BanAccount(ctx context.Context, accountID int64) error
+	SyncAccountGamesAsCurrentAdmin(ctx context.Context, actorUserID, accountID int64, games []repo_postgres.AccountGameSyncInfo) error
+	DisableAccountIfIdleAsCurrentAdmin(ctx context.Context, actorUserID, accountID int64) error
 }
 
 type Handler struct {
@@ -62,7 +65,7 @@ func NewHandler(
 }
 
 func (h *Handler) Routes(jwtSecret string, log *shared_logger.Logger) []pkg_http_server.Route {
-	authMw := shared_middleware.Auth(jwtSecret, log)
+	authMw := shared_middleware.Auth(jwtSecret, log, h.pool)
 	return []pkg_http_server.Route{
 		pkg_http_server.NewRoute("GET", "/me/balance", wrap(h.GetMyBalance, authMw)),
 		pkg_http_server.NewRoute("GET", "/me/ledger", wrap(h.ListMyLedger, authMw)),
@@ -89,6 +92,7 @@ func (h *Handler) Routes(jwtSecret string, log *shared_logger.Logger) []pkg_http
 		pkg_http_server.NewRoute("DELETE", "/accounts/{id}/favorite", wrap(h.FavoriteOK, authMw)),
 		pkg_http_server.NewRoute("GET", "/admin/accounts", wrap(h.AdminListAccounts, authMw)),
 		pkg_http_server.NewRoute("GET", "/admin/rentals", wrap(h.AdminListRentals, authMw)),
+		pkg_http_server.NewRoute("GET", "/admin/rentals/{rentalId}", wrap(h.AdminGetRentalDetail, authMw)),
 		pkg_http_server.NewRoute("GET", "/admin/refund-reason-codes", wrap(h.AdminRefundReasonCodes, authMw)),
 		pkg_http_server.NewRoute("POST", "/admin/accounts", wrap(h.AdminCreateAccount, authMw)),
 		pkg_http_server.NewRoute("PATCH", "/admin/accounts/{accountId}", wrap(h.AdminUpdateAccount, authMw)),
@@ -98,6 +102,7 @@ func (h *Handler) Routes(jwtSecret string, log *shared_logger.Logger) []pkg_http
 		pkg_http_server.NewRoute("POST", "/admin/rentals/{rentalId}/deposit/forfeit", wrap(h.AdminForfeitDeposit, authMw)),
 		pkg_http_server.NewRoute("GET", "/admin/users", wrap(h.AdminListUsers, authMw)),
 		pkg_http_server.NewRoute("PATCH", "/admin/users/{userId}", wrap(h.AdminUpdateUser, authMw)),
+		pkg_http_server.NewRoute("POST", "/admin/users/{userId}/balance-adjustments", wrap(h.AdminAdjustUserBalance, authMw)),
 		pkg_http_server.NewRoute("GET", "/admin/audit-logs", wrap(h.AdminAuditLogs, authMw)),
 	}
 }
@@ -136,7 +141,7 @@ func (h *Handler) CreateRental(w http.ResponseWriter, r *http.Request) {
 		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", err.Error())
 		return
 	}
-	rent, err := h.rentalService.RentAccount(r.Context(), userID, req.AccountID, time.Duration(req.DurationHours)*time.Hour, time.Now())
+	rent, err := h.rentalService.RentAccount(r.Context(), userID, req.AccountID, time.Duration(req.DurationHours)*time.Hour, time.Now().UTC())
 	if err != nil {
 		shared_response.Error(w, http.StatusConflict, "RENTAL_FAILED", err.Error())
 		return
@@ -379,7 +384,10 @@ func (h *Handler) GetMyRentalCredentials(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	creds, err := h.rentalService.GetRentalCredentials(r.Context(), userID, rentalID, time.Now().UTC())
+	creds, err := h.rentalService.GetRentalCredentials(r.Context(), userID, rentalID, rental.CredentialRequestContext{
+		IPAddress: clientIPFromRequest(r),
+		UserAgent: r.UserAgent(),
+	}, time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, rental.ErrCredentialsNotAvailable) {
 			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Rental not found")
@@ -389,17 +397,9 @@ func (h *Handler) GetMyRentalCredentials(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	metadata, _ := json.Marshal(map[string]any{
-		"event":     "rental_credentials_issued",
-		"rental_id": rentalID,
-		"user_id":   userID,
-	})
-	_, _ = h.pool.Exec(r.Context(), `
-		INSERT INTO security_events (
-			user_id, account_id, rental_id, event_type, ip_address, user_agent, success, metadata, created_at
-		) VALUES ($1, NULL, $2, 7, NULL, NULL, true, $3, NOW())`,
-		userID, rentalID, metadata,
-	)
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 
 	shared_response.JSON(w, http.StatusOK, rentalCredentialsResponse{
 		Login:    creds.Login,
@@ -452,7 +452,7 @@ func (h *Handler) CancelRental(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := h.rentalService.CancelRental(r.Context(), userID, id, "cancelled by user", time.Now())
+	_, err := h.rentalService.CancelRental(r.Context(), userID, id, "cancelled by user", time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, rental.ErrCannotCancel) || errors.Is(err, rental.ErrRentalNotFound) {
 			shared_response.Error(w, http.StatusConflict, "CANCEL_FAILED", "Rental cannot be cancelled")
@@ -476,37 +476,16 @@ func (h *Handler) CalculateRental(w http.ResponseWriter, r *http.Request) {
 		shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Account not found")
 		return
 	}
-	shared_response.JSON(w, http.StatusOK, map[string]any{"price_per_hour": money(hourly), "security_deposit": money(deposit), "duration_hours": req.DurationHours, "total_price": money(hourly*int64(req.DurationHours) + deposit)})
-}
-
-type extendRentalRequest struct {
-	DurationHours int `json:"duration_hours"`
-}
-
-func (r *extendRentalRequest) Validate() error {
-	if r.DurationHours < 1 || r.DurationHours > 720 {
-		return errText("duration_hours must be between 1 and 720")
+	_, total, err := rental.CalculateRentalTotal(hourly, deposit, int64(req.DurationHours))
+	if err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Configured rental price exceeds the supported range")
+		return
 	}
-	return nil
+	shared_response.JSON(w, http.StatusOK, map[string]any{"price_per_hour": money(hourly), "security_deposit": money(deposit), "duration_hours": req.DurationHours, "total_price": money(total)})
 }
 
 func (h *Handler) ExtendRental(w http.ResponseWriter, r *http.Request) {
-	userID := shared_middleware.GetUserID(r.Context())
-	id, ok := pathID(w, r, "id")
-	if !ok {
-		return
-	}
-	var req extendRentalRequest
-	if err := pkg_http_request.DecodeAndValidateRequest(r, &req); err != nil {
-		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", err.Error())
-		return
-	}
-	tag, err := h.pool.Exec(r.Context(), `UPDATE rentals SET end_at=end_at + ($1::TEXT || ' hours')::INTERVAL, updated_at=NOW() WHERE id=$2 AND user_id=$3 AND status=2`, req.DurationHours, id, userID)
-	if err != nil || tag.RowsAffected() == 0 {
-		shared_response.Error(w, http.StatusConflict, "EXTEND_FAILED", "Rental cannot be extended")
-		return
-	}
-	shared_response.JSON(w, http.StatusOK, map[string]string{"message": "Rental extended"})
+	shared_response.Error(w, http.StatusNotImplemented, "EXTENSION_NOT_SUPPORTED", "Paid rental extension is not supported")
 }
 
 func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
@@ -719,6 +698,34 @@ func (h *Handler) AdminListRentals(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) AdminGetRentalDetail(w http.ResponseWriter, r *http.Request) {
+	if !admin(w, r) {
+		return
+	}
+
+	rentalID, err := strconv.ParseInt(r.PathValue("rentalId"), 10, 64)
+	if err != nil || rentalID <= 0 {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "rentalId must be a positive integer")
+		return
+	}
+
+	detail, err := h.paymentService.GetAdminRentalDetail(r.Context(), rentalID)
+	if err != nil {
+		if errors.Is(err, payment.ErrInvalidAdminRentalFilters) {
+			shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", err.Error())
+			return
+		}
+		if errors.Is(err, payment.ErrAdminRentalNotFound) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Rental not found")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to load admin rental detail")
+		return
+	}
+
+	shared_response.JSON(w, http.StatusOK, adminRentalDetailDTO(detail))
+}
+
 func (h *Handler) AdminRefundReasonCodes(w http.ResponseWriter, r *http.Request) {
 	if !admin(w, r) {
 		return
@@ -748,8 +755,23 @@ func (h *Handler) AdminCreateAccount(w http.ResponseWriter, r *http.Request) {
 		PricePerHour    int64  `json:"price_per_hour"`
 		SecurityDeposit int64  `json:"security_deposit"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SteamID64 == "" || req.SteamLogin == "" || req.SteamPassword == "" || req.PricePerHour <= 0 {
-		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "steam credentials and positive price_per_hour are required")
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid account creation payload")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid account creation payload")
+		return
+	}
+	if req.SteamID64 == "" || req.SteamLogin == "" || req.SteamPassword == "" || req.PricePerHour <= 0 || req.SecurityDeposit < 0 {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "steam credentials, positive price_per_hour, and non-negative security_deposit are required")
+		return
+	}
+	if _, _, err := rental.CalculateRentalTotal(req.PricePerHour, req.SecurityDeposit, 720); err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Account pricing exceeds the supported range")
 		return
 	}
 	encrypted, err := h.accountRepo.Encrypt(req.SteamPassword)
@@ -758,13 +780,31 @@ func (h *Handler) AdminCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var id int64
-	err = h.pool.QueryRow(r.Context(), `INSERT INTO accounts (steam_id64,login,encrypted_password,hourly_price,deposit_amount,status,steam_guard_enabled,inventory_verified,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,2,true,true,NOW(),NOW()) RETURNING id`, req.SteamID64, req.SteamLogin, encrypted, req.PricePerHour, req.SecurityDeposit).Scan(&id)
+	tx, err := h.pool.Begin(r.Context())
 	if err != nil {
-		shared_response.Error(w, http.StatusConflict, "CREATE_FAILED", err.Error())
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to create account")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := shared_authorization.RequireCurrentAdminForMutation(r.Context(), tx, shared_middleware.GetUserID(r.Context())); err != nil {
+		if errors.Is(err, shared_authorization.ErrCurrentAdminRequired) {
+			shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", "Current administrator authorization is required")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to authorize account creation")
+		return
+	}
+	err = tx.QueryRow(r.Context(), `INSERT INTO accounts (steam_id64,login,encrypted_password,hourly_price,deposit_amount,status,steam_guard_enabled,inventory_verified,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,2,true,true,NOW(),NOW()) RETURNING id`, req.SteamID64, req.SteamLogin, encrypted, req.PricePerHour, req.SecurityDeposit).Scan(&id)
+	if err != nil {
+		shared_response.Error(w, http.StatusConflict, "CREATE_FAILED", "Account could not be created")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to create account")
 		return
 	}
 
-	gamesCount, syncErr := h.syncSteamLibrary(r.Context(), id)
+	gamesCount, syncErr := h.syncSteamLibrary(r.Context(), shared_middleware.GetUserID(r.Context()), id)
 	if syncErr != nil {
 		shared_response.JSON(w, http.StatusCreated, map[string]any{
 			"id":          id,
@@ -786,14 +826,74 @@ func (h *Handler) AdminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Status          *int16 `json:"status"`
 		PricePerHour    *int64 `json:"price_per_hour"`
 		SecurityDeposit *int64 `json:"security_deposit"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	_, err := h.pool.Exec(r.Context(), `UPDATE accounts SET status=COALESCE($1,status), hourly_price=COALESCE($2,hourly_price), deposit_amount=COALESCE($3,deposit_amount), updated_at=NOW() WHERE id=$4`, req.Status, req.PricePerHour, req.SecurityDeposit, id)
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid account update payload")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid account update payload")
+		return
+	}
+	if req.PricePerHour != nil && *req.PricePerHour <= 0 {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "price_per_hour must be positive")
+		return
+	}
+	if req.SecurityDeposit != nil && *req.SecurityDeposit < 0 {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "security_deposit must be non-negative")
+		return
+	}
+	tx, err := h.pool.Begin(r.Context())
 	if err != nil {
-		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update account")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := shared_authorization.RequireCurrentAdminForMutation(r.Context(), tx, shared_middleware.GetUserID(r.Context())); err != nil {
+		if errors.Is(err, shared_authorization.ErrCurrentAdminRequired) {
+			shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", "Current administrator authorization is required")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to authorize account update")
+		return
+	}
+	var currentPrice, currentDeposit int64
+	err = tx.QueryRow(r.Context(), `SELECT hourly_price, deposit_amount FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, id).Scan(&currentPrice, &currentDeposit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Account not found")
+		return
+	}
+	if err != nil {
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update account")
+		return
+	}
+	mergedPrice, mergedDeposit := currentPrice, currentDeposit
+	if req.PricePerHour != nil {
+		mergedPrice = *req.PricePerHour
+	}
+	if req.SecurityDeposit != nil {
+		mergedDeposit = *req.SecurityDeposit
+	}
+	if _, _, err := rental.CalculateRentalTotal(mergedPrice, mergedDeposit, 720); err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Account pricing exceeds the supported range")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `UPDATE accounts SET hourly_price=COALESCE($1,hourly_price), deposit_amount=COALESCE($2,deposit_amount), updated_at=NOW() WHERE id=$3 AND deleted_at IS NULL`, req.PricePerHour, req.SecurityDeposit, id)
+	if err != nil {
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update account")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Account not found")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update account")
 		return
 	}
 	shared_response.JSON(w, http.StatusOK, map[string]string{"message": "Account updated"})
@@ -808,8 +908,16 @@ func (h *Handler) AdminSyncAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	gamesCount, err := h.syncSteamLibrary(r.Context(), id)
+	gamesCount, err := h.syncSteamLibrary(r.Context(), shared_middleware.GetUserID(r.Context()), id)
 	if err != nil {
+		if errors.Is(err, shared_authorization.ErrCurrentAdminRequired) {
+			shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", "Current administrator authorization is required")
+			return
+		}
+		if errors.Is(err, repo_postgres.ErrAccountLifecycleConflict) {
+			shared_response.Error(w, http.StatusConflict, "ACCOUNT_LIFECYCLE_CONFLICT", "Account cannot be disabled while a rental is waiting for payment or active")
+			return
+		}
 		shared_response.Error(w, http.StatusBadGateway, "STEAM_SYNC_FAILED", err.Error())
 		return
 	}
@@ -817,7 +925,7 @@ func (h *Handler) AdminSyncAccount(w http.ResponseWriter, r *http.Request) {
 	shared_response.JSON(w, http.StatusOK, map[string]any{"message": "Account library synced", "games_count": gamesCount})
 }
 
-func (h *Handler) syncSteamLibrary(ctx context.Context, accountID int64) (int, error) {
+func (h *Handler) syncSteamLibrary(ctx context.Context, actorUserID, accountID int64) (int, error) {
 	if h.steamClient == nil || h.steamSyncRepo == nil {
 		return 0, fmt.Errorf("steam synchronization is not configured")
 	}
@@ -835,7 +943,7 @@ func (h *Handler) syncSteamLibrary(ctx context.Context, accountID int64) (int, e
 		return 0, fmt.Errorf("failed to check VAC bans for %s: %w", login, err)
 	}
 	if vacBanned {
-		if banErr := h.steamSyncRepo.BanAccount(ctx, accountID); banErr != nil {
+		if banErr := h.steamSyncRepo.DisableAccountIfIdleAsCurrentAdmin(ctx, actorUserID, accountID); banErr != nil {
 			return 0, fmt.Errorf("account is VAC banned and could not be disabled: %w", banErr)
 		}
 		return 0, fmt.Errorf("account is VAC banned and was disabled")
@@ -845,7 +953,7 @@ func (h *Handler) syncSteamLibrary(ctx context.Context, accountID int64) (int, e
 	if err != nil {
 		return 0, fmt.Errorf("failed to fetch owned games for %s: %w", login, err)
 	}
-	if err := h.steamSyncRepo.SyncAccountGames(ctx, accountID, games); err != nil {
+	if err := h.steamSyncRepo.SyncAccountGamesAsCurrentAdmin(ctx, actorUserID, accountID, games); err != nil {
 		return 0, fmt.Errorf("failed to persist Steam library: %w", err)
 	}
 
@@ -885,20 +993,178 @@ func (h *Handler) AdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TrustScore *int    `json:"trust_score"`
 		IsBlocked  *bool   `json:"is_blocked"`
-		Balance    *int64  `json:"balance"`
 		Role       *string `json:"role"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid admin user update payload")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid admin user update payload")
+		return
+	}
 	if req.Role != nil && *req.Role != "ADMIN" && *req.Role != "RENT" {
 		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "role must be ADMIN or RENT")
 		return
 	}
-	_, err := h.pool.Exec(r.Context(), `UPDATE users SET trust_score=COALESCE($1,trust_score), is_blocked=COALESCE($2,is_blocked), balance=COALESCE($3,balance), role=COALESCE($4,role), updated_at=NOW() WHERE id=$5`, req.TrustScore, req.IsBlocked, req.Balance, req.Role, id)
+	if req.TrustScore != nil && (*req.TrustScore < 0 || *req.TrustScore > 1000) {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "trust_score must be between 0 and 1000")
+		return
+	}
+
+	tx, err := h.pool.Begin(r.Context())
 	if err != nil {
-		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update user")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	actorUserID := shared_middleware.GetUserID(r.Context())
+	if err := shared_authorization.RequireCurrentAdminForMutation(r.Context(), tx, actorUserID); err != nil {
+		if errors.Is(err, shared_authorization.ErrCurrentAdminRequired) {
+			shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", "Current administrator authorization is required")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to authorize user update")
+		return
+	}
+	if actorUserID == id {
+		shared_response.Error(w, http.StatusConflict, "ADMIN_USER_UPDATE_FORBIDDEN", "Administrators cannot change their own administrative user state")
+		return
+	}
+	var oldRole string
+	var oldBlocked bool
+	if err := tx.QueryRow(r.Context(), `SELECT role, is_blocked FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, id).Scan(&oldRole, &oldBlocked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "User not found")
+			return
+		}
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update user")
+		return
+	}
+
+	tag, err := tx.Exec(r.Context(), `UPDATE users SET trust_score=COALESCE($1,trust_score), is_blocked=COALESCE($2,is_blocked), role=COALESCE($3,role), updated_at=NOW() WHERE id=$4 AND deleted_at IS NULL`, req.TrustScore, req.IsBlocked, req.Role, id)
+	if err != nil {
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update user")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "User not found")
+		return
+	}
+	newRole, newBlocked := oldRole, oldBlocked
+	if req.Role != nil {
+		newRole = *req.Role
+	}
+	if req.IsBlocked != nil {
+		newBlocked = *req.IsBlocked
+	}
+	if newRole != oldRole || newBlocked != oldBlocked {
+		if _, err := tx.Exec(r.Context(), `UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL`, id); err != nil {
+			shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to revoke user sessions")
+			return
+		}
+		if _, err := tx.Exec(r.Context(), `INSERT INTO audit_logs (actor_user_id, entity_type, entity_id, action, old_values, new_values, created_at) VALUES ($1, 'USER', $2, 'USER_SECURITY_STATE_UPDATED', jsonb_build_object('role',$3::text,'is_blocked',$4::boolean), jsonb_build_object('role',$5::text,'is_blocked',$6::boolean), NOW())`, actorUserID, id, oldRole, oldBlocked, newRole, newBlocked); err != nil {
+			shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to audit user update")
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update user")
 		return
 	}
 	shared_response.JSON(w, http.StatusOK, map[string]string{"message": "User updated"})
+}
+
+type adminBalanceAdjustmentRequest struct {
+	Amount         int64  `json:"amount"`
+	Currency       string `json:"currency"`
+	ReasonCode     string `json:"reason_code"`
+	Comment        string `json:"comment"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+func (h *Handler) AdminAdjustUserBalance(w http.ResponseWriter, r *http.Request) {
+	if !admin(w, r) {
+		return
+	}
+
+	targetUserID, err := strconv.ParseInt(r.PathValue("userId"), 10, 64)
+	if err != nil || targetUserID <= 0 {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "userId must be a positive integer")
+		return
+	}
+
+	var req adminBalanceAdjustmentRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid balance adjustment payload")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Invalid balance adjustment payload")
+		return
+	}
+
+	result, err := h.paymentService.AdjustAdminBalance(
+		r.Context(),
+		shared_middleware.GetUserID(r.Context()),
+		shared_middleware.GetUserRole(r.Context()),
+		targetUserID,
+		payment.AdminBalanceAdjustmentInput{
+			Amount:         req.Amount,
+			Currency:       req.Currency,
+			ReasonCode:     req.ReasonCode,
+			Comment:        req.Comment,
+			IdempotencyKey: req.IdempotencyKey,
+		},
+		clientIPFromRequest(r),
+		r.Header.Get("User-Agent"),
+		time.Now().UTC(),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, payment.ErrAdminRequired):
+			shared_response.Error(w, http.StatusForbidden, "FORBIDDEN", err.Error())
+		case errors.Is(err, payment.ErrFinancialUserNotFound):
+			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "User not found")
+		case errors.Is(err, payment.ErrBalanceAdjustmentAmountRequired),
+			errors.Is(err, payment.ErrBalanceAdjustmentCurrencyUnsupported),
+			errors.Is(err, payment.ErrBalanceAdjustmentReasonRequired),
+			errors.Is(err, payment.ErrBalanceAdjustmentCommentTooLong),
+			errors.Is(err, payment.ErrBalanceAdjustmentIdempotencyRequired),
+			errors.Is(err, payment.ErrBalanceAdjustmentOverflow):
+			shared_response.Error(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", err.Error())
+		case errors.Is(err, payment.ErrBalanceAdjustmentWouldBeNegative),
+			errors.Is(err, payment.ErrBalanceAdjustmentIdempotencyConflict):
+			shared_response.Error(w, http.StatusConflict, "BALANCE_ADJUSTMENT_FAILED", err.Error())
+		default:
+			shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to adjust user balance")
+		}
+		return
+	}
+
+	status := http.StatusCreated
+	if result.IdempotentReplay {
+		status = http.StatusOK
+	}
+	shared_response.JSON(w, status, map[string]any{
+		"adjustment_id":     result.AdjustmentID,
+		"user_id":           result.UserID,
+		"previous_balance":  result.PreviousBalance,
+		"new_balance":       result.NewBalance,
+		"amount":            result.Amount,
+		"currency":          result.Currency,
+		"ledger_entry_id":   result.LedgerEntryID,
+		"idempotency_key":   result.IdempotencyKey,
+		"idempotent_replay": result.IdempotentReplay,
+		"created_at":        result.CreatedAt,
+	})
 }
 
 func (h *Handler) AdminAuditLogs(w http.ResponseWriter, r *http.Request) {
@@ -1144,6 +1410,88 @@ func adminRentalEntryDTO(item payment.AdminRentalEntry) map[string]any {
 	return dto
 }
 
+func adminRentalDetailDTO(detail *payment.AdminRentalDetail) map[string]any {
+	result := map[string]any{
+		"rental": map[string]any{
+			"id":                 detail.Rental.ID,
+			"user_id":            detail.Rental.UserID,
+			"account_id":         detail.Rental.AccountID,
+			"status":             detail.Rental.Status,
+			"start_at":           detail.Rental.StartAt,
+			"end_at":             detail.Rental.EndAt,
+			"rental_price":       money(detail.Rental.RentalPrice),
+			"deposit_amount":     money(detail.Rental.DepositAmount),
+			"payment_expires_at": detail.Rental.PaymentExpiresAt,
+			"created_at":         detail.Rental.CreatedAt,
+			"updated_at":         detail.Rental.UpdatedAt,
+		},
+		"payment": nil,
+		"deposit": nil,
+		"refund_summary": map[string]any{
+			"count":                    detail.RefundSummary.Count,
+			"latest_refund_status":     detail.RefundSummary.LatestStatus,
+			"total_refunded_principal": money(detail.RefundSummary.TotalRefundedPrimary),
+			"total_refunded_deposit":   money(detail.RefundSummary.TotalRefundedDeposit),
+			"latest_processed_at":      detail.RefundSummary.LatestProcessedAt,
+		},
+		"ledger_summary": map[string]any{
+			"counts_by_display_type": detail.LedgerSummary.CountsByDisplayType,
+			"totals_by_display_type": adminLedgerTotalsDTO(detail.LedgerSummary.TotalsByDisplayType),
+			"latest_entries":         adminLedgerEntriesDTO(detail.LedgerSummary.LatestEntries),
+		},
+		"support_flags": map[string]any{
+			"eligible_wallet_refund":        detail.SupportFlags.EligibleWalletRefund,
+			"refund_ineligible_reason":      detail.SupportFlags.RefundIneligibleReason,
+			"has_active_credentials_access": detail.SupportFlags.HasActiveCredentials,
+			"payment_window_expired":        detail.SupportFlags.PaymentWindowExpired,
+		},
+	}
+	if detail.Payment != nil {
+		result["payment"] = map[string]any{
+			"id":         detail.Payment.ID,
+			"status":     detail.Payment.Status,
+			"provider":   detail.Payment.Provider,
+			"amount":     detail.Payment.Amount,
+			"currency":   detail.Payment.Currency,
+			"created_at": detail.Payment.CreatedAt,
+		}
+	}
+	if detail.Deposit != nil {
+		result["deposit"] = map[string]any{
+			"amount":       detail.Deposit.Amount,
+			"currency":     detail.Deposit.Currency,
+			"status":       detail.Deposit.Status,
+			"held_at":      detail.Deposit.HeldAt,
+			"released_at":  detail.Deposit.ReleasedAt,
+			"forfeited_at": detail.Deposit.ForfeitedAt,
+			"refunded_at":  detail.Deposit.RefundedAt,
+		}
+	}
+	return result
+}
+
+func adminLedgerTotalsDTO(totals map[string]int64) map[string]any {
+	result := make(map[string]any, len(totals))
+	for key, value := range totals {
+		result[key] = money(value)
+	}
+	return result
+}
+
+func adminLedgerEntriesDTO(entries []payment.AdminRentalSafeLedgerEntry) []map[string]any {
+	items := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		items = append(items, map[string]any{
+			"id":           entry.ID,
+			"display_type": entry.DisplayType,
+			"amount":       entry.Amount,
+			"currency":     entry.Currency,
+			"created_at":   entry.CreatedAt,
+		})
+	}
+	return items
+}
+
 type publicRentalRefundSummary struct {
 	HasRefund   bool
 	Status      string
@@ -1213,6 +1561,9 @@ func publicDepositStatus(depositAmount int64, holdStatus int16) string {
 	if depositAmount <= 0 {
 		return "NONE"
 	}
+	if holdStatus == 0 {
+		return "NONE"
+	}
 	switch holdStatus {
 	case 1:
 		return "HELD"
@@ -1223,7 +1574,7 @@ func publicDepositStatus(depositAmount int64, holdStatus int16) string {
 	case 4:
 		return "REFUNDED"
 	default:
-		return "NONE"
+		return "UNKNOWN"
 	}
 }
 

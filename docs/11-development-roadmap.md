@@ -92,6 +92,8 @@
 - Разработка воркера `CleanupExpiredRentals` в рамках `Background Scheduler`.
 - Реализация периодического сканирования таблицы `rentals` на предмет активных аренд, где `end_at` меньше текущего времени по `Clock`.
 - Автоматический запуск процесса expiration: перевод `ACTIVE` аренды в `EXPIRED`, освобождение аккаунта в `Available` и прекращение доступа к credentials. Переход `EXPIRED -> COMPLETED` не подключён к текущему API/worker flow.
+- Paid rental extension отложен: текущий endpoint безопасно возвращает `501 EXTENSION_NOT_SUPPORTED`. Возврат функции требует pricing, payment, ledger, idempotency, locking и frontend contract в одном завершённом flow.
+- Generic admin account PATCH не меняет lifecycle status; verification/maintenance actions остаются будущими отдельными domain use cases.
 
 ---
 

@@ -31,10 +31,13 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 
 func (r *PostgresRepository) CreateUser(ctx context.Context, u *User) error {
 	db := database.GetTxOrPool(ctx, r.pool)
-	query := `INSERT INTO users (email, password_hash, first_name, last_name, role, trust_score, is_blocked, balance, created_at, updated_at, deleted_at)
-		VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	query := `INSERT INTO users (email, password_hash, first_name, last_name, role, trust_score, is_blocked, created_at, updated_at, deleted_at)
+		VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id`
-	err := db.QueryRow(ctx, query, u.Email, u.FirstName, u.LastName, string(u.Role), u.TrustScore, u.IsBlocked, u.Balance, u.CreatedAt, u.UpdatedAt, u.DeletedAt).Scan(&u.ID)
+	err := db.QueryRow(ctx, query, u.Email, u.FirstName, u.LastName, string(u.Role), u.TrustScore, u.IsBlocked, u.CreatedAt, u.UpdatedAt, u.DeletedAt).Scan(&u.ID)
+	if err == nil {
+		u.Balance = 0
+	}
 	return err
 }
 
@@ -68,8 +71,8 @@ func (r *PostgresRepository) GetUserByEmail(ctx context.Context, email string) (
 
 func (r *PostgresRepository) UpdateUser(ctx context.Context, u *User) error {
 	db := database.GetTxOrPool(ctx, r.pool)
-	query := `UPDATE users SET email = $1, first_name = $2, last_name = $3, role = $4, trust_score = $5, is_blocked = $6, balance = $7, updated_at = $8, deleted_at = $9 WHERE id = $10`
-	_, err := db.Exec(ctx, query, u.Email, u.FirstName, u.LastName, string(u.Role), u.TrustScore, u.IsBlocked, u.Balance, u.UpdatedAt, u.DeletedAt, u.ID)
+	query := `UPDATE users SET first_name = $1, last_name = $2, updated_at = $3 WHERE id = $4 AND deleted_at IS NULL`
+	_, err := db.Exec(ctx, query, u.FirstName, u.LastName, u.UpdatedAt, u.ID)
 	return err
 }
 

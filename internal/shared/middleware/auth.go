@@ -2,10 +2,15 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 	shared_auth "rent_game_accs/internal/shared/auth"
+	shared_authorization "rent_game_accs/internal/shared/authorization"
+	"rent_game_accs/internal/shared/database"
 	shared_logger "rent_game_accs/internal/shared/logger"
 	shared_response "rent_game_accs/internal/shared/response"
 )
@@ -15,7 +20,7 @@ type contextKey string
 const UserIDKey contextKey = "user_id"
 const UserRoleKey contextKey = "user_role"
 
-func Auth(secret string, log *shared_logger.Logger) func(http.Handler) http.Handler {
+func Auth(secret string, log *shared_logger.Logger, pool *pgxpool.Pool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
@@ -37,8 +42,27 @@ func Auth(secret string, log *shared_logger.Logger) func(http.Handler) http.Hand
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), UserIDKey, claims.UserID)
-			ctx = context.WithValue(ctx, UserRoleKey, claims.Role)
+			currentUser, err := shared_authorization.LoadCurrentUser(r.Context(), database.GetTxOrPool(r.Context(), pool), claims.UserID, false)
+			if err != nil {
+				if errors.Is(err, shared_authorization.ErrCurrentUserForbidden) {
+					shared_response.Error(w, http.StatusUnauthorized, "SESSION_REVOKED", "Current session has been revoked")
+					return
+				}
+				if log != nil {
+					log.Error("failed to load current authenticated user", zap.Error(err))
+				}
+				shared_response.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to authorize current user")
+				return
+			}
+
+			effectiveRole := currentUser.Role
+			// A stale RENT token must never gain ADMIN merely because the database
+			// role was promoted. Promotion requires a fresh authenticated token.
+			if effectiveRole == "ADMIN" && claims.Role != "ADMIN" {
+				effectiveRole = "RENT"
+			}
+			ctx := context.WithValue(r.Context(), UserIDKey, currentUser.ID)
+			ctx = context.WithValue(ctx, UserRoleKey, effectiveRole)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
