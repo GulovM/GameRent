@@ -92,7 +92,7 @@ export function CatalogView({
           <label className="range-control">
             <SlidersHorizontal size={18} />
             до {maxPrice} USD/ч
-            <input max="500" min="10" onChange={(event) => setMaxPrice(Number(event.target.value))} step="10" type="range" value={maxPrice} />
+            <input max="1000" min="10" onChange={(event) => setMaxPrice(Number(event.target.value))} step="10" type="range" value={maxPrice} />
           </label>
         </div>
 

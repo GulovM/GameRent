@@ -11,6 +11,7 @@ import {
   getRentalStatusClass,
   isRentalExpiredByTime,
   RENTAL_STATUS_ACTIVE,
+  RENTAL_STATUS_EXPIRED,
   RENTAL_STATUS_WAITING_PAYMENT,
   rentalStatusLabels
 } from "./rentalStatus";
@@ -56,7 +57,13 @@ export function RentalsView({
 }: RentalsViewProps) {
   const selectedRental = rentals.find((item) => item.id === selectedRentalId) ?? rentals[0];
   const selectedPayment = selectedRental ? findPaymentForRental(payments, selectedRental.id) : undefined;
-  const selectedRentalWaitingPayment = selectedRental?.status === RENTAL_STATUS_WAITING_PAYMENT;
+  const selectedRentalExpiredByTime = selectedRental ? isRentalExpiredByTime(selectedRental) : false;
+  const selectedRentalEffectiveStatus = selectedRental
+    ? selectedRentalExpiredByTime && selectedRental.status === RENTAL_STATUS_ACTIVE
+      ? RENTAL_STATUS_EXPIRED
+      : selectedRental.status
+    : undefined;
+  const selectedRentalWaitingPayment = selectedRentalEffectiveStatus === RENTAL_STATUS_WAITING_PAYMENT;
   const availableBalance = balance?.available_balance ?? 0;
   const balanceKnown = balance !== null;
   const hasEnoughBalance = Boolean(selectedRental && balanceKnown && availableBalance >= selectedRental.total_price.amount);
@@ -101,9 +108,11 @@ export function RentalsView({
       <div className="rental-list">
         {rentals.length > 0 ? (
           rentals.map((rental) => {
+            const isExpiredByTime = isRentalExpiredByTime(rental);
+            const effectiveStatus = isExpiredByTime && rental.status === RENTAL_STATUS_ACTIVE ? RENTAL_STATUS_EXPIRED : rental.status;
             const account = accounts.find((item) => item.id === rental.account_id);
             const payment = findPaymentForRental(payments, rental.id);
-            const waitingForPayment = rental.status === RENTAL_STATUS_WAITING_PAYMENT;
+            const waitingForPayment = effectiveStatus === RENTAL_STATUS_WAITING_PAYMENT;
             const canLoadCredentials = canRequestCredentials(rental, payment);
 
             return (
@@ -114,10 +123,10 @@ export function RentalsView({
                 <div>
                   <h3>{account ? gameNames(account, 1) : `Аккаунт #${rental.account_id}`}</h3>
                   <p>
-                    {rentalStatusLabels[rental.status] ?? rental.status} · до {remaining(rental.expires_at)}
+                    {rentalStatusLabels[effectiveStatus] ?? effectiveStatus} · {isExpiredByTime ? "срок истек" : `до ${remaining(rental.expires_at)}`}
                   </p>
                   <div className="rental-meta">
-                    <span className={`status-pill ${getRentalStatusClass(rental.status)}`}>{rentalStatusLabels[rental.status] ?? rental.status}</span>
+                    <span className={`status-pill ${getRentalStatusClass(effectiveStatus)}`}>{rentalStatusLabels[effectiveStatus] ?? effectiveStatus}</span>
                     {payment && <span className={`status-pill ${getPaymentStatusClass(payment.status)}`}>{paymentStatusLabel(payment.status)}</span>}
                     <span className={`status-pill ${depositStatusClass(rental.deposit_status)}`}>{depositStatusLabel(rental.deposit_status)}</span>
                     {rental.has_refund && <span className={`status-pill ${refundStatusClass(rental.refund_status)}`}>{refundStatusLabel(rental.refund_status)}</span>}
@@ -166,7 +175,7 @@ export function RentalsView({
           <div className="rental-detail-grid">
             <div className="detail-item">
               <span>Rental status</span>
-              <strong>{rentalStatusLabels[selectedRental.status] ?? selectedRental.status}</strong>
+              <strong>{selectedRentalEffectiveStatus ? (rentalStatusLabels[selectedRentalEffectiveStatus] ?? selectedRentalEffectiveStatus) : "No data"}</strong>
             </div>
             <div className="detail-item">
               <span>Payment status</span>
@@ -213,7 +222,7 @@ export function RentalsView({
               <strong>{selectedRental.processed_at ? formatTimestamp(selectedRental.processed_at) : "No data"}</strong>
             </div>
           </div>
-          {selectedRental.status === RENTAL_STATUS_WAITING_PAYMENT && (
+          {selectedRentalEffectiveStatus === RENTAL_STATUS_WAITING_PAYMENT && (
             <>
               <div className="safety-note">
                 <Clock3 size={20} />
@@ -253,7 +262,7 @@ export function RentalsView({
               </div>
             </>
           )}
-          {selectedRental.status !== RENTAL_STATUS_WAITING_PAYMENT && selectedRental.status !== RENTAL_STATUS_ACTIVE && (
+          {selectedRentalEffectiveStatus !== RENTAL_STATUS_WAITING_PAYMENT && selectedRentalEffectiveStatus !== RENTAL_STATUS_ACTIVE && (
             <div className="safety-note">
               <Lock size={20} />
               <span>Credentials are not available for cancelled, expired or completed rentals.</span>

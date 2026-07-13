@@ -408,3 +408,76 @@ describe("AdminView balance adjustments", () => {
     expect(screen.getByTestId("admin-user-balance-900")).toHaveTextContent("0 USD");
   });
 });
+
+describe("AdminView deposit release and forfeit", () => {
+  it("renders release and forfeit buttons for HELD deposit status in detail view", async () => {
+    const onReleaseDeposit = vi.fn().mockResolvedValue({ changed: true });
+    const onForfeitDeposit = vi.fn().mockResolvedValue({ changed: true });
+
+    const detailWithHeldDeposit: AdminRentalDetail = makeAdminRentalDetail({
+      deposit: {
+        amount: 700,
+        currency: "USD",
+        status: "HELD",
+        held_at: "2026-07-10T12:00:00Z"
+      }
+    });
+
+    render(
+      <AdminView
+        accounts={[makeAccount()]}
+        adminRentalDetail={detailWithHeldDeposit}
+        adminRentalDetailError={null}
+        adminRentalDetailLoading={false}
+        adminRentalFilters={{}}
+        adminRentals={[makeAdminRental()]}
+        adminRentalsError={null}
+        adminRentalsLoading={false}
+        adminRentalsPagination={makePagination()}
+        adminRentalsSummary={makeAdminSummary()}
+        auditLogs={[]}
+        onCloseAdminRentalDetail={() => undefined}
+        onAdminRentalFiltersChange={async (_filters: AdminRentalFilters) => undefined}
+        onAdminRentalFiltersReset={async () => undefined}
+        onAdjustBalance={noopBalanceAdjustment}
+        onCreateAccount={noopPromise}
+        onNextRefundPage={noopPromise}
+        onOpenAdminRentalDetail={async (_rentalId: number) => undefined}
+        onPrevRefundPage={noopPromise}
+        onSync={noopPromise}
+        onUpdateAccount={noopPromise}
+        onUpdateUser={noopUserUpdate}
+        onWalletRefund={async () => ({} as any)}
+        onReleaseDeposit={onReleaseDeposit}
+        onForfeitDeposit={onForfeitDeposit}
+        refundReasonOptions={refundReasonOptions}
+        user={makeUser()}
+        users={[makeUser()]}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Refunds" }));
+
+    // Assert detail is rendered and shows release/forfeit buttons
+    expect(screen.getByRole("button", { name: "Release deposit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Forfeit deposit" })).toBeInTheDocument();
+
+    // Test release confirm & submit
+    fireEvent.click(screen.getByRole("button", { name: "Release deposit" }));
+    expect(screen.getByText(/Are you sure you want to release the deposit/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm release" }));
+    await waitFor(() => expect(onReleaseDeposit).toHaveBeenCalledWith(1));
+
+    // Test forfeit form & submit
+    fireEvent.click(screen.getByRole("button", { name: "Forfeit deposit" }));
+    expect(screen.getByRole("heading", { name: "Forfeit Deposit" })).toBeInTheDocument();
+    
+    // Fill forfeit evidence reference
+    fireEvent.change(screen.getByPlaceholderText("SECURITY_EVENT:123"), { target: { value: "SECURITY_EVENT:123" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm forfeit" }));
+    await waitFor(() => expect(onForfeitDeposit).toHaveBeenCalledWith(1, {
+      reason_code: "ACCOUNT_SECURITY_VIOLATION",
+      evidence_reference: "SECURITY_EVENT:123"
+    }));
+  });
+});

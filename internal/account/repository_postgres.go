@@ -10,9 +10,10 @@ import (
 	"io"
 	"time"
 
+	"rent_game_accs/internal/shared/database"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"rent_game_accs/internal/shared/database"
 )
 
 var (

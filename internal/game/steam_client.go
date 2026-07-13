@@ -10,8 +10,9 @@ import (
 	"strconv"
 	"time"
 
-	"go.uber.org/zap"
 	repo "rent_game_accs/internal/repository/postgres"
+
+	"go.uber.org/zap"
 )
 
 type SteamClient interface {

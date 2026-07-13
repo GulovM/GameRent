@@ -88,7 +88,7 @@ export default function App() {
   const [duration, setDuration] = useState(2);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("Available");
-  const [maxPrice, setMaxPrice] = useState(300);
+  const [maxPrice, setMaxPrice] = useState(1000);
   const [loading, setLoading] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
@@ -883,6 +883,50 @@ export default function App() {
     }
   }
 
+  async function handleAdminReleaseDeposit(rentalId: number) {
+    try {
+      const result = await api.adminReleaseDeposit(rentalId);
+      await refreshAdminRentals();
+      if (openAdminRentalDetailId === rentalId) {
+        await refreshAdminRentalDetail(rentalId).catch(() => undefined);
+      }
+      setToast({ type: "ok", message: "Deposit released successfully." });
+      return result;
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        handleAuthFailure();
+      } else if (isApiError(error) && (error.status === 404 || error.status === 409)) {
+        await refreshAdminRentals().catch(() => undefined);
+        if (openAdminRentalDetailId === rentalId) {
+          await refreshAdminRentalDetail(rentalId).catch(() => undefined);
+        }
+      }
+      throw error;
+    }
+  }
+
+  async function handleAdminForfeitDeposit(rentalId: number, payload: { reason_code: string; evidence_reference: string }) {
+    try {
+      const result = await api.adminForfeitDeposit(rentalId, payload);
+      await refreshAdminRentals();
+      if (openAdminRentalDetailId === rentalId) {
+        await refreshAdminRentalDetail(rentalId).catch(() => undefined);
+      }
+      setToast({ type: "ok", message: "Deposit forfeited successfully." });
+      return result;
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        handleAuthFailure();
+      } else if (isApiError(error) && (error.status === 404 || error.status === 409)) {
+        await refreshAdminRentals().catch(() => undefined);
+        if (openAdminRentalDetailId === rentalId) {
+          await refreshAdminRentalDetail(rentalId).catch(() => undefined);
+        }
+      }
+      throw error;
+    }
+  }
+
   async function handleLogout() {
     invalidateCredentialRequest();
     const refresh = getRefreshToken();
@@ -989,6 +1033,8 @@ export default function App() {
             }}
             onOpenAdminRentalDetail={handleOpenAdminRentalDetail}
             onWalletRefund={handleAdminWalletRefund}
+            onReleaseDeposit={handleAdminReleaseDeposit}
+            onForfeitDeposit={handleAdminForfeitDeposit}
             onSync={handleSyncAccount}
             onUpdateAccount={handleUpdateAccount}
             onUpdateUser={handleUpdateAdminUser}

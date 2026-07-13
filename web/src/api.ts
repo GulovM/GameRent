@@ -273,6 +273,16 @@ export type AdminWalletRefundResponse = {
   deposit_status: string;
 };
 
+export type AdminDepositSettlementResponse = {
+  changed: boolean;
+  idempotent: boolean;
+  status: string;
+  deposit_status: string;
+  settled_at: string;
+  rental_status: number;
+  completed_at: string;
+};
+
 export type NotificationItem = {
   id: number;
   type: number;
@@ -374,7 +384,13 @@ function url(path: string, query?: Query) {
 }
 
 async function parseResponse<T>(response: Response): Promise<{ envelope: ApiEnvelope<T>; error?: ApiError }> {
-  const envelope = (await response.json().catch(() => ({}))) as ApiEnvelope<T>;
+  const text = await response.text().catch(() => "");
+  // Replace 15+ digit numbers that are values in JSON with strings
+  let sanitizedText = text.replace(/(:\s*)([0-9]{15,})/g, '$1"$2"');
+  // Replace 15+ digit numbers that are array items with strings
+  sanitizedText = sanitizedText.replace(/([\[,]\s*)([0-9]{15,})/g, '$1"$2"');
+
+  const envelope = (sanitizedText ? JSON.parse(sanitizedText) : {}) as ApiEnvelope<T>;
   if (!response.ok || envelope.success === false) {
     return {
       envelope,
@@ -427,7 +443,12 @@ async function request<T>(path: string, options: RequestInit = {}, query?: Query
   const token = getAccessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
 
-  const response = await fetch(url(path, query), { ...options, headers });
+  let body = options.body;
+  if (typeof body === "string") {
+    body = body.replace(/"(id|[^"]+_id|[^"]+Id)"\s*:\s*"([0-9]{15,})"/g, '"$1":$2');
+  }
+
+  const response = await fetch(url(path, query), { ...options, body, headers });
   const parsed = await parseResponse<T>(response);
 
   if (parsed.error) {
@@ -634,6 +655,15 @@ export const api = {
     return request<AdminWalletRefundResponse>(`/api/v1/admin/rentals/${rentalId}/wallet-refund`, {
       method: "POST",
       body: JSON.stringify({ reason_code })
+    });
+  },
+  adminReleaseDeposit(rentalId: number) {
+    return request<AdminDepositSettlementResponse>(`/api/v1/admin/rentals/${rentalId}/deposit/release`, { method: "POST" });
+  },
+  adminForfeitDeposit(rentalId: number, payload: { reason_code: string; evidence_reference: string }) {
+    return request<AdminDepositSettlementResponse>(`/api/v1/admin/rentals/${rentalId}/deposit/forfeit`, {
+      method: "POST",
+      body: JSON.stringify(payload)
     });
   }
 };

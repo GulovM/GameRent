@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"math/rand"
 
-	"go.uber.org/zap"
 	"rent_game_accs/internal/game"
 	repo "rent_game_accs/internal/repository/postgres"
+
+	"go.uber.org/zap"
 )
 
 type SteamSyncRepository interface {

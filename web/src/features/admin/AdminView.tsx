@@ -74,6 +74,8 @@ type AdminViewProps = {
   onAdjustBalance: (targetUser: User, input: AdminBalanceAdjustmentInput) => Promise<AdminBalanceAdjustmentResponse>;
   onUpdateUser: (targetUser: User, patch: AdminUserPatch) => Promise<void>;
   onWalletRefund: (rentalId: number, reasonCode: string) => Promise<AdminWalletRefundResponse>;
+  onReleaseDeposit?: (rentalId: number) => Promise<any>;
+  onForfeitDeposit?: (rentalId: number, payload: { reason_code: string; evidence_reference: string }) => Promise<any>;
   refundReasonOptions: RefundReasonCodeOption[];
   user: User | null;
   users: User[];
@@ -103,6 +105,8 @@ export function AdminView({
   onAdjustBalance,
   onUpdateUser,
   onWalletRefund,
+  onReleaseDeposit,
+  onForfeitDeposit,
   refundReasonOptions,
   user,
   users
@@ -180,6 +184,8 @@ export function AdminView({
             onPrevPage={onPrevRefundPage}
             onResetFilters={onAdminRentalFiltersReset}
             onWalletRefund={onWalletRefund}
+            onReleaseDeposit={onReleaseDeposit}
+            onForfeitDeposit={onForfeitDeposit}
             pagination={adminRentalsPagination}
             refundReasonOptions={refundReasonOptions}
             rentals={adminRentals}
@@ -272,6 +278,8 @@ function AdminRefundsSection({
   onPrevPage,
   onResetFilters,
   onWalletRefund,
+  onReleaseDeposit,
+  onForfeitDeposit,
   pagination,
   refundReasonOptions,
   rentals
@@ -289,6 +297,8 @@ function AdminRefundsSection({
   onPrevPage: () => Promise<void>;
   onResetFilters: () => Promise<void>;
   onWalletRefund: (rentalId: number, reasonCode: string) => Promise<AdminWalletRefundResponse>;
+  onReleaseDeposit?: (rentalId: number) => Promise<any>;
+  onForfeitDeposit?: (rentalId: number, payload: { reason_code: string; evidence_reference: string }) => Promise<any>;
   pagination: Pagination | null;
   refundReasonOptions: RefundReasonCodeOption[];
   rentals: AdminRentalRefundSummary[];
@@ -663,7 +673,11 @@ function AdminRefundsSection({
             ) : detailError ? (
               <div className="admin-refund-feedback error">{detailError}</div>
             ) : detail ? (
-              <AdminRentalDetailPanel detail={detail} />
+              <AdminRentalDetailPanel
+                detail={detail}
+                onReleaseDeposit={onReleaseDeposit}
+                onForfeitDeposit={onForfeitDeposit}
+              />
             ) : (
               <div className="empty-inline">
                 <AlertTriangle size={24} />
@@ -686,7 +700,76 @@ function AdminRefundsSection({
   );
 }
 
-function AdminRentalDetailPanel({ detail }: { detail: AdminRentalDetail }) {
+const DEPOSIT_FORFEIT_REASONS = [
+  { code: "ACCOUNT_SECURITY_VIOLATION", label: "Account Security Violation" },
+  { code: "ADMIN_CORRECTION", label: "Admin Correction" },
+  { code: "CREDENTIAL_MISUSE", label: "Credential Misuse" },
+  { code: "DAMAGE_CONFIRMED", label: "Damage Confirmed" },
+  { code: "USER_CAUSED_GAME_BAN", label: "User Caused Game Ban" }
+];
+
+function AdminRentalDetailPanel({
+  detail,
+  onReleaseDeposit,
+  onForfeitDeposit
+}: {
+  detail: AdminRentalDetail;
+  onReleaseDeposit?: (rentalId: number) => Promise<any>;
+  onForfeitDeposit?: (rentalId: number, payload: { reason_code: string; evidence_reference: string }) => Promise<any>;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState<{ type: "ok" | "error"; message: string } | null>(null);
+  const [showForfeitForm, setShowForfeitForm] = useState(false);
+  const [forfeitReason, setForfeitReason] = useState(DEPOSIT_FORFEIT_REASONS[0].code);
+  const [evidenceRef, setEvidenceRef] = useState("");
+  const [showReleaseConfirm, setShowReleaseConfirm] = useState(false);
+
+  // Reset local form states when detail updates
+  useEffect(() => {
+    setShowReleaseConfirm(false);
+    setShowForfeitForm(false);
+    setFeedback(null);
+  }, [detail]);
+
+  async function handleRelease() {
+    if (!onReleaseDeposit) return;
+    setSubmitting(true);
+    setFeedback(null);
+    try {
+      await onReleaseDeposit(detail.rental.id);
+      setFeedback({ type: "ok", message: "Deposit successfully released." });
+      setShowReleaseConfirm(false);
+    } catch (error) {
+      setFeedback({ type: "error", message: error instanceof Error ? error.message : "Failed to release deposit." });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleForfeit(e: FormEvent) {
+    e.preventDefault();
+    if (!onForfeitDeposit) return;
+    if (!evidenceRef.trim().startsWith("SECURITY_EVENT:")) {
+      setFeedback({ type: "error", message: "Evidence reference must be formatted as SECURITY_EVENT:<positive integer>" });
+      return;
+    }
+    setSubmitting(true);
+    setFeedback(null);
+    try {
+      await onForfeitDeposit(detail.rental.id, {
+        reason_code: forfeitReason,
+        evidence_reference: evidenceRef.trim()
+      });
+      setFeedback({ type: "ok", message: "Deposit successfully forfeited." });
+      setShowForfeitForm(false);
+      setEvidenceRef("");
+    } catch (error) {
+      setFeedback({ type: "error", message: error instanceof Error ? error.message : "Failed to forfeit deposit." });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   return (
     <div className="admin-detail-body">
       <div className="admin-detail-section">
@@ -768,32 +851,104 @@ function AdminRentalDetailPanel({ detail }: { detail: AdminRentalDetail }) {
       <div className="admin-detail-section">
         <h3>Deposit</h3>
         {detail.deposit ? (
-          <div className="admin-refund-grid">
-            <div className="detail-item">
-              <span>Status</span>
-              <strong className={`status-pill ${depositStatusClass(detail.deposit.status)}`}>{adminDepositStatusLabel(detail.deposit.status)}</strong>
+          <>
+            <div className="admin-refund-grid">
+              <div className="detail-item">
+                <span>Status</span>
+                <strong className={`status-pill ${depositStatusClass(detail.deposit.status)}`}>{adminDepositStatusLabel(detail.deposit.status)}</strong>
+              </div>
+              <div className="detail-item">
+                <span>Amount</span>
+                <strong>{money({ amount: detail.deposit.amount, currency: detail.deposit.currency })}</strong>
+              </div>
+              <div className="detail-item">
+                <span>Held at</span>
+                <strong>{formatTimestamp(detail.deposit.held_at)}</strong>
+              </div>
+              <div className="detail-item">
+                <span>Released at</span>
+                <strong>{formatTimestamp(detail.deposit.released_at)}</strong>
+              </div>
+              <div className="detail-item">
+                <span>Forfeited at</span>
+                <strong>{formatTimestamp(detail.deposit.forfeited_at)}</strong>
+              </div>
+              <div className="detail-item">
+                <span>Refunded at</span>
+                <strong>{formatTimestamp(detail.deposit.refunded_at)}</strong>
+              </div>
             </div>
-            <div className="detail-item">
-              <span>Amount</span>
-              <strong>{money({ amount: detail.deposit.amount, currency: detail.deposit.currency })}</strong>
-            </div>
-            <div className="detail-item">
-              <span>Held at</span>
-              <strong>{formatTimestamp(detail.deposit.held_at)}</strong>
-            </div>
-            <div className="detail-item">
-              <span>Released at</span>
-              <strong>{formatTimestamp(detail.deposit.released_at)}</strong>
-            </div>
-            <div className="detail-item">
-              <span>Forfeited at</span>
-              <strong>{formatTimestamp(detail.deposit.forfeited_at)}</strong>
-            </div>
-            <div className="detail-item">
-              <span>Refunded at</span>
-              <strong>{formatTimestamp(detail.deposit.refunded_at)}</strong>
-            </div>
-          </div>
+
+            {feedback && <div className={`admin-refund-feedback ${feedback.type}`} style={{ marginTop: "1rem" }}>{feedback.message}</div>}
+
+            {detail.deposit.status === "HELD" && (
+              <div className="admin-deposit-actions" style={{ marginTop: "1rem", borderTop: "1px solid var(--border-color)", paddingTop: "1rem" }}>
+                {!showReleaseConfirm && !showForfeitForm && (
+                  <div className="row-actions">
+                    <button className="primary-button" disabled={submitting} onClick={() => setShowReleaseConfirm(true)} type="button">
+                      Release deposit
+                    </button>
+                    <button className="danger-button" disabled={submitting} onClick={() => setShowForfeitForm(true)} type="button">
+                      Forfeit deposit
+                    </button>
+                  </div>
+                )}
+
+                {showReleaseConfirm && (
+                  <div className="admin-refund-confirm" style={{ padding: "1rem", background: "var(--surface-color-light)", borderRadius: "var(--radius)" }}>
+                    <p style={{ margin: "0 0 1rem 0" }}>Are you sure you want to release the deposit of {money({ amount: detail.deposit.amount, currency: detail.deposit.currency })} to the user?</p>
+                    <div className="row-actions">
+                      <button className="secondary-button" disabled={submitting} onClick={() => setShowReleaseConfirm(false)} type="button">
+                        Cancel
+                      </button>
+                      <button className="primary-button" disabled={submitting} onClick={handleRelease} type="button">
+                        Confirm release
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {showForfeitForm && (
+                  <form onSubmit={handleForfeit} style={{ display: "flex", flexDirection: "column", gap: "1rem", padding: "1rem", background: "var(--surface-color-light)", borderRadius: "var(--radius)" }}>
+                    <h4 style={{ margin: 0 }}>Forfeit Deposit</h4>
+                    <label style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                      <span>Reason code</span>
+                      <select
+                        disabled={submitting}
+                        onChange={(e) => setForfeitReason(e.target.value)}
+                        value={forfeitReason}
+                      >
+                        {DEPOSIT_FORFEIT_REASONS.map((r) => (
+                          <option key={r.code} value={r.code}>
+                            {r.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                      <span>Evidence reference</span>
+                      <input
+                        disabled={submitting}
+                        onChange={(e) => setEvidenceRef(e.target.value)}
+                        placeholder="SECURITY_EVENT:123"
+                        required
+                        type="text"
+                        value={evidenceRef}
+                      />
+                    </label>
+                    <div className="row-actions">
+                      <button className="secondary-button" disabled={submitting} onClick={() => setShowForfeitForm(false)} type="button">
+                        Cancel
+                      </button>
+                      <button className="danger-button" disabled={submitting} type="submit">
+                        Confirm forfeit
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
+          </>
         ) : (
           <div className="admin-refund-hint">No deposit data</div>
         )}

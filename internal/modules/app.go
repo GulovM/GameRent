@@ -119,8 +119,6 @@ func Run() {
 		scheduler.NewSteamSyncWorker(repo, steamClient, logger.Logger),
 	)
 
-	bgScheduler.Start(signalCtx)
-
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		logger.Fatal("JWT_SECRET is required")
@@ -156,6 +154,21 @@ func Run() {
 	if err != nil {
 		logger.Fatal("invalid PAYMENT_WEBHOOK_SECRET configuration", zap.Error(err))
 	}
+
+	bgScheduler.Register(
+		"deposit_finalization",
+		10*time.Second,
+		func(ctx context.Context) error {
+			logger.Debug("running deposit auto-release finalization")
+			_, err := paymentService.FinalizeExpiredRentals(ctx, clk.Now(), 100)
+			if err != nil {
+				logger.Error("failed to finalize expired rentals", zap.Error(err))
+			}
+			return err
+		},
+	)
+
+	bgScheduler.Start(signalCtx)
 	reviewService := review.NewService(reviewRepo)
 	notificationService := notification.NewService(notificationRepo)
 	paymentHandler := payment.NewHandler(paymentService, logger.Logger)

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"rent_game_accs/internal/payment"
 	pkg_http_request "rent_game_accs/internal/pkg/transport/http/request"
@@ -223,6 +224,7 @@ func (h *Handler) GetMyRentalCredentials(w http.ResponseWriter, r *http.Request)
 		UserAgent: r.UserAgent(),
 	}, time.Now().UTC())
 	if err != nil {
+		log.Printf("GetRentalCredentials error for rentalID=%d, userID=%d: %v", rentalID, userID, err)
 		if errors.Is(err, rental.ErrCredentialsNotAvailable) {
 			shared_response.Error(w, http.StatusNotFound, "NOT_FOUND", "Rental not found")
 			return
