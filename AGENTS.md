@@ -363,27 +363,3 @@ After every implementation task, report:
 5. Any limitation, assumption or manual verification still required.
 
 Do not claim that tests passed unless they were actually executed successfully.
-
-## Backend architecture enforcement
-
-The API handler layer must remain thin.
-
-Handlers may:
-- parse HTTP path/query/body;
-- call services;
-- map domain errors to HTTP responses;
-- return DTOs.
-
-Handlers must not:
-- execute SQL;
-- open database transactions;
-- contain business state transitions;
-- contain financial ledger logic;
-- contain credential access logic beyond calling the authorized service;
-- grow unrelated domain handlers in one file.
-
-If a task requires SQL, implement it in the repository layer.
-If a task requires business rules, implement them in the service/domain layer.
-If a task requires response shaping, use focused DTO/mapper files.
-
-Before adding new backend functionality, check whether the target file already violates SRP. If it does, refactor the boundary first instead of adding more logic.
