@@ -3,6 +3,7 @@ package user
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,6 +20,24 @@ type Repository interface {
 	GetUserByEmail(ctx context.Context, email string) (*User, error)
 	UpdateUser(ctx context.Context, u *User) error
 	ListUsers(ctx context.Context, limit, offset int) ([]*User, error)
+}
+
+type AdminRepository interface {
+	Repository
+	GetUserForUpdate(ctx context.Context, id int64) (*User, error)
+	UpdateAdminState(ctx context.Context, id int64, trustScore *int, isBlocked *bool, role *string) error
+	RevokeActiveRefreshTokens(ctx context.Context, userID int64) error
+	RecordAdminUserStateChange(ctx context.Context, actorUserID, userID int64, oldRole string, oldBlocked bool, newRole string, newBlocked bool) error
+	ListAuditLogs(ctx context.Context, limit int) ([]AuditLog, error)
+}
+
+type AuditLog struct {
+	ID          int64
+	ActorUserID *int64
+	EntityType  string
+	EntityID    int64
+	Action      string
+	CreatedAt   time.Time
 }
 
 type PostgresRepository struct {
@@ -53,6 +72,62 @@ func (r *PostgresRepository) GetUser(ctx context.Context, id int64) (*User, erro
 		return nil, err
 	}
 	return &u, nil
+}
+
+func (r *PostgresRepository) GetUserForUpdate(ctx context.Context, id int64) (*User, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	query := `SELECT id, email, COALESCE(first_name, ''), COALESCE(last_name, ''), role, trust_score, is_blocked, balance, created_at, updated_at, deleted_at FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`
+	var u User
+	err := db.QueryRow(ctx, query, id).Scan(&u.ID, &u.Email, &u.FirstName, &u.LastName, &u.Role, &u.TrustScore, &u.IsBlocked, &u.Balance, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+func (r *PostgresRepository) UpdateAdminState(ctx context.Context, id int64, trustScore *int, isBlocked *bool, role *string) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	tag, err := db.Exec(ctx, `UPDATE users SET trust_score=COALESCE($1,trust_score), is_blocked=COALESCE($2,is_blocked), role=COALESCE($3,role), updated_at=NOW() WHERE id=$4 AND deleted_at IS NULL`, trustScore, isBlocked, role, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+func (r *PostgresRepository) RevokeActiveRefreshTokens(ctx context.Context, userID int64) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	_, err := db.Exec(ctx, `UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL`, userID)
+	return err
+}
+
+func (r *PostgresRepository) RecordAdminUserStateChange(ctx context.Context, actorUserID, userID int64, oldRole string, oldBlocked bool, newRole string, newBlocked bool) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	_, err := db.Exec(ctx, `INSERT INTO audit_logs (actor_user_id, entity_type, entity_id, action, old_values, new_values, created_at) VALUES ($1, 'USER', $2, 'USER_SECURITY_STATE_UPDATED', jsonb_build_object('role',$3::text,'is_blocked',$4::boolean), jsonb_build_object('role',$5::text,'is_blocked',$6::boolean), NOW())`, actorUserID, userID, oldRole, oldBlocked, newRole, newBlocked)
+	return err
+}
+
+func (r *PostgresRepository) ListAuditLogs(ctx context.Context, limit int) ([]AuditLog, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	rows, err := db.Query(ctx, `SELECT id, actor_user_id, entity_type, entity_id, action, created_at FROM audit_logs ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]AuditLog, 0)
+	for rows.Next() {
+		var item AuditLog
+		if err := rows.Scan(&item.ID, &item.ActorUserID, &item.EntityType, &item.EntityID, &item.Action, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (r *PostgresRepository) GetUserByEmail(ctx context.Context, email string) (*User, error) {

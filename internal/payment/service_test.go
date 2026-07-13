@@ -449,6 +449,8 @@ func (m *mockRepository) LockWalletRefundState(ctx context.Context, rentalID int
 	return &cp, nil
 }
 
+func (m *mockRepository) LockRentalSettlementKey(context.Context, int64) error { return nil }
+
 func (m *mockRepository) LockPaymentForWebhookByID(ctx context.Context, paymentID int64) (*WebhookPaymentState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -601,6 +603,32 @@ func (m *mockRepository) LockDepositSettlementState(ctx context.Context, rentalI
 	return &cp, nil
 }
 
+func (m *mockRepository) LockNextRentalFinalizationState(ctx context.Context, now time.Time) (*DepositSettlementState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]int64, 0, len(m.settlementStatesByRental))
+	for id := range m.settlementStatesByRental {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		state := m.settlementStatesByRental[id]
+		if state.RentalStatus != 3 || state.PaymentStatus != 2 {
+			continue
+		}
+		eligible := state.RentalDepositAmount == 0 && !state.HasDepositHold
+		if isConsistentPositiveDepositState(state) {
+			eligible = state.HoldStatus == depositHoldStatusReleased || state.HoldStatus == depositHoldStatusForfeited || state.HoldStatus == depositHoldStatusRefunded ||
+				(state.HoldStatus == depositHoldStatusHeld && state.ReviewDeadlineAt != nil && !now.Before(*state.ReviewDeadlineAt))
+		}
+		if eligible {
+			cp := *state
+			return &cp, nil
+		}
+	}
+	return nil, ErrDepositHoldNotFound
+}
+
 func (m *mockRepository) LoadDepositSettlementEligibility(ctx context.Context, rentalID int64) (*DepositSettlementEligibility, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -612,7 +640,11 @@ func (m *mockRepository) LoadDepositSettlementEligibility(ctx context.Context, r
 	return &cp, nil
 }
 
-func (m *mockRepository) MarkDepositReleased(ctx context.Context, holdID int64, now time.Time) error {
+func (m *mockRepository) VerifyDepositForfeitEvidence(ctx context.Context, rentalID, userID, accountID, securityEventID int64) (bool, error) {
+	return securityEventID > 0, nil
+}
+
+func (m *mockRepository) MarkDepositReleased(ctx context.Context, holdID int64, source int16, settledByUserID *int64, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, state := range m.settlementStatesByRental {
@@ -621,6 +653,9 @@ func (m *mockRepository) MarkDepositReleased(ctx context.Context, holdID int64, 
 				return ErrDepositSettlementNotAllowed
 			}
 			state.HoldStatus = depositHoldStatusReleased
+			state.SettlementSource = int16Pointer(source)
+			state.SettledByUserID = settledByUserID
+			state.ReleasedAt = timePointer(now)
 			for _, refundState := range m.refundStatesByRental {
 				if refundState.HoldID == holdID {
 					refundState.HoldStatus = depositHoldStatusReleased
@@ -633,7 +668,7 @@ func (m *mockRepository) MarkDepositReleased(ctx context.Context, holdID int64, 
 	return ErrDepositHoldNotFound
 }
 
-func (m *mockRepository) MarkDepositForfeited(ctx context.Context, holdID int64, now time.Time) error {
+func (m *mockRepository) MarkDepositForfeited(ctx context.Context, holdID int64, settledByUserID int64, reasonCode, evidenceReference string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, state := range m.settlementStatesByRental {
@@ -642,6 +677,11 @@ func (m *mockRepository) MarkDepositForfeited(ctx context.Context, holdID int64,
 				return ErrDepositSettlementNotAllowed
 			}
 			state.HoldStatus = depositHoldStatusForfeited
+			state.SettlementSource = int16Pointer(depositSettlementSourceAdminForfeit)
+			state.SettledByUserID = &settledByUserID
+			state.SettlementReasonCode = reasonCode
+			state.SettlementEvidenceRef = evidenceReference
+			state.ForfeitedAt = timePointer(now)
 			for _, refundState := range m.refundStatesByRental {
 				if refundState.HoldID == holdID {
 					refundState.HoldStatus = depositHoldStatusForfeited
@@ -654,7 +694,7 @@ func (m *mockRepository) MarkDepositForfeited(ctx context.Context, holdID int64,
 	return ErrDepositHoldNotFound
 }
 
-func (m *mockRepository) MarkDepositRefunded(ctx context.Context, holdID, refundID int64, now time.Time) error {
+func (m *mockRepository) MarkDepositRefunded(ctx context.Context, holdID, refundID int64, settledByUserID int64, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, state := range m.settlementStatesByRental {
@@ -663,6 +703,9 @@ func (m *mockRepository) MarkDepositRefunded(ctx context.Context, holdID, refund
 				return ErrDepositSettlementNotAllowed
 			}
 			state.HoldStatus = depositHoldStatusRefunded
+			state.SettlementSource = int16Pointer(depositSettlementSourceWalletRefund)
+			state.SettledByUserID = &settledByUserID
+			state.RefundedAt = timePointer(now)
 			for _, refundState := range m.refundStatesByRental {
 				if refundState.HoldID == holdID {
 					refundState.HoldStatus = depositHoldStatusRefunded
@@ -683,6 +726,29 @@ func (m *mockRepository) MarkDepositRefunded(ctx context.Context, holdID, refund
 		}
 	}
 	return ErrDepositHoldNotFound
+}
+
+func (m *mockRepository) MarkRentalCompleted(ctx context.Context, rentalID int64, now time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.settlementStatesByRental[rentalID]
+	if !ok || state.RentalStatus != 3 || state.PaymentStatus != 2 {
+		return false, nil
+	}
+	eligible := state.RentalDepositAmount == 0 && !state.HasDepositHold
+	if isConsistentPositiveDepositState(state) {
+		eligible = state.HoldStatus == depositHoldStatusReleased || state.HoldStatus == depositHoldStatusForfeited || state.HoldStatus == depositHoldStatusRefunded
+	}
+	if !eligible {
+		return false, nil
+	}
+	state.RentalStatus = 4
+	state.CompletedAt = timePointer(now)
+	if refundState, exists := m.refundStatesByRental[rentalID]; exists {
+		refundState.RentalStatus = 4
+		refundState.CompletedAt = timePointer(now)
+	}
+	return true, nil
 }
 
 func (m *mockRepository) CreditUserBalance(ctx context.Context, userID, amount int64, now time.Time) error {
@@ -860,8 +926,24 @@ func (m *mockRepository) InsertAuditLog(ctx context.Context, actorUserID int64, 
 	return nil
 }
 
+func (m *mockRepository) InsertSystemAuditLog(ctx context.Context, entityType string, entityID int64, action string, oldValues, newValues []byte) error {
+	return m.InsertAuditLog(ctx, 0, entityType, entityID, action, oldValues, newValues)
+}
+
 func (m *mockRepository) CreatePendingPayment(ctx context.Context, rentalID, userID int64, amount int64, currency string) (int64, error) {
 	return 0, nil
+}
+
+func (m *mockRepository) GetCustomerRentalPayment(ctx context.Context, rentalID, userID int64) (*CustomerPayment, error) {
+	return nil, ErrPaymentNotFound
+}
+
+func (m *mockRepository) ListCustomerPayments(ctx context.Context, userID int64) ([]CustomerPayment, error) {
+	return nil, nil
+}
+
+func (m *mockRepository) GetCustomerPayment(ctx context.Context, paymentID, userID int64) (*CustomerPayment, error) {
+	return nil, ErrPaymentNotFound
 }
 
 func (m *mockRepository) LogSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error {
@@ -955,6 +1037,17 @@ func (m *mockRepository) LogAdminBalanceAdjustmentSecurityEvent(ctx context.Cont
 }
 
 func seedSettlementState(repo *mockRepository, state *DepositSettlementState, eligibility *DepositSettlementEligibility) {
+	if state.HoldID > 0 {
+		state.HasDepositHold = true
+		state.RentalDepositAmount = state.Amount
+		state.HoldUserID = state.UserID
+		state.HoldPaymentID = state.PaymentID
+		state.HoldCurrency = state.Currency
+	}
+	if state.ReviewDeadlineAt == nil && state.HasDepositHold {
+		deadline := time.Now().UTC().Add(24 * time.Hour)
+		state.ReviewDeadlineAt = &deadline
+	}
 	repo.settlementStatesByRental[state.RentalID] = state
 	if eligibility != nil {
 		repo.settlementEligibilityByRental[state.RentalID] = eligibility
@@ -983,21 +1076,28 @@ func seedWalletPaymentState(repo *mockRepository, state *WalletPaymentState) {
 
 func seedWalletRefundState(repo *mockRepository, state *WalletRefundState) {
 	repo.refundStatesByRental[state.RentalID] = state
-	if state.HasDepositHold {
-		repo.settlementStatesByRental[state.RentalID] = &DepositSettlementState{
-			HoldID:        state.HoldID,
-			RentalID:      state.RentalID,
-			UserID:        state.UserID,
-			AccountID:     state.AccountID,
-			PaymentID:     state.PaymentID,
-			HoldStatus:    state.HoldStatus,
-			RentalStatus:  state.RentalStatus,
-			PaymentStatus: state.PaymentStatus,
-			Amount:        state.HoldAmount,
-			Currency:      state.Currency,
-			UserBalance:   state.UserBalance,
-		}
+	settlement := &DepositSettlementState{
+		HoldID:              state.HoldID,
+		RentalID:            state.RentalID,
+		UserID:              state.UserID,
+		AccountID:           state.AccountID,
+		PaymentID:           state.PaymentID,
+		HoldStatus:          state.HoldStatus,
+		RentalStatus:        state.RentalStatus,
+		PaymentStatus:       state.PaymentStatus,
+		Amount:              state.HoldAmount,
+		Currency:            state.Currency,
+		UserBalance:         state.UserBalance,
+		Provider:            state.Provider,
+		RentalPrice:         state.RentalPrice,
+		RentalDepositAmount: state.DepositAmount,
+		HasDepositHold:      state.HasDepositHold,
+		HoldUserID:          state.UserID,
+		HoldPaymentID:       state.PaymentID,
+		HoldCurrency:        state.Currency,
+		CompletedAt:         state.CompletedAt,
 	}
+	repo.settlementStatesByRental[state.RentalID] = settlement
 }
 
 func providerWebhookRequest(paymentID, rentalID, amount int64, currency, externalTransactionID string) WebhookRequest {
@@ -1518,8 +1618,8 @@ func TestPaymentService_RefundWalletPayment_Success(t *testing.T) {
 	if len(repo.depositRefundEntries) != 1 || repo.depositRefundEntries[0].Amount != 700 {
 		t.Fatalf("expected one deposit refund entry, got %+v", repo.depositRefundEntries)
 	}
-	if repo.balanceCreditCalls != 1 || repo.auditCalls != 1 || repo.securityEventCalls != 1 || repo.refundCompleteCalls != 1 {
-		t.Fatalf("expected one credit/audit/security/completion call, got balance=%d audit=%d security=%d completion=%d", repo.balanceCreditCalls, repo.auditCalls, repo.securityEventCalls, repo.refundCompleteCalls)
+	if repo.balanceCreditCalls != 1 || repo.auditCalls != 2 || repo.securityEventCalls != 2 || repo.refundCompleteCalls != 1 {
+		t.Fatalf("expected refund and rental completion audit/security calls, got balance=%d audit=%d security=%d completion=%d", repo.balanceCreditCalls, repo.auditCalls, repo.securityEventCalls, repo.refundCompleteCalls)
 	}
 }
 
@@ -1623,8 +1723,8 @@ func TestPaymentService_RefundWalletPayment_ReplayIsIdempotent(t *testing.T) {
 	if !res.Idempotent || res.Changed || res.TotalAmount != 1200 {
 		t.Fatalf("expected idempotent refund replay, got %+v", res)
 	}
-	if repo.balanceCreditCalls != 0 || len(repo.balanceRefundEntries) != 0 || len(repo.depositRefundEntries) != 0 || repo.auditCalls != 0 || repo.securityEventCalls != 0 {
-		t.Fatalf("expected no replay side effects")
+	if repo.balanceCreditCalls != 0 || len(repo.balanceRefundEntries) != 0 || len(repo.depositRefundEntries) != 0 || repo.auditCalls != 1 || repo.securityEventCalls != 1 {
+		t.Fatalf("expected replay to perform only catch-up rental completion")
 	}
 }
 
@@ -1779,25 +1879,29 @@ func TestPaymentService_ReleaseDeposit_Success(t *testing.T) {
 	if len(repo.depositReleaseEntries) != 1 {
 		t.Fatalf("expected one release ledger entry, got %d", len(repo.depositReleaseEntries))
 	}
-	if repo.auditCalls != 1 || repo.securityEventCalls != 1 || repo.balanceCreditCalls != 1 {
-		t.Fatalf("expected one audit/security/balance mutation, got audit=%d security=%d balance=%d", repo.auditCalls, repo.securityEventCalls, repo.balanceCreditCalls)
+	if repo.auditCalls != 2 || repo.securityEventCalls != 2 || repo.balanceCreditCalls != 1 {
+		t.Fatalf("expected settlement and completion audit/security mutations, got audit=%d security=%d balance=%d", repo.auditCalls, repo.securityEventCalls, repo.balanceCreditCalls)
 	}
 }
 
 func TestPaymentService_ReleaseDeposit_ReplayIsNoOp(t *testing.T) {
 	repo := newMockRepository(nil)
+	completedAt := time.Now().UTC().Add(-time.Minute)
+	adminReleaseSource := depositSettlementSourceAdminRelease
 	seedSettlementState(repo, &DepositSettlementState{
-		HoldID:        1,
-		RentalID:      201,
-		UserID:        301,
-		AccountID:     401,
-		PaymentID:     501,
-		HoldStatus:    depositHoldStatusReleased,
-		RentalStatus:  3,
-		PaymentStatus: 2,
-		Amount:        700,
-		Currency:      "USD",
-		UserBalance:   1700,
+		HoldID:           1,
+		RentalID:         201,
+		UserID:           301,
+		AccountID:        401,
+		PaymentID:        501,
+		HoldStatus:       depositHoldStatusReleased,
+		RentalStatus:     4,
+		PaymentStatus:    2,
+		Amount:           700,
+		Currency:         "USD",
+		UserBalance:      1700,
+		SettlementSource: &adminReleaseSource,
+		CompletedAt:      &completedAt,
 	}, &DepositSettlementEligibility{RentalExists: true})
 	service := NewPaymentService(repo)
 
@@ -1808,7 +1912,7 @@ func TestPaymentService_ReleaseDeposit_ReplayIsNoOp(t *testing.T) {
 	if res.Changed {
 		t.Fatalf("expected replay to be no-op, got %+v", res)
 	}
-	if repo.balanceCreditCalls != 0 || repo.auditCalls != 0 || repo.securityEventCalls != 0 || len(repo.depositReleaseEntries) != 0 {
+	if repo.balanceCreditCalls != 0 || repo.auditCalls != 0 || repo.securityEventCalls != 0 || len(repo.depositReleaseEntries) != 0 || !res.Idempotent {
 		t.Fatalf("expected no duplicate side effects on replay")
 	}
 }
@@ -1830,7 +1934,7 @@ func TestPaymentService_ForfeitDeposit_Success(t *testing.T) {
 	}, &DepositSettlementEligibility{RentalExists: true})
 	service := NewPaymentService(repo)
 
-	res, err := service.ForfeitDeposit(context.Background(), 901, "ADMIN", 210, "damage_confirmed", time.Now())
+	res, err := service.ForfeitDeposit(context.Background(), 901, "ADMIN", 210, "DAMAGE_CONFIRMED", "SECURITY_EVENT:1", time.Now())
 	if err != nil {
 		t.Fatalf("ForfeitDeposit failed: %v", err)
 	}
@@ -1844,15 +1948,15 @@ func TestPaymentService_ForfeitDeposit_Success(t *testing.T) {
 	if len(repo.depositForfeitEntries) != 1 {
 		t.Fatalf("expected one forfeit ledger entry, got %d", len(repo.depositForfeitEntries))
 	}
-	if repo.balanceCreditCalls != 0 || repo.auditCalls != 1 || repo.securityEventCalls != 1 {
-		t.Fatalf("expected no balance credit and one audit/security event")
+	if repo.balanceCreditCalls != 0 || repo.auditCalls != 2 || repo.securityEventCalls != 2 {
+		t.Fatalf("expected no balance credit and settlement plus completion audit/security events")
 	}
 }
 
 func TestPaymentService_ForfeitDeposit_NonAdminRejected(t *testing.T) {
 	service := NewPaymentService(newMockRepository(nil))
 
-	_, err := service.ForfeitDeposit(context.Background(), 901, "RENT", 210, "damage_confirmed", time.Now())
+	_, err := service.ForfeitDeposit(context.Background(), 901, "RENT", 210, "DAMAGE_CONFIRMED", "SECURITY_EVENT:1", time.Now())
 	if !errors.Is(err, ErrAdminRequired) {
 		t.Fatalf("expected ErrAdminRequired, got %v", err)
 	}

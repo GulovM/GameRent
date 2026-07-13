@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"rent_game_accs/internal/shared/database"
@@ -17,29 +18,36 @@ const webhookPaymentProvider = "internal"
 const walletPaymentProvider = "balance"
 
 const (
-	ledgerEntryProviderPaymentReceived int16 = 1
-	ledgerEntryDepositHeld             int16 = 2
-	ledgerEntryDepositReleasedBalance  int16 = 3
-	ledgerEntryDepositForfeited        int16 = 4
-	ledgerEntryBalanceDebit            int16 = 5
-	ledgerEntryBalanceRefundCredit     int16 = 6
-	ledgerEntryDepositRefundCredit     int16 = 7
-	ledgerEntryAdminBalanceCredit      int16 = 8
-	ledgerEntryAdminBalanceDebit       int16 = 9
-	depositHoldStatusHeld              int16 = 1
-	depositHoldStatusReleased          int16 = 2
-	depositHoldStatusForfeited         int16 = 3
-	depositHoldStatusRefunded          int16 = 4
-	refundSourceTypeWallet             int16 = 1
-	refundKindFull                     int16 = 1
-	refundStatusRequested              int16 = 1
-	refundStatusCompleted              int16 = 2
-	refundStatusFailed                 int16 = 3
-	securityEventTypeDepositReleased   int16 = 11
-	securityEventTypeDepositForfeited  int16 = 12
-	securityEventTypeWalletPayment     int16 = 13
-	securityEventTypeWalletRefund      int16 = 14
-	securityEventTypeBalanceAdjustment int16 = 15
+	ledgerEntryProviderPaymentReceived  int16 = 1
+	ledgerEntryDepositHeld              int16 = 2
+	ledgerEntryDepositReleasedBalance   int16 = 3
+	ledgerEntryDepositForfeited         int16 = 4
+	ledgerEntryBalanceDebit             int16 = 5
+	ledgerEntryBalanceRefundCredit      int16 = 6
+	ledgerEntryDepositRefundCredit      int16 = 7
+	ledgerEntryAdminBalanceCredit       int16 = 8
+	ledgerEntryAdminBalanceDebit        int16 = 9
+	depositHoldStatusHeld               int16 = 1
+	depositHoldStatusReleased           int16 = 2
+	depositHoldStatusForfeited          int16 = 3
+	depositHoldStatusRefunded           int16 = 4
+	refundSourceTypeWallet              int16 = 1
+	refundKindFull                      int16 = 1
+	refundStatusRequested               int16 = 1
+	refundStatusCompleted               int16 = 2
+	refundStatusFailed                  int16 = 3
+	securityEventTypeDepositReleased    int16 = 11
+	securityEventTypeDepositForfeited   int16 = 12
+	securityEventTypeWalletPayment      int16 = 13
+	securityEventTypeWalletRefund       int16 = 14
+	securityEventTypeBalanceAdjustment  int16 = 15
+	securityEventTypeRentalCompleted    int16 = 16
+	securityEventTypeSuspiciousActivity int16 = 4
+	securityEventTypeSecurityIncident   int16 = 6
+	depositSettlementSourceAdminRelease int16 = 1
+	depositSettlementSourceAdminForfeit int16 = 2
+	depositSettlementSourceAutoRelease  int16 = 3
+	depositSettlementSourceWalletRefund int16 = 4
 )
 
 type Repository interface {
@@ -51,6 +59,9 @@ type Repository interface {
 	MarkPaymentSuccessfulForWallet(ctx context.Context, paymentID int64, now time.Time) error
 	RecordBalanceDebit(ctx context.Context, entry FinancialLedgerEntry) error
 	GetUserBalance(ctx context.Context, userID int64) (*UserBalance, error)
+	GetCustomerRentalPayment(ctx context.Context, rentalID, userID int64) (*CustomerPayment, error)
+	ListCustomerPayments(ctx context.Context, userID int64) ([]CustomerPayment, error)
+	GetCustomerPayment(ctx context.Context, paymentID, userID int64) (*CustomerPayment, error)
 	ListUserLedgerEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicLedgerEntry, error)
 	CountUserLedgerEntries(ctx context.Context, userID int64) (int64, error)
 	ListUserRefundEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicRefundEntry, error)
@@ -65,6 +76,7 @@ type Repository interface {
 	SetUserBalance(ctx context.Context, userID, balance int64, now time.Time) error
 	LogAdminBalanceAdjustmentSecurityEvent(ctx context.Context, targetUserID int64, clientIP, userAgent string, metadata []byte) error
 	LockWalletRefundState(ctx context.Context, rentalID int64) (*WalletRefundState, error)
+	LockRentalSettlementKey(ctx context.Context, rentalID int64) error
 	LockPaymentForWebhookByID(ctx context.Context, paymentID int64) (*WebhookPaymentState, error)
 	LockPaymentForWebhookByExternalTransaction(ctx context.Context, provider, externalTransactionID string) (*WebhookPaymentState, error)
 	MarkPaymentSuccessful(ctx context.Context, paymentID int64, externalTransactionID string) error
@@ -74,10 +86,13 @@ type Repository interface {
 	CreateDepositHold(ctx context.Context, hold DepositHold) error
 	RecordDepositHeld(ctx context.Context, entry FinancialLedgerEntry) error
 	LockDepositSettlementState(ctx context.Context, rentalID int64) (*DepositSettlementState, error)
+	LockNextRentalFinalizationState(ctx context.Context, now time.Time) (*DepositSettlementState, error)
 	LoadDepositSettlementEligibility(ctx context.Context, rentalID int64) (*DepositSettlementEligibility, error)
-	MarkDepositReleased(ctx context.Context, holdID int64, now time.Time) error
-	MarkDepositForfeited(ctx context.Context, holdID int64, now time.Time) error
-	MarkDepositRefunded(ctx context.Context, holdID, refundID int64, now time.Time) error
+	VerifyDepositForfeitEvidence(ctx context.Context, rentalID, userID, accountID, securityEventID int64) (bool, error)
+	MarkDepositReleased(ctx context.Context, holdID int64, source int16, settledByUserID *int64, now time.Time) error
+	MarkDepositForfeited(ctx context.Context, holdID int64, settledByUserID int64, reasonCode, evidenceReference string, now time.Time) error
+	MarkDepositRefunded(ctx context.Context, holdID, refundID int64, settledByUserID int64, now time.Time) error
+	MarkRentalCompleted(ctx context.Context, rentalID int64, now time.Time) (bool, error)
 	CreditUserBalance(ctx context.Context, userID, amount int64, now time.Time) error
 	RecordDepositReleasedToBalance(ctx context.Context, entry FinancialLedgerEntry) error
 	RecordDepositForfeited(ctx context.Context, entry FinancialLedgerEntry) error
@@ -90,6 +105,7 @@ type Repository interface {
 	LogDepositSecurityEvent(ctx context.Context, eventType int16, userID, accountID, rentalID int64, userAgent string, metadata []byte) error
 	LogWalletSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error
 	InsertAuditLog(ctx context.Context, actorUserID int64, entityType string, entityID int64, action string, oldValues, newValues []byte) error
+	InsertSystemAuditLog(ctx context.Context, entityType string, entityID int64, action string, oldValues, newValues []byte) error
 	LogSecurityEvent(ctx context.Context, userID, accountID, rentalID int64, clientIP, userAgent string, metadata []byte) error
 }
 
@@ -157,12 +173,20 @@ type WalletRefundState struct {
 	HoldID         int64
 	HoldStatus     int16
 	HoldAmount     int64
+	CompletedAt    *time.Time
 }
 
 type UserBalance struct {
 	UserID           int64
 	AvailableBalance int64
 	Currency         string
+}
+
+type CustomerPayment struct {
+	ID, RentalID, Amount int64
+	Currency             string
+	Status               int16
+	CreatedAt            time.Time
 }
 
 type PublicLedgerEntry struct {
@@ -201,17 +225,35 @@ type DepositHold struct {
 }
 
 type DepositSettlementState struct {
-	HoldID        int64
-	RentalID      int64
-	UserID        int64
-	AccountID     int64
-	PaymentID     int64
-	HoldStatus    int16
-	RentalStatus  int16
-	PaymentStatus int16
-	Amount        int64
-	Currency      string
-	UserBalance   int64
+	HoldID                int64
+	RentalID              int64
+	UserID                int64
+	AccountID             int64
+	PaymentID             int64
+	HoldStatus            int16
+	RentalStatus          int16
+	PaymentStatus         int16
+	Amount                int64
+	Currency              string
+	UserBalance           int64
+	Provider              string
+	RentalPrice           int64
+	RentalDepositAmount   int64
+	EndAt                 time.Time
+	ActualFinishedAt      *time.Time
+	ReviewDeadlineAt      *time.Time
+	CompletedAt           *time.Time
+	HasDepositHold        bool
+	ReleasedAt            *time.Time
+	ForfeitedAt           *time.Time
+	RefundedAt            *time.Time
+	SettlementSource      *int16
+	SettledByUserID       *int64
+	SettlementReasonCode  string
+	SettlementEvidenceRef string
+	HoldUserID            int64
+	HoldPaymentID         int64
+	HoldCurrency          string
 }
 
 type DepositSettlementEligibility struct {
@@ -263,6 +305,66 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 
 func (r *PostgresRepository) WithinTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
 	return r.txManager.WithinTransaction(ctx, fn)
+}
+
+func (r *PostgresRepository) GetCustomerRentalPayment(ctx context.Context, rentalID, userID int64) (*CustomerPayment, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var exists bool
+	if err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM rentals WHERE id = $1 AND user_id = $2)`, rentalID, userID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrPaymentNotFound
+	}
+	return r.getCustomerPaymentByRental(ctx, rentalID, userID)
+}
+
+func (r *PostgresRepository) getCustomerPaymentByRental(ctx context.Context, rentalID, userID int64) (*CustomerPayment, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var payment CustomerPayment
+	err := db.QueryRow(ctx, `SELECT id, rental_id, amount, currency, status, created_at FROM payments WHERE rental_id = $1 AND user_id = $2`, rentalID, userID).Scan(
+		&payment.ID, &payment.RentalID, &payment.Amount, &payment.Currency, &payment.Status, &payment.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCustomerPaymentUnavailable
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &payment, nil
+}
+
+func (r *PostgresRepository) ListCustomerPayments(ctx context.Context, userID int64) ([]CustomerPayment, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	rows, err := db.Query(ctx, `SELECT id, rental_id, amount, currency, status, created_at FROM payments WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]CustomerPayment, 0)
+	for rows.Next() {
+		var payment CustomerPayment
+		if err := rows.Scan(&payment.ID, &payment.RentalID, &payment.Amount, &payment.Currency, &payment.Status, &payment.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, payment)
+	}
+	return items, rows.Err()
+}
+
+func (r *PostgresRepository) GetCustomerPayment(ctx context.Context, paymentID, userID int64) (*CustomerPayment, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var payment CustomerPayment
+	err := db.QueryRow(ctx, `SELECT id, rental_id, amount, currency, status, created_at FROM payments WHERE id = $1 AND user_id = $2`, paymentID, userID).Scan(
+		&payment.ID, &payment.RentalID, &payment.Amount, &payment.Currency, &payment.Status, &payment.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrPaymentNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &payment, nil
 }
 
 func (r *PostgresRepository) CreatePendingPayment(ctx context.Context, rentalID, userID int64, amount int64, currency string) (int64, error) {
@@ -344,95 +446,37 @@ func (r *PostgresRepository) GetUserBalance(ctx context.Context, userID int64) (
 }
 
 func (r *PostgresRepository) LockWalletRefundState(ctx context.Context, rentalID int64) (*WalletRefundState, error) {
-	db := database.GetTxOrPool(ctx, r.pool)
-	withHoldQuery := `
-		SELECT
-			p.id,
-			r.id,
-			r.user_id,
-			r.account_id,
-			p.provider,
-			p.status,
-			r.status,
-			r.rental_price,
-			r.deposit_amount,
-			p.currency,
-			u.balance,
-			d.id,
-			d.status,
-			d.amount
-		FROM rentals r
-		JOIN accounts a ON a.id = r.account_id
-		JOIN users u ON u.id = r.user_id
-		JOIN payments p ON p.rental_id = r.id AND p.user_id = r.user_id
-		JOIN deposit_holds d ON d.rental_id = r.id
-		WHERE r.id = $1
-		FOR UPDATE OF p, r, a, u, d`
-
-	var state WalletRefundState
-	err := db.QueryRow(ctx, withHoldQuery, rentalID).Scan(
-		&state.PaymentID,
-		&state.RentalID,
-		&state.UserID,
-		&state.AccountID,
-		&state.Provider,
-		&state.PaymentStatus,
-		&state.RentalStatus,
-		&state.RentalPrice,
-		&state.DepositAmount,
-		&state.Currency,
-		&state.UserBalance,
-		&state.HoldID,
-		&state.HoldStatus,
-		&state.HoldAmount,
-	)
-	if err == nil {
-		state.HasDepositHold = true
-		return &state, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, err
-	}
-
-	withoutHoldQuery := `
-		SELECT
-			p.id,
-			r.id,
-			r.user_id,
-			r.account_id,
-			p.provider,
-			p.status,
-			r.status,
-			r.rental_price,
-			r.deposit_amount,
-			p.currency,
-			u.balance
-		FROM rentals r
-		JOIN accounts a ON a.id = r.account_id
-		JOIN users u ON u.id = r.user_id
-		JOIN payments p ON p.rental_id = r.id AND p.user_id = r.user_id
-		WHERE r.id = $1
-		FOR UPDATE OF p, r, a, u`
-
-	if err := db.QueryRow(ctx, withoutHoldQuery, rentalID).Scan(
-		&state.PaymentID,
-		&state.RentalID,
-		&state.UserID,
-		&state.AccountID,
-		&state.Provider,
-		&state.PaymentStatus,
-		&state.RentalStatus,
-		&state.RentalPrice,
-		&state.DepositAmount,
-		&state.Currency,
-		&state.UserBalance,
-	); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	settlement, err := r.LockDepositSettlementState(ctx, rentalID)
+	if err != nil {
+		if errors.Is(err, ErrDepositHoldNotFound) || errors.Is(err, ErrPaymentNotFound) {
 			return nil, ErrWalletRefundNotFound
 		}
 		return nil, err
 	}
-	return &state, nil
+	return &WalletRefundState{
+		PaymentID:      settlement.PaymentID,
+		RentalID:       settlement.RentalID,
+		UserID:         settlement.UserID,
+		AccountID:      settlement.AccountID,
+		Provider:       settlement.Provider,
+		PaymentStatus:  settlement.PaymentStatus,
+		RentalStatus:   settlement.RentalStatus,
+		RentalPrice:    settlement.RentalPrice,
+		DepositAmount:  settlement.RentalDepositAmount,
+		Currency:       settlement.Currency,
+		UserBalance:    settlement.UserBalance,
+		HasDepositHold: settlement.HasDepositHold,
+		HoldID:         settlement.HoldID,
+		HoldStatus:     settlement.HoldStatus,
+		HoldAmount:     settlement.Amount,
+		CompletedAt:    settlement.CompletedAt,
+	}, nil
+}
+
+func (r *PostgresRepository) LockRentalSettlementKey(ctx context.Context, rentalID int64) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	_, err := db.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, fmt.Sprintf("rental:settlement:%d", rentalID))
+	return err
 }
 
 func (r *PostgresRepository) ListUserLedgerEntries(ctx context.Context, userID int64, limit, offset int) ([]PublicLedgerEntry, error) {
@@ -804,40 +848,22 @@ func (r *PostgresRepository) RecordDepositHeld(ctx context.Context, entry Financ
 
 func (r *PostgresRepository) LockDepositSettlementState(ctx context.Context, rentalID int64) (*DepositSettlementState, error) {
 	db := database.GetTxOrPool(ctx, r.pool)
-	query := `
-		SELECT
-			d.id,
-			r.id,
-			r.user_id,
-			r.account_id,
-			p.id,
-			d.status,
-			r.status,
-			p.status,
-			d.amount,
-			d.currency,
-			u.balance
-		FROM deposit_holds d
-		JOIN rentals r ON r.id = d.rental_id
-		JOIN payments p ON p.id = d.payment_id
-		JOIN accounts a ON a.id = r.account_id
-		JOIN users u ON u.id = r.user_id
-		WHERE d.rental_id = $1
-		FOR UPDATE OF d, r, p, a, u`
-
 	var state DepositSettlementState
-	err := db.QueryRow(ctx, query, rentalID).Scan(
-		&state.HoldID,
+	var actualFinishedAt, reviewDeadlineAt, completedAt sql.NullTime
+	err := db.QueryRow(ctx, `
+		SELECT id, user_id, account_id, status, rental_price, deposit_amount, end_at,
+		       actual_finished_at, deposit_review_deadline_at, completed_at
+		FROM rentals WHERE id = $1 FOR UPDATE`, rentalID).Scan(
 		&state.RentalID,
 		&state.UserID,
 		&state.AccountID,
-		&state.PaymentID,
-		&state.HoldStatus,
 		&state.RentalStatus,
-		&state.PaymentStatus,
-		&state.Amount,
-		&state.Currency,
-		&state.UserBalance,
+		&state.RentalPrice,
+		&state.RentalDepositAmount,
+		&state.EndAt,
+		&actualFinishedAt,
+		&reviewDeadlineAt,
+		&completedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDepositHoldNotFound
@@ -845,7 +871,117 @@ func (r *PostgresRepository) LockDepositSettlementState(ctx context.Context, ren
 	if err != nil {
 		return nil, err
 	}
+	if actualFinishedAt.Valid {
+		state.ActualFinishedAt = &actualFinishedAt.Time
+	}
+	if reviewDeadlineAt.Valid {
+		state.ReviewDeadlineAt = &reviewDeadlineAt.Time
+	}
+	if completedAt.Valid {
+		state.CompletedAt = &completedAt.Time
+	}
+
+	var lockedAccountID int64
+	if err := db.QueryRow(ctx, `SELECT id FROM accounts WHERE id = $1 FOR UPDATE`, state.AccountID).Scan(&lockedAccountID); err != nil {
+		return nil, err
+	}
+	if err := db.QueryRow(ctx, `
+		SELECT id, provider, status, currency
+		FROM payments WHERE rental_id = $1 AND user_id = $2 FOR UPDATE`, state.RentalID, state.UserID).Scan(
+		&state.PaymentID, &state.Provider, &state.PaymentStatus, &state.Currency,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrPaymentNotFound
+		}
+		return nil, err
+	}
+
+	var releasedAt, forfeitedAt, refundedAt sql.NullTime
+	var source sql.NullInt16
+	var settledBy sql.NullInt64
+	var reasonCode, evidenceRef sql.NullString
+	err = db.QueryRow(ctx, `
+		SELECT id, user_id, payment_id, status, amount, currency, released_at, forfeited_at, refunded_at,
+		       settlement_source, settled_by_user_id, settlement_reason_code, settlement_evidence_ref
+		FROM deposit_holds WHERE rental_id = $1 FOR UPDATE`, state.RentalID).Scan(
+		&state.HoldID, &state.HoldUserID, &state.HoldPaymentID, &state.HoldStatus, &state.Amount, &state.HoldCurrency,
+		&releasedAt, &forfeitedAt, &refundedAt, &source, &settledBy, &reasonCode, &evidenceRef,
+	)
+	if err == nil {
+		state.HasDepositHold = true
+		if releasedAt.Valid {
+			state.ReleasedAt = &releasedAt.Time
+		}
+		if forfeitedAt.Valid {
+			state.ForfeitedAt = &forfeitedAt.Time
+		}
+		if refundedAt.Valid {
+			state.RefundedAt = &refundedAt.Time
+		}
+		if source.Valid {
+			value := int16(source.Int16)
+			state.SettlementSource = &value
+		}
+		if settledBy.Valid {
+			value := settledBy.Int64
+			state.SettledByUserID = &value
+		}
+		if reasonCode.Valid {
+			state.SettlementReasonCode = reasonCode.String
+		}
+		if evidenceRef.Valid {
+			state.SettlementEvidenceRef = evidenceRef.String
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	if err := db.QueryRow(ctx, `SELECT balance FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, state.UserID).Scan(&state.UserBalance); err != nil {
+		return nil, err
+	}
 	return &state, nil
+}
+
+func (r *PostgresRepository) LockNextRentalFinalizationState(ctx context.Context, now time.Time) (*DepositSettlementState, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var rentalID int64
+	err := db.QueryRow(ctx, `
+		WITH candidate AS MATERIALIZED (
+			SELECT r.id
+			FROM rentals r
+			JOIN payments p ON p.rental_id = r.id AND p.user_id = r.user_id AND p.status = 2
+			LEFT JOIN deposit_holds d ON d.rental_id = r.id
+			WHERE r.status = 3
+			  AND (
+				(r.deposit_amount = 0 AND d.id IS NULL)
+				OR (
+					r.deposit_amount > 0
+					AND d.id IS NOT NULL
+					AND d.user_id = r.user_id
+					AND d.payment_id = p.id
+					AND d.amount = r.deposit_amount
+					AND d.currency = p.currency
+					AND (d.status IN (2, 3, 4) OR (d.status = 1 AND r.deposit_review_deadline_at <= $1))
+				)
+			  )
+			ORDER BY COALESCE(r.deposit_review_deadline_at, r.end_at), r.id
+			LIMIT 1
+		), advisory AS (
+			SELECT id
+			FROM candidate
+			WHERE pg_try_advisory_xact_lock(hashtextextended('rental:settlement:' || id::text, 0))
+		)
+		SELECT r.id
+		FROM advisory c
+		JOIN rentals r ON r.id = c.id
+		FOR UPDATE OF r SKIP LOCKED`, now.UTC()).Scan(&rentalID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDepositHoldNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.LockDepositSettlementState(ctx, rentalID)
 }
 
 func (r *PostgresRepository) LoadDepositSettlementEligibility(ctx context.Context, rentalID int64) (*DepositSettlementEligibility, error) {
@@ -880,15 +1016,35 @@ func (r *PostgresRepository) LoadDepositSettlementEligibility(ctx context.Contex
 	return &eligibility, nil
 }
 
-func (r *PostgresRepository) MarkDepositReleased(ctx context.Context, holdID int64, now time.Time) error {
+func (r *PostgresRepository) VerifyDepositForfeitEvidence(ctx context.Context, rentalID, userID, accountID, securityEventID int64) (bool, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var exists bool
+	err := db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM security_events
+			WHERE id = $1
+			  AND rental_id = $2
+			  AND user_id = $3
+			  AND account_id = $4
+			  AND success = TRUE
+			  AND event_type IN ($5, $6)
+		)`, securityEventID, rentalID, userID, accountID, securityEventTypeSuspiciousActivity, securityEventTypeSecurityIncident).Scan(&exists)
+	return exists, err
+}
+
+func (r *PostgresRepository) MarkDepositReleased(ctx context.Context, holdID int64, source int16, settledByUserID *int64, now time.Time) error {
 	db := database.GetTxOrPool(ctx, r.pool)
 	query := `
 		UPDATE deposit_holds
 		SET status = $2,
 			released_at = $3,
+			settlement_source = $5,
+			settled_by_user_id = $6,
+			settlement_reason_code = NULL,
+			settlement_evidence_ref = NULL,
 			updated_at = $3
 		WHERE id = $1 AND status = $4`
-	tag, err := db.Exec(ctx, query, holdID, depositHoldStatusReleased, now, depositHoldStatusHeld)
+	tag, err := db.Exec(ctx, query, holdID, depositHoldStatusReleased, now.UTC(), depositHoldStatusHeld, source, settledByUserID)
 	if err != nil {
 		return err
 	}
@@ -898,15 +1054,19 @@ func (r *PostgresRepository) MarkDepositReleased(ctx context.Context, holdID int
 	return nil
 }
 
-func (r *PostgresRepository) MarkDepositForfeited(ctx context.Context, holdID int64, now time.Time) error {
+func (r *PostgresRepository) MarkDepositForfeited(ctx context.Context, holdID int64, settledByUserID int64, reasonCode, evidenceReference string, now time.Time) error {
 	db := database.GetTxOrPool(ctx, r.pool)
 	query := `
 		UPDATE deposit_holds
 		SET status = $2,
 			forfeited_at = $3,
+			settlement_source = $5,
+			settled_by_user_id = $6,
+			settlement_reason_code = $7,
+			settlement_evidence_ref = $8,
 			updated_at = $3
 		WHERE id = $1 AND status = $4`
-	tag, err := db.Exec(ctx, query, holdID, depositHoldStatusForfeited, now, depositHoldStatusHeld)
+	tag, err := db.Exec(ctx, query, holdID, depositHoldStatusForfeited, now.UTC(), depositHoldStatusHeld, depositSettlementSourceAdminForfeit, settledByUserID, reasonCode, evidenceReference)
 	if err != nil {
 		return err
 	}
@@ -916,16 +1076,20 @@ func (r *PostgresRepository) MarkDepositForfeited(ctx context.Context, holdID in
 	return nil
 }
 
-func (r *PostgresRepository) MarkDepositRefunded(ctx context.Context, holdID, refundID int64, now time.Time) error {
+func (r *PostgresRepository) MarkDepositRefunded(ctx context.Context, holdID, refundID int64, settledByUserID int64, now time.Time) error {
 	db := database.GetTxOrPool(ctx, r.pool)
 	query := `
 		UPDATE deposit_holds
 		SET status = $2,
 			refunded_at = $3,
 			refund_id = $4,
+			settlement_source = $6,
+			settled_by_user_id = $7,
+			settlement_reason_code = NULL,
+			settlement_evidence_ref = NULL,
 			updated_at = $3
 		WHERE id = $1 AND status = $5`
-	tag, err := db.Exec(ctx, query, holdID, depositHoldStatusRefunded, now, refundID, depositHoldStatusHeld)
+	tag, err := db.Exec(ctx, query, holdID, depositHoldStatusRefunded, now.UTC(), refundID, depositHoldStatusHeld, depositSettlementSourceWalletRefund, settledByUserID)
 	if err != nil {
 		return err
 	}
@@ -933,6 +1097,42 @@ func (r *PostgresRepository) MarkDepositRefunded(ctx context.Context, holdID, re
 		return ErrDepositSettlementNotAllowed
 	}
 	return nil
+}
+
+func (r *PostgresRepository) MarkRentalCompleted(ctx context.Context, rentalID int64, now time.Time) (bool, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	tag, err := db.Exec(ctx, `
+		UPDATE rentals r
+		SET status = 4, completed_at = $2, updated_at = $2
+		WHERE r.id = $1
+		  AND r.status = 3
+		  AND (
+			(
+				r.deposit_amount = 0
+				AND NOT EXISTS (SELECT 1 FROM deposit_holds d WHERE d.rental_id = r.id)
+				AND EXISTS (
+					SELECT 1 FROM payments p
+					WHERE p.rental_id = r.id AND p.user_id = r.user_id AND p.status = 2
+				)
+			)
+			OR EXISTS (
+				SELECT 1
+				FROM deposit_holds d
+				JOIN payments p ON p.id = d.payment_id
+				WHERE d.rental_id = r.id
+				  AND d.user_id = r.user_id
+				  AND p.rental_id = r.id
+				  AND p.user_id = r.user_id
+				  AND p.status = 2
+				  AND d.amount = r.deposit_amount
+				  AND d.currency = p.currency
+				  AND d.status IN (2, 3, 4)
+			)
+		  )`, rentalID, now.UTC())
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 func (r *PostgresRepository) CreditUserBalance(ctx context.Context, userID, amount int64, now time.Time) error {
@@ -1179,7 +1379,7 @@ func (r *PostgresRepository) insertLedgerEntry(ctx context.Context, entryType in
 			metadata
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::jsonb, '{}'::jsonb))
 		ON CONFLICT (idempotency_key) DO NOTHING`
-	_, err := db.Exec(
+	tag, err := db.Exec(
 		ctx,
 		query,
 		entryType,
@@ -1195,7 +1395,13 @@ func (r *PostgresRepository) insertLedgerEntry(ctx context.Context, entryType in
 		entry.CorrelationID,
 		entry.Metadata,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLedgerIdempotencyConflict
+	}
+	return nil
 }
 
 func (r *PostgresRepository) LogDepositSecurityEvent(ctx context.Context, eventType int16, userID, accountID, rentalID int64, userAgent string, metadata []byte) error {
@@ -1241,6 +1447,16 @@ func (r *PostgresRepository) InsertAuditLog(ctx context.Context, actorUserID int
 			actor_user_id, entity_type, entity_id, action, old_values, new_values, created_at
 		) VALUES ($1, $2, $3, $4, COALESCE($5::jsonb, '{}'::jsonb), COALESCE($6::jsonb, '{}'::jsonb), NOW())`
 	_, err := db.Exec(ctx, query, actorUserID, entityType, entityID, action, oldValues, newValues)
+	return err
+}
+
+func (r *PostgresRepository) InsertSystemAuditLog(ctx context.Context, entityType string, entityID int64, action string, oldValues, newValues []byte) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	_, err := db.Exec(ctx, `
+		INSERT INTO audit_logs (
+			actor_user_id, entity_type, entity_id, action, old_values, new_values, created_at
+		) VALUES (NULL, $1, $2, $3, COALESCE($4::jsonb, '{}'::jsonb), COALESCE($5::jsonb, '{}'::jsonb), NOW())`,
+		entityType, entityID, action, oldValues, newValues)
 	return err
 }
 

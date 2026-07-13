@@ -6,6 +6,20 @@
 
 ---
 
+## P1.1 paid-rental closure policy
+
+`ACTIVE` means a successfully paid rental whose usage interval has not ended. At `now >= end_at`, credentials are denied independently of cleanup timing. Cleanup changes only `ACTIVE -> EXPIRED`, releases the account, and sets `actual_finished_at`. For a positive `HELD` deposit it persists `deposit_review_deadline_at = end_at + 24 hours`.
+
+Paid `EXPIRED` means usage ended and settlement may be pending. Unpaid payment-window timeout continues to use the existing `EXPIRED` compatibility status with failed payment and never enters completion processing. The internal reasons are `USAGE_ENDED_SETTLEMENT_PENDING` and `PAYMENT_WINDOW_EXPIRED`.
+
+`COMPLETED` is automatic paid closure. It requires `payment=SUCCESS` and either zero deposit or a terminal hold (`RELEASED`, `FORFEITED`, or `REFUNDED`). `HELD`, missing, unknown, or inconsistent positive-deposit state blocks closure. Completion sets `completed_at` and never rewrites `actual_finished_at`.
+
+An admin may release a held deposit after paid expiry. An admin may forfeit it only strictly before the persisted review deadline and only with an allow-listed reason plus a verified, successful, aggregate-matching `Suspicious Activity` or `Security Incident` reference. Routine lifecycle events are not forfeiture evidence. At the deadline, auto-release wins; auto-forfeit does not exist. Partial forfeiture, provider refunds, disputes, and rental extension are outside P1.1.
+
+Release credits the wallet once and records an immutable ledger entry. Forfeit does not credit the wallet and records an immutable ledger entry. Wallet refund may atomically resolve `HELD -> REFUNDED` and complete the rental; refunds of already released/forfeited deposits remain principal-only. Every settlement, balance, ledger, security/audit, and completion change is atomic and idempotent.
+
+---
+
 # 1. Purpose
 
 ## 1.1 Overview
@@ -595,7 +609,7 @@ Credentials после перехода в `EXPIRED` не выдаются.
 
 Аренда полностью завершена.
 
-В текущем API/worker flow переход в `COMPLETED` не является реализованным закрытием оплаченной аренды; expiration использует `EXPIRED`.
+Expiration переводит paid rental только в `EXPIRED`. Отдельный settlement/finalizer flow переводит paid `EXPIRED` rental в `COMPLETED`, когда положительный депозит отсутствует либо deposit hold уже находится в терминальном состоянии `RELEASED`, `FORFEITED` или `REFUNDED`.
 
 ---
 
@@ -819,7 +833,7 @@ REQUESTED
 COMPLETED
 ```
 
-На текущем этапе реализован только wallet-paid full refund. Refund не меняет `rental.status` и не переводит `payment.status` в отдельный refund status.
+На текущем этапе реализован только wallet-paid full refund. Refund не переводит `payment.status` в отдельный refund status. Если refund завершает `HELD -> REFUNDED`, та же транзакция может выполнить lifecycle closure `EXPIRED -> COMPLETED`; refund не переоткрывает `COMPLETED`.
 
 ---
 

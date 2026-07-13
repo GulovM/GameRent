@@ -72,8 +72,8 @@ describe("App credentials safety and auto-clearing", () => {
 
   it("clears credentials after 60 seconds, on window blur, and visibilitychange", async () => {
     const userObj = makeUser({ role: "RENT" });
-    const rentalObj = makeRental({ id: 10, status: 2 }); // Active status = 2
-    const paymentObj = makePayment({ id: 100, rental_id: 10, status: 2 }); // Success status = 2
+    const rentalObj = makeRental({ id: 10, status: 2 }); 
+    const paymentObj = makePayment({ id: 100, rental_id: 10, status: 2 }); 
 
     vi.mocked(api.accounts).mockResolvedValue({ accounts: [makeAccount()], pagination: makePagination() });
     vi.mocked(api.games).mockResolvedValue({ games: [], pagination: makePagination() });
@@ -92,7 +92,6 @@ describe("App credentials safety and auto-clearing", () => {
 
     const getCredsBtn = await screen.findByLabelText("Get rental credentials");
 
-    // Enable fake timers specifically for the 60-second auto-clear check
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 
     fireEvent.click(getCredsBtn);
@@ -109,7 +108,6 @@ describe("App credentials safety and auto-clearing", () => {
     expect(screen.queryByText("secure_login")).not.toBeInTheDocument();
     expect(screen.queryByText("secure_password")).not.toBeInTheDocument();
 
-    // Restore real timers for the rest of the test
     vi.useRealTimers();
 
     const btn = await screen.findByLabelText("Get rental credentials");

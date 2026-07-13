@@ -1,5 +1,27 @@
 # API Design
 
+## P1.1 settlement endpoint compatibility
+
+The existing routes remain stable:
+
+- `POST /api/v1/admin/rentals/{rentalId}/deposit/release`
+- `POST /api/v1/admin/rentals/{rentalId}/deposit/forfeit`
+
+Forfeit now requires strict JSON:
+
+```json
+{
+  "reason_code": "DAMAGE_CONFIRMED",
+  "evidence_reference": "SECURITY_EVENT:123"
+}
+```
+
+`reason_code` must be in the backend allow-list. `evidence_reference` accepts only `SECURITY_EVENT:<positive integer>`; the referenced event must be a successful `Suspicious Activity` or `Security Incident` event belonging to the same rental/user/account aggregate. Routine expiry/payment events, nullable/failed events, free-form evidence, URLs, credentials, provider payloads, and secrets are rejected. The actor must still be a current, unblocked, undeleted database `ADMIN` inside the settlement transaction, including idempotent replay.
+
+Release and forfeit retain the legacy `status` response field and add `idempotent`, `deposit_status`, `settled_at`, `rental_status`, and `completed_at`. A repeated identical decision is an idempotent success; an opposite terminal decision or changed forfeit reason/evidence is `409 DEPOSIT_SETTLEMENT_FAILED`. Pre-P1 terminal holds have no settlement metadata, so authorized replays remain idempotent for backward compatibility without fabricating provenance.
+
+Phase 1 adds no completion endpoint, review-queue endpoint, or system-actor HTTP surface. Phase 2 admin-review API and Phase 3 frontend work remain deferred.
+
 ## 1. Purpose
 
 Данный документ описывает REST API платформы GameRent.
@@ -416,7 +438,7 @@ Admin account creation and pricing/deposit PATCH also revalidate inside their wr
 7. Expiration worker переводит истёкшую `ACTIVE` аренду в `EXPIRED`, освобождает account `RENTED -> AVAILABLE` и не изменяет `SUCCESS` payment.
 8. Waiting-payment cleanup переводит просроченную неоплаченную аренду `WAITING_PAYMENT -> EXPIRED`, payment `PENDING -> FAILED`, account `RESERVED -> AVAILABLE`.
 9. Успешный provider webhook пишет immutable `financial_ledger_entries`: `PROVIDER_PAYMENT_RECEIVED` и, при ненулевом депозите, `DEPOSIT_HELD`.
-10. `POST /api/v1/admin/rentals/{rentalId}/wallet-refund` доступен только `ADMIN`, принимает `reason_code`, работает только для wallet-paid `SUCCESS` payment и rental в `EXPIRED` или `COMPLETED`. Backend сам рассчитывает full refund, не переводит `payment.status` в отдельный `REFUNDED` status и не меняет `rental.status` из-за refund.
+10. `POST /api/v1/admin/rentals/{rentalId}/wallet-refund` доступен только `ADMIN`, принимает `reason_code`, работает только для wallet-paid `SUCCESS` payment и rental в `EXPIRED` или `COMPLETED`. Backend сам рассчитывает full refund и не переводит `payment.status` в отдельный `REFUNDED` status. Если refund атомарно переводит `deposit_hold HELD -> REFUNDED`, он также может закрыть paid `EXPIRED` rental в `COMPLETED`; refund никогда не переоткрывает уже завершённую аренду.
 11. Wallet refund кредитует `users.balance` идемпотентно и пишет отдельные ledger entries `BALANCE_REFUND_CREDIT` и `DEPOSIT_REFUND_CREDIT`. Если `deposit_hold` уже `RELEASED` или `FORFEITED`, депозит повторно не кредитуется.
 12. Rental extension отключён: endpoint возвращает `501 EXTENSION_NOT_SUPPORTED`, UI не предлагает действие, `end_at` остаётся неизменным.
 13. Generic admin account PATCH не принимает lifecycle status. Account status меняется только согласованными rental/payment/cleanup/idle-disable операциями.

@@ -430,17 +430,17 @@ export default function App() {
     invalidateCredentialRequest();
   }, [invalidateCredentialRequest, user?.id]);
 
-  // 60-second auto-clear timer for credentials
+  
   useEffect(() => {
     if (!credentials) return;
     const timer = window.setTimeout(() => {
       invalidateCredentialRequest();
-    }, 60000); // 60 seconds
+    }, 60000); 
 
     return () => window.clearTimeout(timer);
   }, [credentials, invalidateCredentialRequest]);
 
-  // Reactive rental expiry check
+  
   useEffect(() => {
     if (!credentials || !selectedRental) return;
 
@@ -453,7 +453,7 @@ export default function App() {
       if (isRentalExpiredByTime(selectedRental)) {
         invalidateCredentialRequest();
       }
-    }, 1000); // check every second
+    }, 1000); 
 
     return () => window.clearInterval(interval);
   }, [credentials, invalidateCredentialRequest, selectedRental]);
@@ -475,12 +475,12 @@ export default function App() {
     };
   }, [invalidateCredentialRequest, selectedRental]);
 
-  // Clear credentials on navigation (view changes)
+  
   useEffect(() => {
     invalidateCredentialRequest();
   }, [invalidateCredentialRequest, view]);
 
-  // Clear credentials on unmount and register security event listeners (tab switch / blur)
+  
   useEffect(() => {
     const handleClearCredentials = () => {
       invalidateCredentialRequest();
@@ -890,7 +890,7 @@ export default function App() {
     try {
       if (refresh) await api.logout(refresh);
     } catch {
-      // Local logout must still complete if server revocation is unavailable.
+      
     } finally {
       clearTokens();
       clearPrivateState();

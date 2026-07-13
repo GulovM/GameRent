@@ -56,8 +56,7 @@ func Auth(secret string, log *shared_logger.Logger, pool *pgxpool.Pool) func(htt
 			}
 
 			effectiveRole := currentUser.Role
-			// A stale RENT token must never gain ADMIN merely because the database
-			// role was promoted. Promotion requires a fresh authenticated token.
+
 			if effectiveRole == "ADMIN" && claims.Role != "ADMIN" {
 				effectiveRole = "RENT"
 			}

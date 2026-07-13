@@ -17,6 +17,7 @@ import (
 	"rent_game_accs/internal/api"
 	"rent_game_accs/internal/auth"
 	"rent_game_accs/internal/game"
+	"rent_game_accs/internal/notification"
 	"rent_game_accs/internal/payment"
 	pkg_logger "rent_game_accs/internal/pkg/logger"
 	"rent_game_accs/internal/pkg/monitoring"
@@ -26,6 +27,7 @@ import (
 	pkg_http_server "rent_game_accs/internal/pkg/transport/http/server"
 	"rent_game_accs/internal/rental"
 	repo_postgres "rent_game_accs/internal/repository/postgres"
+	"rent_game_accs/internal/review"
 	"rent_game_accs/internal/shared/clock"
 	"rent_game_accs/internal/shared/database"
 	shared_logger "rent_game_accs/internal/shared/logger"
@@ -140,23 +142,32 @@ func Run() {
 	accountRepo := account.NewPostgresRepository(pool.Pool, os.Getenv("ENCRYPTION_KEY"))
 	rentalRepo := rental.NewPostgresRepository(pool.Pool)
 	paymentRepo := payment.NewPostgresRepository(pool.Pool)
+	reviewRepo := review.NewPostgresRepository(pool.Pool)
+	notificationRepo := notification.NewPostgresRepository(pool.Pool)
 
 	authService := auth.NewPostgresService(authRepo, txManager, jwtSecret, jwtTTL)
 	userService := user.NewPostgresService(userRepo)
+	adminUserService := user.NewAdminService(userRepo, txManager)
 	gameService := game.NewPostgresService(gameRepo)
 	accountService := account.NewPostgresService(accountRepo)
+	adminAccountService := account.NewAdminService(accountRepo, txManager)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
 	paymentService, err := payment.NewPaymentServiceWithWebhookSecret(paymentRepo, webhookSecret)
 	if err != nil {
 		logger.Fatal("invalid PAYMENT_WEBHOOK_SECRET configuration", zap.Error(err))
 	}
+	reviewService := review.NewService(reviewRepo)
+	notificationService := notification.NewService(notificationRepo)
 	paymentHandler := payment.NewHandler(paymentService, logger.Logger)
 
 	authHandler := auth.NewHandler(authService, logger.Logger)
 	userHandler := user.NewHandler(userService, logger.Logger)
 	gameHandler := game.NewHandler(gameService, logger.Logger)
 	accountHandler := account.NewHandler(accountService, logger.Logger)
-	apiHandler := api.NewHandler(pool.Pool, rentalService, paymentService, accountRepo, steamClient, repo)
+	apiAuthMiddleware := func(secret string, log *shared_logger.Logger) func(http.Handler) http.Handler {
+		return shared_middleware.Auth(secret, log, pool.Pool)
+	}
+	apiHandler := api.NewHandler(apiAuthMiddleware, rentalService, paymentService, adminAccountService, adminUserService, steamClient, repo, reviewService, notificationService)
 
 	sLogger := &shared_logger.Logger{Logger: logger.Logger}
 	rateLimiter := shared_middleware.NewRateLimiter(5.0, 10.0)

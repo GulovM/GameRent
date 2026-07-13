@@ -419,6 +419,7 @@ func TestAdminBalanceAdjustment_RollbackAndProfileStaleWriteProtection(t *testin
 }
 
 func TestAdminFinancialOperations_RejectStaleCurrentAdminWithoutMutation(t *testing.T) {
+	var forfeitEvidenceReference string
 	type operation struct {
 		name  string
 		setup func(*testing.T, *pgxpool.Pool) (int64, int64)
@@ -468,10 +469,11 @@ func TestAdminFinancialOperations_RejectStaleCurrentAdminWithoutMutation(t *test
 			setup: func(t *testing.T, pool *pgxpool.Pool) (int64, int64) {
 				const userID, accountID, rentalID, paymentID int64 = 780301, 780302, 780303, 780304
 				seedHeldDepositSettlementRental(t, pool, userID, accountID, rentalID, paymentID, 500, 500)
+				forfeitEvidenceReference = settlementEvidenceReference(t, pool, rentalID)
 				return userID, rentalID
 			},
 			call: func(service *payment.PaymentService, _, rentalID int64, _ string) error {
-				_, err := service.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", time.Now())
+				_, err := service.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", forfeitEvidenceReference, time.Now())
 				return err
 			},
 		},

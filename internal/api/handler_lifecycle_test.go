@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"rent_game_accs/internal/payment"
 	shared_middleware "rent_game_accs/internal/shared/middleware"
 	shared_response "rent_game_accs/internal/shared/response"
 )
@@ -55,5 +57,91 @@ func TestPublicDepositStatusMapsUnknownCodeToUnknown(t *testing.T) {
 	}
 	if got := publicDepositStatus(700, 0); got != "NONE" {
 		t.Fatalf("missing hold status=%q want NONE", got)
+	}
+}
+
+func TestAdminForfeitDepositRequest_RequiresAllowlistedReasonAndEvidenceReference(t *testing.T) {
+	tests := []struct {
+		name    string
+		request adminForfeitDepositRequest
+		wantErr bool
+	}{
+		{
+			name: "valid",
+			request: adminForfeitDepositRequest{
+				ReasonCode:        "DAMAGE_CONFIRMED",
+				EvidenceReference: "SECURITY_EVENT:42",
+			},
+		},
+		{
+			name: "trims canonical values",
+			request: adminForfeitDepositRequest{
+				ReasonCode:        " DAMAGE_CONFIRMED ",
+				EvidenceReference: " SECURITY_EVENT:42 ",
+			},
+		},
+		{
+			name: "arbitrary reason rejected",
+			request: adminForfeitDepositRequest{
+				ReasonCode:        "damage_confirmed",
+				EvidenceReference: "SECURITY_EVENT:42",
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing evidence rejected",
+			request: adminForfeitDepositRequest{
+				ReasonCode: "DAMAGE_CONFIRMED",
+			},
+			wantErr: true,
+		},
+		{
+			name: "free form evidence rejected",
+			request: adminForfeitDepositRequest{
+				ReasonCode:        "DAMAGE_CONFIRMED",
+				EvidenceReference: "user pasted evidence here",
+			},
+			wantErr: true,
+		},
+		{
+			name: "non-positive security event rejected",
+			request: adminForfeitDepositRequest{
+				ReasonCode:        "DAMAGE_CONFIRMED",
+				EvidenceReference: "SECURITY_EVENT:0",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.request.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error=%v wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDepositSettlementResponse_PreservesStatusAndAddsLifecycleFields(t *testing.T) {
+	settledAt := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	completedAt := settledAt.Add(time.Second)
+	response := depositSettlementResponse(&payment.DepositSettlementResult{
+		Changed:       true,
+		Idempotent:    false,
+		DepositStatus: "RELEASED",
+		SettledAt:     &settledAt,
+		RentalStatus:  4,
+		CompletedAt:   &completedAt,
+	})
+
+	if response["status"] != "RELEASED" || response["deposit_status"] != "RELEASED" {
+		t.Fatalf("legacy/additive deposit status mismatch: %+v", response)
+	}
+	if response["changed"] != true || response["idempotent"] != false {
+		t.Fatalf("settlement flags mismatch: %+v", response)
+	}
+	if response["settled_at"] != &settledAt || response["completed_at"] != &completedAt || response["rental_status"] != int16(4) {
+		t.Fatalf("settlement lifecycle fields mismatch: %+v", response)
 	}
 }

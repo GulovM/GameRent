@@ -177,7 +177,7 @@ func TestPaymentService_AdminFinancialOperations_RequireCurrentDatabaseAdmin(t *
 		{
 			name: "deposit forfeit",
 			call: func(service *PaymentService) error {
-				_, err := service.ForfeitDeposit(context.Background(), 900, "ADMIN", 100, "DAMAGE_CONFIRMED", time.Now())
+				_, err := service.ForfeitDeposit(context.Background(), 900, "ADMIN", 100, "DAMAGE_CONFIRMED", "SECURITY_EVENT:1", time.Now())
 				return err
 			},
 		},

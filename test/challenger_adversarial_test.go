@@ -14,7 +14,6 @@ import (
 	"go.uber.org/zap"
 
 	"rent_game_accs/internal/account"
-	"rent_game_accs/internal/api"
 	"rent_game_accs/internal/auth"
 	"rent_game_accs/internal/payment"
 	pkg_http_server "rent_game_accs/internal/pkg/transport/http/server"
@@ -50,7 +49,7 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 	rentalRepo := rental.NewPostgresRepository(pool)
 
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -64,16 +63,13 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	t.Cleanup(func() { ts.Close() })
 
-	// Helper: Register/Login a client
 	userID, token := registerAndLoginE2EUser(t, ts, "adversarial@example.com", "pass-123-adv", "Adversarial", "Tester")
 
-	// Top up balance
 	_, err := pool.Exec(ctx, `UPDATE users SET balance = $1 WHERE id = $2`, 10000, userID)
 	if err != nil {
 		t.Fatalf("failed to top up user balance: %v", err)
 	}
 
-	// Helper: Setup game and account
 	gameID := int64(9995)
 	_, err = pool.Exec(ctx, `
 		INSERT INTO games (id, name, steam_app_id, short_description, header_image, developers, publishers, genres)
@@ -100,7 +96,6 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 	_ = accEntity.Publish(time.Now().UTC())
 	_ = accountRepo.CreateAccount(ctx, accEntity)
 
-	// Create and pay rental
 	rent, err := rentalService.RentAccount(ctx, userID, accEntity.ID, 3*time.Hour, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("failed to rent: %v", err)
@@ -110,15 +105,12 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 	var paymentID int64
 	_ = pool.QueryRow(ctx, "SELECT id FROM payments WHERE rental_id = $1", rentalID).Scan(&paymentID)
 
-	// Simulate payment webhook success
 	_, _ = pool.Exec(ctx, "UPDATE payments SET status = 2, external_transaction_id = 'ext-tx-adv' WHERE id = $1", paymentID)
 	_, _ = pool.Exec(ctx, "UPDATE rentals SET status = 2 WHERE id = $1", rentalID)
 	_, _ = pool.Exec(ctx, "UPDATE accounts SET status = 4 WHERE id = $1", accEntity.ID)
 
 	client := &http.Client{}
 
-	// Adversarial Check 1: Active paid rental with expired payment deadline allows credentials
-	// Set payment_expires_at in the past
 	_, _ = pool.Exec(ctx, "UPDATE rentals SET payment_expires_at = $1 WHERE id = $2", time.Now().UTC().Add(-1*time.Hour), rentalID)
 
 	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/me/rentals/"+strconv.FormatInt(rentalID, 10)+"/credentials", nil)
@@ -136,7 +128,6 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 		t.Fatalf("expected credentials retrieval to succeed (200), got %d: %s", res.StatusCode, string(body))
 	}
 
-	// Adversarial Check 3: Cache-Control: no-store headers are present
 	if cc := res.Header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
 		t.Errorf("expected Cache-Control: no-store, got %q", cc)
 	}
@@ -159,7 +150,6 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 		t.Fatalf("incorrect credentials returned: %+v", credsResp)
 	}
 
-	// Adversarial Check 4: Client IP, User-Agent, and Account ID are correctly logged in security events table
 	var loggedUA, loggedIP string
 	var loggedAccID int64
 	var loggedSuccess bool
@@ -180,8 +170,6 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 		t.Errorf("expected logged Success true, got false")
 	}
 
-	// Adversarial Check 5: Audit failures block credential retrieval
-	// We pass X-Forwarded-For with an invalid IP syntax, which fails the INET check in PostgreSQL, throwing a DB error on INSERT.
 	reqErr, _ := http.NewRequest("GET", ts.URL+"/api/v1/me/rentals/"+strconv.FormatInt(rentalID, 10)+"/credentials", nil)
 	reqErr.Header.Set("Authorization", "Bearer "+token)
 	reqErr.Header.Set("User-Agent", "Adversarial-Agent")
@@ -198,8 +186,6 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 		t.Errorf("expected audit event failure to block and return 500 Internal Server Error, got %d: %s", resErr.StatusCode, string(body))
 	}
 
-	// Adversarial Check 2: Expired, cancelled, and refunded rentals strictly deny credentials
-	// Case A: Expired
 	_, _ = pool.Exec(ctx, "UPDATE rentals SET status = 3 WHERE id = $1", rentalID)
 	resExp, errExp := client.Do(req)
 	if errExp != nil {
@@ -210,7 +196,6 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 		t.Errorf("expected expired rental to return 404, got %d", resExp.StatusCode)
 	}
 
-	// Case B: Cancelled
 	_, _ = pool.Exec(ctx, "UPDATE rentals SET status = 5 WHERE id = $1", rentalID)
 	resCan, errCan := client.Do(req)
 	if errCan != nil {
@@ -221,9 +206,8 @@ func TestAdversarial_CredentialEligibilityFix(t *testing.T) {
 		t.Errorf("expected cancelled rental to return 404, got %d", resCan.StatusCode)
 	}
 
-	// Case C: Refunded / payment not successful
 	_, _ = pool.Exec(ctx, "UPDATE rentals SET status = 2 WHERE id = $1", rentalID)
-	_, _ = pool.Exec(ctx, "UPDATE payments SET status = 3 WHERE id = $1", paymentID) // FAILED
+	_, _ = pool.Exec(ctx, "UPDATE payments SET status = 3 WHERE id = $1", paymentID)
 	resRef, errRef := client.Do(req)
 	if errRef != nil {
 		t.Fatalf("failed to execute request for refunded/failed rental: %v", errRef)

@@ -437,9 +437,6 @@ async function request<T>(path: string, options: RequestInit = {}, query?: Query
       path === "/api/v1/auth/refresh" ||
       path === "/api/v1/auth/logout";
     if (parsed.error.status === 401 && allowRefresh && !isCredentialEndpoint && getRefreshToken()) {
-      // The request may have been sent with an access token that another
-      // concurrent request has already refreshed. Retry with the new access
-      // token instead of rotating the successor refresh token again.
       if (token && getAccessToken() && getAccessToken() !== token) {
         return request<T>(path, options, query, false);
       }

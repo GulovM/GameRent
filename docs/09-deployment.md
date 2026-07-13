@@ -6,6 +6,12 @@
 
 **Status:** Approved
 
+## P1.1 migration rollout note
+
+Apply `20260713150000_rental_completion_deposit_settlement.sql` before deploying the Phase 1 application. The migration gives only consistent historical paid `EXPIRED + HELD` rentals a fresh 24-hour rollout review window; it does not derive historical deadlines from old `end_at`, so deployment cannot immediately mass-release legacy deposits. Preflight should count paid expired holds that remain without a deadline because they are inconsistent and require manual investigation.
+
+Phase 1 exposes the settlement finalizer as an explicit backend job function only. Do not add or enable a production auto-release scheduler loop until the later API/notification rollout supplies an explicit configuration gate and operational monitoring. Rollback must first ensure no application instance depends on the new columns; the Goose Down migration removes the P1.1 fields and indexes.
+
 ---
 
 # 1. Purpose

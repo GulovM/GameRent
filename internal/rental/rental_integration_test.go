@@ -2,6 +2,7 @@ package rental_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -24,6 +25,19 @@ import (
 )
 
 const integrationAdminID int64 = 799999
+
+func settlementEvidenceReference(t *testing.T, pool *pgxpool.Pool, rentalID int64) string {
+	t.Helper()
+	var eventID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO security_events (user_id, account_id, rental_id, event_type, success, metadata)
+		SELECT user_id, account_id, id, 6, true, '{"event":"deposit_review_evidence"}'::jsonb
+		FROM rentals WHERE id = $1
+		RETURNING id`, rentalID).Scan(&eventID); err != nil {
+		t.Fatalf("create deposit evidence event: %v", err)
+	}
+	return "SECURITY_EVENT:" + strconv.FormatInt(eventID, 10)
+}
 
 func setupTestDB(t *testing.T) (*pgxpool.Pool, database.TxManager) {
 	if os.Getenv("RUN_INTEGRATION_TESTS") != "1" {
@@ -880,7 +894,14 @@ func seedHeldDepositSettlementRental(t *testing.T, pool *pgxpool.Pool, userID, a
 		t.Fatalf("failed to activate rental for settlement: %v", err)
 	}
 
-	if _, err := pool.Exec(context.Background(), "UPDATE rentals SET status = 3, actual_finished_at = NOW(), updated_at = NOW() WHERE id = $1", rentalID); err != nil {
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE rentals
+		SET status = 3,
+			end_at = NOW(),
+			actual_finished_at = NOW(),
+			deposit_review_deadline_at = CASE WHEN deposit_amount > 0 THEN NOW() + INTERVAL '24 hours' END,
+			updated_at = NOW()
+		WHERE id = $1`, rentalID); err != nil {
 		t.Fatalf("failed to expire rental for settlement: %v", err)
 	}
 	if _, err := pool.Exec(context.Background(), "UPDATE accounts SET status = 2, updated_at = NOW() WHERE id = $1", accountID); err != nil {
@@ -896,7 +917,14 @@ func seedWalletPaidRefundableRental(t *testing.T, pool *pgxpool.Pool, userID, ac
 	if _, err := paymentService.PayRentalWithBalance(context.Background(), userID, rentalID, "127.0.0.1", "test", time.Now().UTC()); err != nil {
 		t.Fatalf("failed to wallet-pay refundable rental: %v", err)
 	}
-	if _, err := pool.Exec(context.Background(), "UPDATE rentals SET status = 3, actual_finished_at = NOW(), updated_at = NOW() WHERE id = $1", rentalID); err != nil {
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE rentals
+		SET status = 3,
+			end_at = NOW(),
+			actual_finished_at = NOW(),
+			deposit_review_deadline_at = CASE WHEN deposit_amount > 0 THEN NOW() + INTERVAL '24 hours' END,
+			updated_at = NOW()
+		WHERE id = $1`, rentalID); err != nil {
 		t.Fatalf("failed to expire wallet-paid rental: %v", err)
 	}
 	if _, err := pool.Exec(context.Background(), "UPDATE accounts SET status = 2, updated_at = NOW() WHERE id = $1", accountID); err != nil {
@@ -989,7 +1017,19 @@ func TestDepositForfeitDoesNotCreditBalance(t *testing.T) {
 		t.Fatalf("failed to read initial balance: %v", err)
 	}
 
-	result, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
+	var routineEventID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO security_events (user_id, account_id, rental_id, event_type, success, metadata)
+		VALUES ($1,$2,$3,10,true,'{"event":"routine_rental_expiry"}'::jsonb)
+		RETURNING id`, userID, accountID, rentalID).Scan(&routineEventID); err != nil {
+		t.Fatalf("seed routine security event: %v", err)
+	}
+	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", "SECURITY_EVENT:"+strconv.FormatInt(routineEventID, 10), time.Now().UTC()); !errors.Is(err, payment.ErrInvalidEvidenceReference) {
+		t.Fatalf("routine event must not qualify as forfeiture evidence: %v", err)
+	}
+
+	evidenceReference := settlementEvidenceReference(t, pool, rentalID)
+	result, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", evidenceReference, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("ForfeitDeposit failed: %v", err)
 	}
@@ -1025,7 +1065,7 @@ func TestDepositForfeitDoesNotCreditBalance(t *testing.T) {
 		t.Fatalf("expected one forfeit ledger/security/audit entry, got ledger=%d security=%d audit=%d", ledgerCount, securityCount, auditCount)
 	}
 
-	result, err = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
+	result, err = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", evidenceReference, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("repeated ForfeitDeposit should be no-op: %v", err)
 	}
@@ -1055,7 +1095,7 @@ func TestDepositSettlementRejectsInvalidStatesAndRoles(t *testing.T) {
 	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected WAITING_PAYMENT release rejection, got %v", err)
 	}
-	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", "SECURITY_EVENT:1", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected WAITING_PAYMENT forfeit rejection, got %v", err)
 	}
 
@@ -1067,7 +1107,7 @@ func TestDepositSettlementRejectsInvalidStatesAndRoles(t *testing.T) {
 	if _, err := paymentService.ReleaseDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected ACTIVE release rejection, got %v", err)
 	}
-	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, "damage_confirmed", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
+	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, "DAMAGE_CONFIRMED", "SECURITY_EVENT:1", time.Now().UTC()); !errors.Is(err, payment.ErrDepositSettlementNotAllowed) {
 		t.Fatalf("expected ACTIVE forfeit rejection, got %v", err)
 	}
 
@@ -1095,7 +1135,7 @@ func TestDepositSettlementRejectsInvalidStatesAndRoles(t *testing.T) {
 		t.Fatalf("expected zero-deposit release rejection, got %v", err)
 	}
 
-	if _, err := paymentService.ForfeitDeposit(context.Background(), 7003, "RENT", rentalID2, "damage_confirmed", time.Now().UTC()); !errors.Is(err, payment.ErrAdminRequired) {
+	if _, err := paymentService.ForfeitDeposit(context.Background(), 7003, "RENT", rentalID2, "DAMAGE_CONFIRMED", "SECURITY_EVENT:1", time.Now().UTC()); !errors.Is(err, payment.ErrAdminRequired) {
 		t.Fatalf("expected non-admin forfeit rejection, got %v", err)
 	}
 }
@@ -1105,6 +1145,7 @@ func TestDepositSettlementConcurrentReleaseVsForfeit(t *testing.T) {
 	paymentService := payment.NewPaymentService(payment.NewPostgresRepository(pool))
 	userID, accountID, rentalID, paymentID := int64(9861), int64(9862), int64(9863), int64(9864)
 	seedHeldDepositSettlementRental(t, pool, userID, accountID, rentalID, paymentID, 500, 500)
+	evidenceReference := settlementEvidenceReference(t, pool, rentalID)
 
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -1119,7 +1160,7 @@ func TestDepositSettlementConcurrentReleaseVsForfeit(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "damage_confirmed", time.Now().UTC())
+		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", evidenceReference, time.Now().UTC())
 	}()
 
 	close(start)
@@ -1161,6 +1202,212 @@ func TestDepositSettlementConcurrentReleaseVsForfeit(t *testing.T) {
 		return
 	}
 	t.Fatalf("unexpected concurrent hold status: %d", holdStatus)
+}
+
+func TestDepositFinalizer_DuplicateWorkersCreditAndCompleteOnce(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	userID, accountID, rentalID, paymentID := int64(9871), int64(9872), int64(9873), int64(9874)
+	seedHeldDepositSettlementRental(t, pool, userID, accountID, rentalID, paymentID, 500, 500)
+	now := time.Now().UTC()
+	if _, err := pool.Exec(context.Background(), `UPDATE rentals SET deposit_review_deadline_at=$2 WHERE id=$1`, rentalID, now); err != nil {
+		t.Fatalf("make deposit review due: %v", err)
+	}
+
+	var beforeBalance int64
+	if err := pool.QueryRow(context.Background(), `SELECT balance FROM users WHERE id=$1`, userID).Scan(&beforeBalance); err != nil {
+		t.Fatalf("load balance before finalization: %v", err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan *payment.RentalFinalizationResult, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := payment.NewPaymentService(payment.NewPostgresRepository(pool)).FinalizeExpiredRentals(context.Background(), now, 1)
+			results <- result
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("duplicate finalizer failed: %v", err)
+		}
+	}
+	processed := 0
+	for result := range results {
+		if result != nil {
+			processed += result.Processed
+		}
+	}
+	if processed != 1 {
+		t.Fatalf("processed=%d want=1", processed)
+	}
+
+	var holdStatus, settlementSource, rentalStatus int16
+	var afterBalance int64
+	var completedAt sql.NullTime
+	var releaseEntries int
+	if err := pool.QueryRow(context.Background(), `SELECT status, settlement_source FROM deposit_holds WHERE rental_id=$1`, rentalID).Scan(&holdStatus, &settlementSource); err != nil {
+		t.Fatalf("load finalized hold: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT status, completed_at FROM rentals WHERE id=$1`, rentalID).Scan(&rentalStatus, &completedAt); err != nil {
+		t.Fatalf("load finalized rental: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT balance FROM users WHERE id=$1`, userID).Scan(&afterBalance); err != nil {
+		t.Fatalf("load finalized balance: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM financial_ledger_entries WHERE rental_id=$1 AND entry_type=3`, rentalID).Scan(&releaseEntries); err != nil {
+		t.Fatalf("count auto-release ledger: %v", err)
+	}
+	if holdStatus != 2 || settlementSource != 3 || rentalStatus != 4 || !completedAt.Valid || afterBalance != beforeBalance+500 || releaseEntries != 1 {
+		t.Fatalf("invalid duplicate-finalizer result hold=%d source=%d rental=%d completed=%v balance=%d entries=%d", holdStatus, settlementSource, rentalStatus, completedAt, afterBalance, releaseEntries)
+	}
+}
+
+func TestDepositFinalizer_AutoReleaseWinsForfeitAtDeadline(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	userID, accountID, rentalID, paymentID := int64(9876), int64(9877), int64(9878), int64(9879)
+	seedHeldDepositSettlementRental(t, pool, userID, accountID, rentalID, paymentID, 500, 500)
+	evidenceReference := settlementEvidenceReference(t, pool, rentalID)
+	now := time.Now().UTC()
+	if _, err := pool.Exec(context.Background(), `UPDATE rentals SET deposit_review_deadline_at=$2 WHERE id=$1`, rentalID, now); err != nil {
+		t.Fatalf("make forfeit race review due: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var finalizeErr, forfeitErr error
+	go func() {
+		defer wg.Done()
+		<-start
+		_, finalizeErr = payment.NewPaymentService(payment.NewPostgresRepository(pool)).FinalizeExpiredRentals(context.Background(), now, 1)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, forfeitErr = payment.NewPaymentService(payment.NewPostgresRepository(pool)).ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID, "DAMAGE_CONFIRMED", evidenceReference, now)
+	}()
+	close(start)
+	wg.Wait()
+	if finalizeErr != nil {
+		t.Fatalf("auto-release finalizer failed: %v", finalizeErr)
+	}
+	if !errors.Is(forfeitErr, payment.ErrDepositReviewDeadlinePassed) && !errors.Is(forfeitErr, payment.ErrDepositAlreadySettled) {
+		t.Fatalf("forfeit at deadline must lose to auto-release, got %v", forfeitErr)
+	}
+
+	var holdStatus, settlementSource, rentalStatus int16
+	var releaseEntries, forfeitEntries int
+	if err := pool.QueryRow(context.Background(), `SELECT status, settlement_source FROM deposit_holds WHERE rental_id=$1`, rentalID).Scan(&holdStatus, &settlementSource); err != nil {
+		t.Fatalf("load deadline-race hold: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM rentals WHERE id=$1`, rentalID).Scan(&rentalStatus); err != nil {
+		t.Fatalf("load deadline-race rental: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FILTER (WHERE entry_type=3), COUNT(*) FILTER (WHERE entry_type=4) FROM financial_ledger_entries WHERE rental_id=$1`, rentalID).Scan(&releaseEntries, &forfeitEntries); err != nil {
+		t.Fatalf("count deadline-race ledger: %v", err)
+	}
+	if holdStatus != 2 || settlementSource != 3 || rentalStatus != 4 || releaseEntries != 1 || forfeitEntries != 0 {
+		t.Fatalf("invalid deadline-race result hold=%d source=%d rental=%d release=%d forfeit=%d", holdStatus, settlementSource, rentalStatus, releaseEntries, forfeitEntries)
+	}
+}
+
+func TestDepositFinalizer_LedgerConflictRollsBackAutoRelease(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	userID, accountID, rentalID, paymentID := int64(9891), int64(9892), int64(9893), int64(9894)
+	seedHeldDepositSettlementRental(t, pool, userID, accountID, rentalID, paymentID, 500, 500)
+	now := time.Now().UTC()
+	if _, err := pool.Exec(context.Background(), `UPDATE rentals SET deposit_review_deadline_at=$2 WHERE id=$1`, rentalID, now); err != nil {
+		t.Fatalf("make rollback review due: %v", err)
+	}
+	idempotencyKey := fmt.Sprintf("deposit:auto-release:rental:%d", rentalID)
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO financial_ledger_entries (
+			entry_type,user_id,rental_id,payment_id,account_id,amount,currency,idempotency_key,metadata
+		) VALUES (3,$1,$2,$3,$4,1,'USD',$5,'{}'::jsonb)`, userID, rentalID, paymentID, accountID, idempotencyKey); err != nil {
+		t.Fatalf("seed colliding ledger fact: %v", err)
+	}
+	var beforeBalance int64
+	if err := pool.QueryRow(context.Background(), `SELECT balance FROM users WHERE id=$1`, userID).Scan(&beforeBalance); err != nil {
+		t.Fatalf("load rollback balance: %v", err)
+	}
+
+	_, err := payment.NewPaymentService(payment.NewPostgresRepository(pool)).FinalizeExpiredRentals(context.Background(), now, 1)
+	if !errors.Is(err, payment.ErrLedgerIdempotencyConflict) {
+		t.Fatalf("expected ledger collision, got %v", err)
+	}
+
+	var holdStatus, rentalStatus int16
+	var afterBalance int64
+	var completedAt sql.NullTime
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM deposit_holds WHERE rental_id=$1`, rentalID).Scan(&holdStatus); err != nil {
+		t.Fatalf("load rollback hold: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT status, completed_at FROM rentals WHERE id=$1`, rentalID).Scan(&rentalStatus, &completedAt); err != nil {
+		t.Fatalf("load rollback rental: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT balance FROM users WHERE id=$1`, userID).Scan(&afterBalance); err != nil {
+		t.Fatalf("load balance after rollback: %v", err)
+	}
+	if holdStatus != 1 || rentalStatus != 3 || completedAt.Valid || afterBalance != beforeBalance {
+		t.Fatalf("auto-release did not roll back hold=%d rental=%d completed=%v balance=%d want=%d", holdStatus, rentalStatus, completedAt, afterBalance, beforeBalance)
+	}
+}
+
+func TestDepositFinalizer_ConcurrentWalletRefundCreditsDepositOnce(t *testing.T) {
+	pool, _ := setupTestDB(t)
+	userID, accountID, rentalID, paymentID := int64(9881), int64(9882), int64(9883), int64(9884)
+	seedWalletPaidRefundableRental(t, pool, userID, accountID, rentalID, paymentID, 10000, 500, 500)
+	now := time.Now().UTC()
+	if _, err := pool.Exec(context.Background(), `UPDATE rentals SET deposit_review_deadline_at=$2 WHERE id=$1`, rentalID, now); err != nil {
+		t.Fatalf("make wallet deposit review due: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var finalizeErr, refundErr error
+	go func() {
+		defer wg.Done()
+		<-start
+		_, finalizeErr = payment.NewPaymentService(payment.NewPostgresRepository(pool)).FinalizeExpiredRentals(context.Background(), now, 1)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, refundErr = payment.NewPaymentService(payment.NewPostgresRepository(pool)).RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID, "SERVICE_UNAVAILABLE", now)
+	}()
+	close(start)
+	wg.Wait()
+	if finalizeErr != nil || refundErr != nil {
+		t.Fatalf("refund/auto-release race failed finalizer=%v refund=%v", finalizeErr, refundErr)
+	}
+
+	var holdStatus, rentalStatus int16
+	var completedAt sql.NullTime
+	var depositCreditEntries int
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM deposit_holds WHERE rental_id=$1`, rentalID).Scan(&holdStatus); err != nil {
+		t.Fatalf("load raced hold: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT status, completed_at FROM rentals WHERE id=$1`, rentalID).Scan(&rentalStatus, &completedAt); err != nil {
+		t.Fatalf("load raced rental: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM financial_ledger_entries WHERE rental_id=$1 AND entry_type IN (3,7)`, rentalID).Scan(&depositCreditEntries); err != nil {
+		t.Fatalf("count deposit credit entries: %v", err)
+	}
+	if (holdStatus != 2 && holdStatus != 4) || rentalStatus != 4 || !completedAt.Valid || depositCreditEntries != 1 {
+		t.Fatalf("invalid refund/auto-release result hold=%d rental=%d completed=%v depositCredits=%d", holdStatus, rentalStatus, completedAt, depositCreditEntries)
+	}
 }
 
 func TestWalletPaymentWithBalance_Success(t *testing.T) {
@@ -1622,7 +1869,7 @@ func TestWalletRefundPrincipalOnlyScenarios(t *testing.T) {
 
 	userID3, accountID3, rentalID3, paymentID3 := int64(10001), int64(10002), int64(10003), int64(10004)
 	seedWalletPaidRefundableRental(t, pool, userID3, accountID3, rentalID3, paymentID3, 10000, 500, 500)
-	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID3, "damage_confirmed", time.Now().UTC()); err != nil {
+	if _, err := paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID3, "DAMAGE_CONFIRMED", settlementEvidenceReference(t, pool, rentalID3), time.Now().UTC()); err != nil {
 		t.Fatalf("failed to forfeit deposit before refund test: %v", err)
 	}
 	result, err = paymentService.RefundWalletPayment(context.Background(), integrationAdminID, "ADMIN", rentalID3, "SERVICE_UNAVAILABLE", time.Now().UTC())
@@ -1712,6 +1959,7 @@ func TestWalletRefundConcurrentWithDepositSettlement(t *testing.T) {
 
 	userID2, accountID2, rentalID2, paymentID2 := int64(10051), int64(10052), int64(10053), int64(10054)
 	seedWalletPaidRefundableRental(t, pool, userID2, accountID2, rentalID2, paymentID2, 10000, 500, 500)
+	evidenceReference := settlementEvidenceReference(t, pool, rentalID2)
 	start = make(chan struct{})
 	wg = sync.WaitGroup{}
 	var refundErr2, forfeitErr error
@@ -1724,7 +1972,7 @@ func TestWalletRefundConcurrentWithDepositSettlement(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, "damage_confirmed", time.Now().UTC())
+		_, forfeitErr = paymentService.ForfeitDeposit(context.Background(), integrationAdminID, "ADMIN", rentalID2, "DAMAGE_CONFIRMED", evidenceReference, time.Now().UTC())
 	}()
 	close(start)
 	wg.Wait()

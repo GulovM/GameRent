@@ -108,7 +108,7 @@ func (p RentalPeriod) Duration() time.Duration {
 }
 
 func (p RentalPeriod) IsExpired(now time.Time) bool {
-	return now.After(p.EndAt)
+	return !now.Before(p.EndAt)
 }
 
 func (p RentalPeriod) RemainingTime(now time.Time) time.Duration {
@@ -119,17 +119,19 @@ func (p RentalPeriod) RemainingTime(now time.Time) time.Duration {
 }
 
 type Rental struct {
-	ID                 int64
-	UserID             int64
-	AccountID          int64
-	Status             RentalStatus
-	Period             RentalPeriod
-	RentalPrice        Money
-	DepositAmount      Money
-	ActualFinishedAt   *time.Time
-	CancellationReason *string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID                      int64
+	UserID                  int64
+	AccountID               int64
+	Status                  RentalStatus
+	Period                  RentalPeriod
+	RentalPrice             Money
+	DepositAmount           Money
+	ActualFinishedAt        *time.Time
+	DepositReviewDeadlineAt *time.Time
+	CompletedAt             *time.Time
+	CancellationReason      *string
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 func NewRental(userID, accountID int64, period RentalPeriod, price, deposit Money, now time.Time) (*Rental, error) {
@@ -183,7 +185,12 @@ func (r *Rental) Expire(now time.Time) error {
 	if r.Status != StatusActive {
 		return ErrInvalidTransition
 	}
+	if now.Before(r.Period.EndAt) {
+		return ErrInvalidTransition
+	}
 	r.Status = StatusExpired
+	usageEndedAt := r.Period.EndAt
+	r.ActualFinishedAt = &usageEndedAt
 	r.UpdatedAt = now
 	return nil
 }
@@ -193,7 +200,7 @@ func (r *Rental) Complete(now time.Time) error {
 		return ErrInvalidTransition
 	}
 	r.Status = StatusCompleted
-	r.ActualFinishedAt = &now
+	r.CompletedAt = &now
 	r.UpdatedAt = now
 	return nil
 }

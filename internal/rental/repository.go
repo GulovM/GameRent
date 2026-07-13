@@ -13,6 +13,25 @@ type Repository interface {
 	CancelWaitingPaymentRental(ctx context.Context, rentalID, userID int64, reason string, now time.Time) (bool, error)
 }
 
+type CustomerRepository interface {
+	ListCustomerRentals(ctx context.Context, userID int64) ([]CustomerRental, error)
+	GetCustomerRental(ctx context.Context, rentalID int64) (*CustomerRental, error)
+	GetRentalQuote(ctx context.Context, accountID int64) (*RentalQuote, error)
+}
+
+type CustomerRental struct {
+	ID, UserID, AccountID                         int64
+	Status, DepositHoldStatus, RefundStatus       int16
+	StartAt, EndAt, PaymentExpiresAt              time.Time
+	RentalPrice, DepositAmount, RefundTotalAmount int64
+	RefundProcessedAt                             *time.Time
+}
+
+type RentalQuote struct {
+	HourlyPrice   int64
+	DepositAmount int64
+}
+
 type CredentialIssueEvent struct {
 	UserID    int64
 	AccountID int64

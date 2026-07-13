@@ -40,18 +40,27 @@ var (
 	ErrDepositHoldNotFound         = errors.New("deposit hold not found")
 	ErrDepositSettlementNotAllowed = errors.New("deposit settlement is not allowed")
 	ErrDepositAlreadySettled       = errors.New("deposit is already settled")
+	ErrDepositReviewDeadlinePassed = errors.New("deposit review deadline has passed")
+	ErrInvalidEvidenceReference    = errors.New("invalid evidence_reference")
+	ErrInvalidFinalizationLimit    = errors.New("invalid finalization batch limit")
+	ErrLedgerIdempotencyConflict   = errors.New("financial ledger idempotency conflict")
 	ErrAdminRequired               = errors.New("admin role is required")
 	ErrInvalidReasonCode           = errors.New("invalid reason_code")
 	ErrInvalidLedgerPagination     = errors.New("invalid ledger pagination")
 	ErrInvalidRefundPagination     = errors.New("invalid refund pagination")
 	ErrInvalidAdminRentalFilters   = errors.New("invalid admin rental filters")
 	ErrAdminRentalNotFound         = errors.New("admin rental not found")
+	ErrCustomerRentalNotFound      = errors.New("customer rental not found")
+	ErrCustomerPaymentUnavailable  = errors.New("customer payment unavailable")
 )
 
 type Service interface {
 	ProcessWebhook(ctx context.Context, req WebhookRequest, clientIP, userAgent string) (*WebhookResult, error)
 	VerifySignature(payload []byte, signature string) bool
 	GetUserBalance(ctx context.Context, userID int64) (*UserBalance, error)
+	CreateCustomerPayment(ctx context.Context, userID, rentalID int64) (*CustomerPayment, error)
+	ListCustomerPayments(ctx context.Context, userID int64) ([]CustomerPayment, error)
+	GetCustomerPayment(ctx context.Context, userID, paymentID int64) (*CustomerPayment, error)
 	ListUserLedger(ctx context.Context, userID int64, page, pageSize int) (*UserLedgerPage, error)
 	ListUserRefunds(ctx context.Context, userID int64, page, pageSize int) (*UserRefundPage, error)
 	ListAdminRentals(ctx context.Context, filters AdminRentalListFilter) (*AdminRentalPage, error)
@@ -60,7 +69,34 @@ type Service interface {
 	PayRentalWithBalance(ctx context.Context, userID, rentalID int64, clientIP, userAgent string, now time.Time) (*WalletPaymentResult, error)
 	RefundWalletPayment(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*WalletRefundResult, error)
 	ReleaseDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, now time.Time) (*DepositSettlementResult, error)
-	ForfeitDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*DepositSettlementResult, error)
+	ForfeitDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode, evidenceReference string, now time.Time) (*DepositSettlementResult, error)
+	FinalizeExpiredRentals(ctx context.Context, now time.Time, limit int) (*RentalFinalizationResult, error)
+}
+
+func (s *PaymentService) CreateCustomerPayment(ctx context.Context, userID, rentalID int64) (*CustomerPayment, error) {
+	payment, err := s.repo.GetCustomerRentalPayment(ctx, rentalID, userID)
+	if errors.Is(err, ErrPaymentNotFound) {
+		return nil, ErrCustomerRentalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if payment == nil {
+		return nil, ErrCustomerPaymentUnavailable
+	}
+	return payment, nil
+}
+
+func (s *PaymentService) ListCustomerPayments(ctx context.Context, userID int64) ([]CustomerPayment, error) {
+	return s.repo.ListCustomerPayments(ctx, userID)
+}
+
+func (s *PaymentService) GetCustomerPayment(ctx context.Context, userID, paymentID int64) (*CustomerPayment, error) {
+	payment, err := s.repo.GetCustomerPayment(ctx, paymentID, userID)
+	if errors.Is(err, ErrPaymentNotFound) {
+		return nil, ErrPaymentNotFound
+	}
+	return payment, err
 }
 
 type WebhookResult struct {
@@ -72,8 +108,19 @@ type WebhookResult struct {
 }
 
 type DepositSettlementResult struct {
-	Changed bool
-	Status  string
+	Changed       bool
+	Idempotent    bool
+	Status        string
+	DepositStatus string
+	SettledAt     *time.Time
+	RentalStatus  int16
+	CompletedAt   *time.Time
+}
+
+type RentalFinalizationResult struct {
+	Processed    int
+	Completed    int
+	AutoReleased int
 }
 
 type UserLedgerPage struct {
@@ -654,6 +701,9 @@ func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID in
 
 	result := &WalletRefundResult{}
 	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.LockRentalSettlementKey(txCtx, rentalID); err != nil {
+			return fmt.Errorf("lock rental settlement key: %w", err)
+		}
 		if err := s.repo.RequireCurrentAdmin(txCtx, actorUserID); err != nil {
 			if errors.Is(err, ErrAdminRequired) {
 				return err
@@ -725,7 +775,12 @@ func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID in
 			if state.DepositAmount > 0 && state.HasDepositHold && state.HoldStatus == depositHoldStatusHeld {
 				result.DepositStatus = "REFUNDED"
 			}
-			return nil
+			settlementState, err := s.repo.LockDepositSettlementState(txCtx, state.RentalID)
+			if err != nil {
+				return fmt.Errorf("reload settlement state for refund replay: %w", err)
+			}
+			completionResult := &DepositSettlementResult{}
+			return s.completeRentalAfterSettlement(txCtx, settlementState, &actorUserID, "WALLET_REFUND_REPLAY", now, completionResult)
 		}
 
 		totals, err := s.repo.LoadCompletedRefundTotals(txCtx, state.PaymentID)
@@ -745,7 +800,7 @@ func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID in
 		}
 
 		if depositAmount > 0 {
-			if err := s.repo.MarkDepositRefunded(txCtx, state.HoldID, refundRecord.ID, now.UTC()); err != nil {
+			if err := s.repo.MarkDepositRefunded(txCtx, state.HoldID, refundRecord.ID, actorUserID, now.UTC()); err != nil {
 				return fmt.Errorf("mark deposit refunded: %w", err)
 			}
 			result.DepositStatus = "REFUNDED"
@@ -853,6 +908,15 @@ func (s *PaymentService) RefundWalletPayment(ctx context.Context, actorUserID in
 			return fmt.Errorf("insert refund audit log: %w", err)
 		}
 
+		settlementState, err := s.repo.LockDepositSettlementState(txCtx, state.RentalID)
+		if err != nil {
+			return fmt.Errorf("reload settlement state after wallet refund: %w", err)
+		}
+		completionResult := &DepositSettlementResult{}
+		if err := s.completeRentalAfterSettlement(txCtx, settlementState, &actorUserID, "WALLET_REFUND", now, completionResult); err != nil {
+			return err
+		}
+
 		result.Changed = true
 		result.Status = "COMPLETED"
 		return nil
@@ -870,9 +934,12 @@ func (s *PaymentService) ReleaseDeposit(ctx context.Context, actorUserID int64, 
 	if actorRole != "ADMIN" {
 		return nil, ErrAdminRequired
 	}
-
+	now = now.UTC()
 	result := &DepositSettlementResult{}
 	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.LockRentalSettlementKey(txCtx, rentalID); err != nil {
+			return fmt.Errorf("lock rental settlement key: %w", err)
+		}
 		if err := s.repo.RequireCurrentAdmin(txCtx, actorUserID); err != nil {
 			if errors.Is(err, ErrAdminRequired) {
 				return err
@@ -889,11 +956,16 @@ func (s *PaymentService) ReleaseDeposit(ctx context.Context, actorUserID int64, 
 		}
 
 		if state.HoldStatus == depositHoldStatusReleased {
-			result.Status = "RELEASED"
-			return nil
+
+			if state.SettlementSource != nil && *state.SettlementSource != depositSettlementSourceAdminRelease {
+				return ErrDepositAlreadySettled
+			}
+			result.Idempotent = true
+			setDepositSettlementResult(result, state, "RELEASED")
+			return s.completeRentalAfterSettlement(txCtx, state, &actorUserID, "ADMIN_RELEASE", now, result)
 		}
 
-		if err := s.repo.MarkDepositReleased(txCtx, state.HoldID, now); err != nil {
+		if err := s.repo.MarkDepositReleased(txCtx, state.HoldID, depositSettlementSourceAdminRelease, &actorUserID, now); err != nil {
 			return fmt.Errorf("mark deposit released: %w", err)
 		}
 		if err := s.repo.CreditUserBalance(txCtx, state.UserID, state.Amount, now); err != nil {
@@ -953,29 +1025,40 @@ func (s *PaymentService) ReleaseDeposit(ctx context.Context, actorUserID int64, 
 		}
 
 		result.Changed = true
-		result.Status = "RELEASED"
-		return nil
+		state.HoldStatus = depositHoldStatusReleased
+		state.SettlementSource = int16Pointer(depositSettlementSourceAdminRelease)
+		state.SettledByUserID = &actorUserID
+		state.ReleasedAt = timePointer(now)
+		setDepositSettlementResult(result, state, "RELEASED")
+		return s.completeRentalAfterSettlement(txCtx, state, &actorUserID, "ADMIN_RELEASE", now, result)
 	})
 	if err != nil {
 		return nil, err
 	}
-	if result.Status == "" {
-		result.Status = "RELEASED"
-	}
+	setDepositSettlementAliases(result, "RELEASED")
 	return result, nil
 }
 
-func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode string, now time.Time) (*DepositSettlementResult, error) {
+func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, actorRole string, rentalID int64, reasonCode, evidenceReference string, now time.Time) (*DepositSettlementResult, error) {
 	if actorRole != "ADMIN" {
 		return nil, ErrAdminRequired
 	}
 	reasonCode = strings.TrimSpace(reasonCode)
-	if !isSafeReasonCode(reasonCode) {
+	if !IsAllowedDepositForfeitReasonCode(reasonCode) {
 		return nil, ErrInvalidReasonCode
 	}
+	evidenceReference = strings.TrimSpace(evidenceReference)
+	evidenceEventID, ok := parseDepositEvidenceReference(evidenceReference)
+	if !ok {
+		return nil, ErrInvalidEvidenceReference
+	}
+	now = now.UTC()
 
 	result := &DepositSettlementResult{}
 	err := s.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.LockRentalSettlementKey(txCtx, rentalID); err != nil {
+			return fmt.Errorf("lock rental settlement key: %w", err)
+		}
 		if err := s.repo.RequireCurrentAdmin(txCtx, actorUserID); err != nil {
 			if errors.Is(err, ErrAdminRequired) {
 				return err
@@ -987,25 +1070,40 @@ func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, 
 			return err
 		}
 
-		if err := validateDepositForfeitState(state); err != nil {
+		if err := validateDepositForfeitState(state, now); err != nil {
 			return err
 		}
 
 		if state.HoldStatus == depositHoldStatusForfeited {
-			result.Status = "FORFEITED"
-			return nil
+
+			if state.SettlementSource != nil && (*state.SettlementSource != depositSettlementSourceAdminForfeit ||
+				state.SettlementReasonCode != reasonCode || state.SettlementEvidenceRef != evidenceReference) {
+				return ErrDepositAlreadySettled
+			}
+			result.Idempotent = true
+			setDepositSettlementResult(result, state, "FORFEITED")
+			return s.completeRentalAfterSettlement(txCtx, state, &actorUserID, "ADMIN_FORFEIT", now, result)
 		}
 
-		if err := s.repo.MarkDepositForfeited(txCtx, state.HoldID, now); err != nil {
+		verified, err := s.repo.VerifyDepositForfeitEvidence(txCtx, state.RentalID, state.UserID, state.AccountID, evidenceEventID)
+		if err != nil {
+			return fmt.Errorf("verify deposit forfeit evidence: %w", err)
+		}
+		if !verified {
+			return ErrInvalidEvidenceReference
+		}
+
+		if err := s.repo.MarkDepositForfeited(txCtx, state.HoldID, actorUserID, reasonCode, evidenceReference, now); err != nil {
 			return fmt.Errorf("mark deposit forfeited: %w", err)
 		}
 
 		idempotencyKey := fmt.Sprintf("deposit:forfeit:rental:%d", state.RentalID)
 		entryMetadata, err := marshalFinancialMetadata(map[string]any{
-			"event":       "deposit_forfeited",
-			"reason_code": reasonCode,
-			"actor_user":  strconv.FormatInt(actorUserID, 10),
-			"recorded_at": now.Format(time.RFC3339),
+			"event":              "deposit_forfeited",
+			"reason_code":        reasonCode,
+			"evidence_reference": evidenceReference,
+			"actor_user":         strconv.FormatInt(actorUserID, 10),
+			"recorded_at":        now.Format(time.RFC3339),
 		})
 		if err != nil {
 			return fmt.Errorf("marshal forfeit ledger metadata: %w", err)
@@ -1025,12 +1123,13 @@ func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, 
 		}
 
 		eventMetadata, err := json.Marshal(map[string]any{
-			"event":       "deposit_forfeited",
-			"reason_code": reasonCode,
-			"actor_id":    strconv.FormatInt(actorUserID, 10),
-			"payment_id":  strconv.FormatInt(state.PaymentID, 10),
-			"rental_id":   strconv.FormatInt(state.RentalID, 10),
-			"account_id":  strconv.FormatInt(state.AccountID, 10),
+			"event":              "deposit_forfeited",
+			"reason_code":        reasonCode,
+			"evidence_reference": evidenceReference,
+			"actor_id":           strconv.FormatInt(actorUserID, 10),
+			"payment_id":         strconv.FormatInt(state.PaymentID, 10),
+			"rental_id":          strconv.FormatInt(state.RentalID, 10),
+			"account_id":         strconv.FormatInt(state.AccountID, 10),
 		})
 		if err != nil {
 			return fmt.Errorf("marshal forfeit security metadata: %w", err)
@@ -1043,7 +1142,7 @@ func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, 
 		if err != nil {
 			return fmt.Errorf("marshal forfeit audit old values: %w", err)
 		}
-		newValues, err := json.Marshal(map[string]any{"status": "FORFEITED", "reason_code": reasonCode})
+		newValues, err := json.Marshal(map[string]any{"status": "FORFEITED", "reason_code": reasonCode, "evidence_reference": evidenceReference})
 		if err != nil {
 			return fmt.Errorf("marshal forfeit audit new values: %w", err)
 		}
@@ -1052,24 +1151,29 @@ func (s *PaymentService) ForfeitDeposit(ctx context.Context, actorUserID int64, 
 		}
 
 		result.Changed = true
-		result.Status = "FORFEITED"
-		return nil
+		state.HoldStatus = depositHoldStatusForfeited
+		state.SettlementSource = int16Pointer(depositSettlementSourceAdminForfeit)
+		state.SettledByUserID = &actorUserID
+		state.SettlementReasonCode = reasonCode
+		state.SettlementEvidenceRef = evidenceReference
+		state.ForfeitedAt = timePointer(now)
+		setDepositSettlementResult(result, state, "FORFEITED")
+		return s.completeRentalAfterSettlement(txCtx, state, &actorUserID, "ADMIN_FORFEIT", now, result)
 	})
 	if err != nil {
 		return nil, err
 	}
-	if result.Status == "" {
-		result.Status = "FORFEITED"
-	}
+	setDepositSettlementAliases(result, "FORFEITED")
 	return result, nil
 }
 
 func (s *PaymentService) loadDepositSettlementState(ctx context.Context, rentalID int64) (*DepositSettlementState, error) {
 	state, err := s.repo.LockDepositSettlementState(ctx, rentalID)
 	if err == nil {
-		return state, nil
-	}
-	if !errors.Is(err, ErrDepositHoldNotFound) {
+		if state.HasDepositHold {
+			return state, nil
+		}
+	} else if !errors.Is(err, ErrDepositHoldNotFound) {
 		return nil, fmt.Errorf("lock deposit settlement state: %w", err)
 	}
 
@@ -1099,13 +1203,19 @@ func validateDepositReleaseState(state *DepositSettlementState) error {
 	if state.PaymentStatus != 2 {
 		return ErrDepositSettlementNotAllowed
 	}
-	if state.RentalStatus != 3 && state.RentalStatus != 4 {
+	if state.RentalStatus != 3 {
+		return ErrDepositSettlementNotAllowed
+	}
+	if !isConsistentPositiveDepositState(state) {
+		return ErrDepositSettlementNotAllowed
+	}
+	if state.ReviewDeadlineAt == nil {
 		return ErrDepositSettlementNotAllowed
 	}
 	return nil
 }
 
-func validateDepositForfeitState(state *DepositSettlementState) error {
+func validateDepositForfeitState(state *DepositSettlementState, now time.Time) error {
 	if state.HoldStatus == depositHoldStatusReleased {
 		return ErrDepositAlreadySettled
 	}
@@ -1121,8 +1231,14 @@ func validateDepositForfeitState(state *DepositSettlementState) error {
 	if state.PaymentStatus != 2 {
 		return ErrDepositSettlementNotAllowed
 	}
-	if state.RentalStatus != 3 && state.RentalStatus != 4 {
+	if state.RentalStatus != 3 {
 		return ErrDepositSettlementNotAllowed
+	}
+	if !isConsistentPositiveDepositState(state) || state.ReviewDeadlineAt == nil {
+		return ErrDepositSettlementNotAllowed
+	}
+	if !now.Before(state.ReviewDeadlineAt.UTC()) {
+		return ErrDepositReviewDeadlinePassed
 	}
 	return nil
 }

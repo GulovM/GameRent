@@ -16,16 +16,16 @@ import (
 )
 
 var (
-	ErrAccountNotAvailable     = errors.New("account is not available for rent")
-	ErrInsufficientBalance     = errors.New("insufficient balance")
-	ErrUserBlocked             = errors.New("user is blocked")
-	ErrCredentialsNotAvailable = errors.New("rental credentials are not available")
-	ErrInvalidRentalPricing    = errors.New("invalid rental pricing")
-	ErrRentalPriceOverflow     = errors.New("rental price exceeds supported range")
+	ErrAccountNotAvailable        = errors.New("account is not available for rent")
+	ErrInsufficientBalance        = errors.New("insufficient balance")
+	ErrUserBlocked                = errors.New("user is blocked")
+	ErrCredentialsNotAvailable    = errors.New("rental credentials are not available")
+	ErrInvalidRentalPricing       = errors.New("invalid rental pricing")
+	ErrRentalPriceOverflow        = errors.New("rental price exceeds supported range")
+	ErrRentalAccessDenied         = errors.New("rental access denied")
+	ErrCustomerQueriesUnavailable = errors.New("customer rental queries are not configured")
 )
 
-// CalculateRentalTotal performs all rental price arithmetic without allowing
-// signed int64 wraparound. Monetary values remain integer minor units.
 func CalculateRentalTotal(hourlyPrice, depositAmount, hours int64) (rentalPrice int64, total int64, err error) {
 	if hourlyPrice <= 0 || depositAmount < 0 || hours <= 0 {
 		return 0, 0, ErrInvalidRentalPricing
@@ -40,12 +40,49 @@ func CalculateRentalTotal(hourlyPrice, depositAmount, hours int64) (rentalPrice 
 	return rentalPrice, rentalPrice + depositAmount, nil
 }
 
+func (s *Service) ListCustomerRentals(ctx context.Context, userID int64) ([]CustomerRental, error) {
+	if s.customerRepo == nil {
+		return nil, ErrCustomerQueriesUnavailable
+	}
+	return s.customerRepo.ListCustomerRentals(ctx, userID)
+}
+
+func (s *Service) GetCustomerRental(ctx context.Context, userID, rentalID int64) (*CustomerRental, error) {
+	if s.customerRepo == nil {
+		return nil, ErrCustomerQueriesUnavailable
+	}
+	rent, err := s.customerRepo.GetCustomerRental(ctx, rentalID)
+	if err != nil {
+		return nil, err
+	}
+	if rent.UserID != userID {
+		return nil, ErrRentalAccessDenied
+	}
+	return rent, nil
+}
+
+func (s *Service) QuoteRental(ctx context.Context, accountID, durationHours int64) (*RentalQuote, int64, error) {
+	if s.customerRepo == nil {
+		return nil, 0, ErrCustomerQueriesUnavailable
+	}
+	quote, err := s.customerRepo.GetRentalQuote(ctx, accountID)
+	if err != nil {
+		return nil, 0, err
+	}
+	_, total, err := CalculateRentalTotal(quote.HourlyPrice, quote.DepositAmount, durationHours)
+	if err != nil {
+		return nil, 0, err
+	}
+	return quote, total, nil
+}
+
 type Service struct {
-	rentalRepo  Repository
-	accountRepo account.Repository
-	userRepo    user.Repository
-	paymentRepo PaymentRepository
-	txManager   database.TxManager
+	rentalRepo   Repository
+	customerRepo CustomerRepository
+	accountRepo  account.Repository
+	userRepo     user.Repository
+	paymentRepo  PaymentRepository
+	txManager    database.TxManager
 }
 
 type PaymentRepository interface {
@@ -75,12 +112,14 @@ func NewService(
 	paymentRepo PaymentRepository,
 	txManager database.TxManager,
 ) *Service {
+	customerRepo, _ := rentalRepo.(CustomerRepository)
 	return &Service{
-		rentalRepo:  rentalRepo,
-		accountRepo: accountRepo,
-		userRepo:    userRepo,
-		paymentRepo: paymentRepo,
-		txManager:   txManager,
+		rentalRepo:   rentalRepo,
+		customerRepo: customerRepo,
+		accountRepo:  accountRepo,
+		userRepo:     userRepo,
+		paymentRepo:  paymentRepo,
+		txManager:    txManager,
 	}
 }
 

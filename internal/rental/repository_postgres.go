@@ -2,6 +2,7 @@ package rental
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -41,15 +42,21 @@ func (r *PostgresRepository) CreateRental(ctx context.Context, rental *Rental) e
 func (r *PostgresRepository) GetRental(ctx context.Context, id int64) (*Rental, error) {
 	db := database.GetTxOrPool(ctx, r.pool)
 
-	query := `SELECT id, user_id, account_id, rental_price, deposit_amount, start_at, end_at, status FROM rentals WHERE id = $1`
+	query := `
+		SELECT id, user_id, account_id, rental_price, deposit_amount, start_at, end_at, status,
+		       actual_finished_at, deposit_review_deadline_at, completed_at
+		FROM rentals
+		WHERE id = $1`
 
 	var rental Rental
 	var rentalPriceVal, depositAmountVal int64
 	var statusVal int16
 	var startAt, endAt time.Time
+	var actualFinishedAt, reviewDeadlineAt, completedAt sql.NullTime
 
 	err := db.QueryRow(ctx, query, id).Scan(
 		&rental.ID, &rental.UserID, &rental.AccountID, &rentalPriceVal, &depositAmountVal, &startAt, &endAt, &statusVal,
+		&actualFinishedAt, &reviewDeadlineAt, &completedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRentalNotFound
@@ -76,8 +83,91 @@ func (r *PostgresRepository) GetRental(ctx context.Context, id int64) (*Rental, 
 	}
 	rental.Period = period
 	rental.Status = RentalStatus(statusVal)
+	if actualFinishedAt.Valid {
+		rental.ActualFinishedAt = &actualFinishedAt.Time
+	}
+	if reviewDeadlineAt.Valid {
+		rental.DepositReviewDeadlineAt = &reviewDeadlineAt.Time
+	}
+	if completedAt.Valid {
+		rental.CompletedAt = &completedAt.Time
+	}
 
 	return &rental, nil
+}
+
+func (r *PostgresRepository) ListCustomerRentals(ctx context.Context, userID int64) ([]CustomerRental, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	rows, err := db.Query(ctx, customerRentalsQuery+` WHERE r.user_id = $1 ORDER BY r.created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]CustomerRental, 0)
+	for rows.Next() {
+		item, err := scanCustomerRental(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, *item)
+	}
+	return items, rows.Err()
+}
+
+func (r *PostgresRepository) GetCustomerRental(ctx context.Context, rentalID int64) (*CustomerRental, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	row := db.QueryRow(ctx, customerRentalsQuery+` WHERE r.id = $1`, rentalID)
+	item, err := scanCustomerRental(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRentalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+func (r *PostgresRepository) GetRentalQuote(ctx context.Context, accountID int64) (*RentalQuote, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var quote RentalQuote
+	err := db.QueryRow(ctx, `SELECT hourly_price, deposit_amount FROM accounts WHERE id=$1 AND deleted_at IS NULL`, accountID).Scan(&quote.HourlyPrice, &quote.DepositAmount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRentalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &quote, nil
+}
+
+const customerRentalsQuery = `
+	SELECT r.id, r.user_id, r.account_id, r.status, r.start_at, r.end_at, r.payment_expires_at,
+		r.rental_price, r.deposit_amount, COALESCE(d.status, 0), COALESCE(rf.status, 0),
+		COALESCE(rf.amount_total, 0), rf.processed_at
+	FROM rentals r
+	LEFT JOIN deposit_holds d ON d.rental_id = r.id
+	LEFT JOIN LATERAL (
+		SELECT status, amount_total, processed_at FROM refunds
+		WHERE rental_id = r.id AND user_id = r.user_id
+		ORDER BY created_at DESC, id DESC LIMIT 1
+	) rf ON TRUE`
+
+type customerRentalScanner interface{ Scan(...any) error }
+
+func scanCustomerRental(row customerRentalScanner) (*CustomerRental, error) {
+	var item CustomerRental
+	var processedAt sql.NullTime
+	err := row.Scan(&item.ID, &item.UserID, &item.AccountID, &item.Status, &item.StartAt, &item.EndAt,
+		&item.PaymentExpiresAt, &item.RentalPrice, &item.DepositAmount, &item.DepositHoldStatus,
+		&item.RefundStatus, &item.RefundTotalAmount, &processedAt)
+	if err != nil {
+		return nil, err
+	}
+	if processedAt.Valid {
+		value := processedAt.Time
+		item.RefundProcessedAt = &value
+	}
+	return &item, nil
 }
 
 func (r *PostgresRepository) GetRentalCredentials(ctx context.Context, rentalID, userID int64, now time.Time) (*RentalCredentialsRecord, error) {

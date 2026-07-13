@@ -7,6 +7,24 @@
 
 ---
 
+## P1.1 rental completion and deposit settlement schema
+
+Migration `20260713150000_rental_completion_deposit_settlement.sql` adds:
+
+- `rentals.deposit_review_deadline_at`: the persisted admin-review deadline;
+- `rentals.completed_at`: paid lifecycle closure time;
+- `deposit_holds.settlement_source`, `settled_by_user_id`, `settlement_reason_code`, and `settlement_evidence_ref`.
+
+`actual_finished_at` is the usage-ended timestamp and is never overwritten by settlement. `completed_at` is the later lifecycle-closure timestamp. When both usage end and review deadline are present, the deadline cannot precede `actual_finished_at`. Persisted `COMPLETED` rows require `completed_at`.
+
+Settlement source values are `1=ADMIN_RELEASE`, `2=ADMIN_FORFEIT`, `3=SYSTEM_AUTO_RELEASE`, and `4=WALLET_REFUND`. Admin release/forfeit requires an actor; admin forfeit also requires nonblank reason and evidence metadata. System auto-release must not claim an admin actor. Wallet refund records its admin actor. Cross-table payment/rental/deposit consistency remains a transactional service invariant rather than a `CHECK` constraint.
+
+Queue indexes are `idx_rentals_active_expiry_queue(end_at,id) WHERE status=2` and `idx_rentals_expired_finalization_queue(deposit_review_deadline_at,id) WHERE status=3`.
+
+Migration backfill sets legacy `COMPLETED.completed_at = COALESCE(updated_at, actual_finished_at, end_at)`. Only internally consistent paid `EXPIRED + HELD` rows receive a fresh rollout deadline of migration time plus 24 hours. Missing, unknown, or mismatched positive-deposit state remains unchanged and therefore fail-closed; historical `end_at` is never used to cause an immediate mass release.
+
+---
+
 # 1. Purpose
 
 ## 1.1 Overview

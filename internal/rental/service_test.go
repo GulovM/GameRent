@@ -46,6 +46,18 @@ func (m *mockRentalRepo) GetRental(ctx context.Context, id int64) (*Rental, erro
 	return nil, ErrRentalNotFound
 }
 
+func (m *mockRentalRepo) ListCustomerRentals(ctx context.Context, userID int64) ([]CustomerRental, error) {
+	return nil, nil
+}
+
+func (m *mockRentalRepo) GetCustomerRental(ctx context.Context, rentalID int64) (*CustomerRental, error) {
+	return nil, ErrRentalNotFound
+}
+
+func (m *mockRentalRepo) GetRentalQuote(ctx context.Context, accountID int64) (*RentalQuote, error) {
+	return nil, ErrRentalNotFound
+}
+
 func (m *mockRentalRepo) GetRentalCredentials(ctx context.Context, rentalID, userID int64, now time.Time) (*RentalCredentialsRecord, error) {
 	if m.credentialsErr != nil {
 		return nil, m.credentialsErr
@@ -440,7 +452,7 @@ func TestService_GetRentalCredentials_PaymentExpiredActivePaidAllowsCredentials(
 			AccountID:         55,
 			RentalStatus:      StatusActive,
 			AccountStatus:     int16(account.StatusRented),
-			PaymentExpiresAt:  now.Add(-5 * time.Minute), // Expired in the past!
+			PaymentExpiresAt:  now.Add(-5 * time.Minute),
 			Login:             "steam_login",
 			EncryptedPassword: []byte("enc-pass"),
 			SteamID64:         "76561198000000001",

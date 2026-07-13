@@ -46,8 +46,12 @@ type AccountGameSyncInfo struct {
 }
 
 func (r *Repository) GetExpiredRentals(ctx context.Context, now time.Time) ([]ExpiredRental, error) {
-	query := `SELECT id, account_id FROM rentals WHERE status = 2 AND end_at < $1`
-	rows, err := r.pool.Query(ctx, query, now)
+	query := `
+		SELECT id, account_id
+		FROM rentals
+		WHERE status = $2 AND end_at <= $1
+		ORDER BY end_at ASC, id ASC`
+	rows, err := r.pool.Query(ctx, query, now, rentalStatusActive)
 	if err != nil {
 		return nil, err
 	}
@@ -196,20 +200,44 @@ func (r *Repository) ExpireRental(ctx context.Context, rentalID, accountID int64
 
 	query := `
 		WITH locked AS (
-			SELECT r.id AS rental_id, r.account_id, r.user_id
+			SELECT
+				r.id AS rental_id,
+				r.account_id,
+				r.user_id,
+				r.end_at,
+				r.deposit_amount
 			FROM rentals r
 			JOIN accounts a ON a.id = r.account_id
 			WHERE r.id = $1
 				AND r.account_id = $2
 				AND r.status = $4
-				AND r.end_at < $3
+				AND r.end_at <= $3
 				AND a.status = $5
 			FOR UPDATE OF r, a SKIP LOCKED
 		),
 		rental_update AS (
 			UPDATE rentals r
 			SET status = $6,
-				actual_finished_at = $3,
+				actual_finished_at = locked.end_at,
+				deposit_review_deadline_at = CASE
+					WHEN locked.deposit_amount > 0
+						AND EXISTS (
+							SELECT 1
+							FROM payments p
+							JOIN deposit_holds d
+								ON d.payment_id = p.id
+								AND d.rental_id = p.rental_id
+								AND d.user_id = p.user_id
+							WHERE p.rental_id = locked.rental_id
+								AND p.user_id = locked.user_id
+								AND p.status = 2
+								AND d.status = 1
+								AND d.amount = locked.deposit_amount
+								AND d.currency = p.currency
+						)
+					THEN locked.end_at + INTERVAL '24 hours'
+					ELSE NULL
+				END,
 				updated_at = $3
 			FROM locked
 			WHERE r.id = locked.rental_id

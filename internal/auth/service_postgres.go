@@ -61,8 +61,7 @@ func (s *PostgresService) Register(ctx context.Context, email, password, firstNa
 		}
 		user.FirstName = firstName
 		user.LastName = lastName
-		// Public registration never grants privileges. Administrators are
-		// promoted explicitly by an existing administrator.
+
 		user.Role = RoleRent
 		user.EmailVerified = true
 

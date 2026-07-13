@@ -1,5 +1,11 @@
 # Development Roadmap — GameRent
 
+## P1.1 delivery boundary (July 2026)
+
+Phase 1 delivers the backend/database foundation for paid rental closure: usage-end and completion timestamps, a 24-hour deposit-review deadline, current-admin release/forfeit, verified forfeit evidence, wallet-refund completion interaction, idempotent finalization/auto-release job functions, lock ordering, and migration/concurrency coverage.
+
+The finalizer is not enabled as a new production scheduler loop in Phase 1. Phase 2 admin review APIs, Phase 3 user/admin UI, and later notification rollout remain separate work. Provider refunds, partial forfeiture, disputes, trust-score work, and rental extension are explicitly deferred; extension continues to return `501 EXTENSION_NOT_SUPPORTED`.
+
 **Проект:** GameRent  
 **Язык:** Go 1.25+  
 **Архитектура:** Clean Architecture + Domain-Driven Design (DDD)  
@@ -91,7 +97,7 @@
 ### 4.3. Фоновый планировщик завершения аренд
 - Разработка воркера `CleanupExpiredRentals` в рамках `Background Scheduler`.
 - Реализация периодического сканирования таблицы `rentals` на предмет активных аренд, где `end_at` меньше текущего времени по `Clock`.
-- Автоматический запуск процесса expiration: перевод `ACTIVE` аренды в `EXPIRED`, освобождение аккаунта в `Available` и прекращение доступа к credentials. Переход `EXPIRED -> COMPLETED` не подключён к текущему API/worker flow.
+- Автоматический процесс expiration переводит `ACTIVE` аренду только в `EXPIRED`, освобождает аккаунт в `Available`, прекращает доступ к credentials и сохраняет review deadline для положительного `HELD` deposit. Backend Phase P1.1 добавляет отдельный settlement/finalizer flow для безопасного `EXPIRED -> COMPLETED`; новый production scheduler loop по умолчанию не включён.
 - Paid rental extension отложен: текущий endpoint безопасно возвращает `501 EXTENSION_NOT_SUPPORTED`. Возврат функции требует pricing, payment, ledger, idempotency, locking и frontend contract в одном завершённом flow.
 - Generic admin account PATCH не меняет lifecycle status; verification/maintenance actions остаются будущими отдельными domain use cases.
 
@@ -108,8 +114,8 @@
 
 ### 5.2. Возврат депозита и Trust Score Recalculation
 - Финансовая модель больше не ограничивается только `payments`: в backend уже используются `users.balance`, append-only `financial_ledger_entries`, `deposit_holds` и `refunds`.
-- Реализованы wallet payment, admin deposit release/forfeit и первый этап wallet-paid full refund для `EXPIRED`/`COMPLETED` rental.
-- В roadmap как future work остаются provider refund, partial refund, self-service refund, отдельный refund history API и выделенный internal system caller surface.
+- Реализованы wallet payment, admin deposit release/forfeit, wallet-paid full refund и P1.1 backend foundation: 24-hour review deadline, terminal-deposit completion, idempotent auto-release job function and fail-closed anomaly handling.
+- В roadmap как future work остаются Phase 2 admin review API, Phase 3 frontend states, production scheduling/notifications, provider refund, partial refund, self-service refund и отдельный refund history API.
 - Разработка `TrustService`: метод `RecalculateTrust`. Асинхронный расчёт числового значения `trust_score` (0–1000) на основании истории успешных аренд и штрафов. Автоматическое обновление уровня доверия (`TrustLevel`: Bronze, Silver, Gold, Diamond) и очистка кэша профиля в Redis.
 
 ### 5.3. Модуль Отзывов (`internal/review`)

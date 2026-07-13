@@ -2,6 +2,7 @@ package repo_postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"strconv"
@@ -367,7 +368,16 @@ func seedActiveRental(t *testing.T, pool *pkg_postgres_pool.ConnectionPool, endA
 func TestExpireRental_ActiveRentalLifecycle(t *testing.T) {
 	pool, txManager := setupWorkersTestDB(t)
 	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
-	userID, accountID, rentalID, paymentID := seedActiveRental(t, pool, now.Add(-time.Minute))
+	endAt := now.Add(-time.Minute)
+	userID, accountID, rentalID, paymentID := seedActiveRental(t, pool, endAt)
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO deposit_holds (
+			rental_id, user_id, payment_id, amount, currency, status,
+			held_at, idempotency_key, created_at, updated_at
+		) VALUES ($1, $2, $3, 500, 'USD', 1, $4, $5, $4, $4)`,
+		rentalID, userID, paymentID, endAt.Add(-time.Hour), "expire-held-"+strconv.FormatInt(rentalID, 10)); err != nil {
+		t.Fatalf("failed to insert held deposit: %v", err)
+	}
 	repo := NewRepository(pool)
 
 	changed, err := repo.ExpireRental(context.Background(), rentalID, accountID, now)
@@ -379,7 +389,11 @@ func TestExpireRental_ActiveRentalLifecycle(t *testing.T) {
 	}
 
 	var rentalStatus, paymentStatus, accountStatus int16
-	if err := pool.QueryRow(context.Background(), "SELECT status FROM rentals WHERE id = $1", rentalID).Scan(&rentalStatus); err != nil {
+	var actualFinishedAt, reviewDeadline *time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT status, actual_finished_at, deposit_review_deadline_at
+		FROM rentals
+		WHERE id = $1`, rentalID).Scan(&rentalStatus, &actualFinishedAt, &reviewDeadline); err != nil {
 		t.Fatalf("failed to query rental status: %v", err)
 	}
 	if err := pool.QueryRow(context.Background(), "SELECT status FROM payments WHERE id = $1", paymentID).Scan(&paymentStatus); err != nil {
@@ -397,6 +411,13 @@ func TestExpireRental_ActiveRentalLifecycle(t *testing.T) {
 	if accountStatus != int16(2) {
 		t.Fatalf("expected account AVAILABLE, got %d", accountStatus)
 	}
+	if actualFinishedAt == nil || !actualFinishedAt.Equal(endAt) {
+		t.Fatalf("expected actual_finished_at=%v, got %v", endAt, actualFinishedAt)
+	}
+	expectedDeadline := endAt.Add(24 * time.Hour)
+	if reviewDeadline == nil || !reviewDeadline.Equal(expectedDeadline) {
+		t.Fatalf("expected deposit review deadline=%v, got %v", expectedDeadline, reviewDeadline)
+	}
 
 	credentialsRepo := rental.NewPostgresRepository(pool.Pool)
 	accountRepo := account.NewPostgresRepository(pool.Pool, "super-secret-32-byte-key-for-aes")
@@ -412,6 +433,206 @@ func TestExpireRental_ActiveRentalLifecycle(t *testing.T) {
 	}
 	if eventCount != 1 {
 		t.Fatalf("expected one expire security event, got %d", eventCount)
+	}
+}
+
+func TestGetExpiredRentals_IncludesExactEndBoundary(t *testing.T) {
+	pool, _ := setupWorkersTestDB(t)
+	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	_, _, rentalID, _ := seedActiveRental(t, pool, now)
+	repo := NewRepository(pool)
+
+	items, err := repo.GetExpiredRentals(context.Background(), now)
+	if err != nil {
+		t.Fatalf("GetExpiredRentals failed: %v", err)
+	}
+	for _, item := range items {
+		if item.ID == rentalID {
+			return
+		}
+	}
+	t.Fatalf("expected rental ending exactly at boundary to be selected: rental_id=%d items=%+v", rentalID, items)
+}
+
+func TestExpireRental_InconsistentPositiveDepositFailsClosed(t *testing.T) {
+	pool, _ := setupWorkersTestDB(t)
+	now := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	_, accountID, rentalID, _ := seedActiveRental(t, pool, now)
+	repo := NewRepository(pool)
+
+	changed, err := repo.ExpireRental(context.Background(), rentalID, accountID, now)
+	if err != nil || !changed {
+		t.Fatalf("ExpireRental at boundary failed: changed=%v err=%v", changed, err)
+	}
+
+	var status int16
+	var reviewDeadline *time.Time
+	if err := pool.QueryRow(context.Background(), `
+		SELECT status, deposit_review_deadline_at
+		FROM rentals
+		WHERE id = $1`, rentalID).Scan(&status, &reviewDeadline); err != nil {
+		t.Fatalf("load expired rental: %v", err)
+	}
+	if status != int16(rental.StatusExpired) {
+		t.Fatalf("expected rental EXPIRED, got %d", status)
+	}
+	if reviewDeadline != nil {
+		t.Fatalf("missing positive-deposit hold must fail closed with NULL deadline, got %v", reviewDeadline)
+	}
+}
+
+func TestRentalCompletionMigration_BackfillConstraintsAndDown(t *testing.T) {
+	pool, _ := setupWorkersTestDB(t)
+	ctx := context.Background()
+
+	port := os.Getenv("POSTGRES_PORT")
+	if port == "" {
+		port = "5433"
+	}
+	host := os.Getenv("POSTGRES_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	dsn := (&pkg_postgres_pool.PostgresConfig{
+		Host: host, Port: port, User: "postgres", Password: "postgres", Database: "game_rental",
+	}).PostgresDSN()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open migration validation db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	goose.SetBaseFS(migrations.EmbedMigrations)
+	if err := goose.SetDialect("postgres"); err != nil {
+		t.Fatalf("set migration dialect: %v", err)
+	}
+	if err := goose.Down(db, "."); err != nil {
+		t.Fatalf("downgrade completion migration for fixture setup: %v", err)
+	}
+	t.Cleanup(func() {
+		goose.SetBaseFS(migrations.EmbedMigrations)
+		_ = goose.SetDialect("postgres")
+		_ = goose.Up(db, ".")
+	})
+
+	base := atomic.AddInt64(&workersTestCounter, 20)
+	userID := base
+	completedAccountID := base + 1
+	heldAccountID := base + 2
+	inconsistentAccountID := base + 3
+	completedRentalID := base + 4
+	heldRentalID := base + 5
+	inconsistentRentalID := base + 6
+	heldPaymentID := base + 7
+	inconsistentPaymentID := base + 8
+	completedAt := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Microsecond)
+	usageEndedAt := completedAt.Add(12 * time.Hour)
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO users (id, email, password_hash, balance)
+		VALUES ($1, $2, 'hash', 0)`, userID, "migration-"+strconv.FormatInt(base, 10)+"@example.com"); err != nil {
+		t.Fatalf("seed migration user: %v", err)
+	}
+	for _, accountID := range []int64{completedAccountID, heldAccountID, inconsistentAccountID} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO accounts (
+				id, login, encrypted_password, status, steam_guard_enabled,
+				inventory_verified, hourly_price, deposit_amount, steam_id64, created_at, updated_at
+			) VALUES ($1, $2, $3, 2, true, true, 100, 500, $4, $5, $5)`,
+			accountID,
+			"migration-account-"+strconv.FormatInt(accountID, 10),
+			[]byte("enc-pass"),
+			strconv.FormatInt(76561198000000000+accountID, 10),
+			completedAt,
+		); err != nil {
+			t.Fatalf("seed migration account %d: %v", accountID, err)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO rentals (
+			id, user_id, account_id, status, start_at, end_at, rental_price,
+			deposit_amount, payment_expires_at, actual_finished_at, created_at, updated_at
+		) VALUES
+			($1, $4, $5, 4, $7, $8, 500, 0, $9, $8, $7, $6),
+			($2, $4, $10, 3, $7, $8, 500, 500, $9, $8, $7, $8),
+			($3, $4, $11, 3, $7, $8, 500, 500, $9, $8, $7, $8)`,
+		completedRentalID, heldRentalID, inconsistentRentalID, userID,
+		completedAccountID, completedAt, completedAt.Add(-2*time.Hour), usageEndedAt,
+		usageEndedAt.Add(time.Hour), heldAccountID, inconsistentAccountID,
+	); err != nil {
+		t.Fatalf("seed legacy rentals: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO payments (id, rental_id, user_id, payment_type, provider, status, amount, currency, processed_at)
+		VALUES
+			($1, $3, $5, 1, 'internal', 2, 1000, 'USD', $6),
+			($2, $4, $5, 1, 'internal', 2, 1000, 'USD', $6)`,
+		heldPaymentID, inconsistentPaymentID, heldRentalID, inconsistentRentalID, userID, usageEndedAt,
+	); err != nil {
+		t.Fatalf("seed legacy payments: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO deposit_holds (
+			rental_id, user_id, payment_id, amount, currency, status,
+			held_at, idempotency_key, created_at, updated_at
+		) VALUES ($1, $2, $3, 500, 'USD', 1, $4, $5, $4, $4)`,
+		heldRentalID, userID, heldPaymentID, usageEndedAt.Add(-time.Hour),
+		"migration-held-"+strconv.FormatInt(heldRentalID, 10),
+	); err != nil {
+		t.Fatalf("seed legacy held deposit: %v", err)
+	}
+
+	beforeUp := time.Now().UTC()
+	if err := goose.Up(db, "."); err != nil {
+		t.Fatalf("apply completion migration: %v", err)
+	}
+	afterUp := time.Now().UTC()
+
+	var backfilledCompletedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT completed_at FROM rentals WHERE id=$1`, completedRentalID).Scan(&backfilledCompletedAt); err != nil {
+		t.Fatalf("load completed_at backfill: %v", err)
+	}
+	if !backfilledCompletedAt.Equal(completedAt) {
+		t.Fatalf("completed_at=%v want legacy updated_at=%v", backfilledCompletedAt, completedAt)
+	}
+
+	var heldDeadline, inconsistentDeadline *time.Time
+	if err := pool.QueryRow(ctx, `SELECT deposit_review_deadline_at FROM rentals WHERE id=$1`, heldRentalID).Scan(&heldDeadline); err != nil {
+		t.Fatalf("load held review deadline: %v", err)
+	}
+	if heldDeadline == nil || heldDeadline.Before(beforeUp.Add(24*time.Hour)) || heldDeadline.After(afterUp.Add(24*time.Hour)) {
+		t.Fatalf("held review deadline must be a fresh rollout window: before=%v after=%v got=%v", beforeUp, afterUp, heldDeadline)
+	}
+	if err := pool.QueryRow(ctx, `SELECT deposit_review_deadline_at FROM rentals WHERE id=$1`, inconsistentRentalID).Scan(&inconsistentDeadline); err != nil {
+		t.Fatalf("load inconsistent review deadline: %v", err)
+	}
+	if inconsistentDeadline != nil {
+		t.Fatalf("inconsistent positive deposit must remain fail closed, got deadline=%v", inconsistentDeadline)
+	}
+
+	for _, name := range []string{"idx_rentals_active_expiry_queue", "idx_rentals_expired_finalization_queue"} {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1)`, name).Scan(&exists); err != nil || !exists {
+			t.Fatalf("expected migration index %s: exists=%v err=%v", name, exists, err)
+		}
+	}
+
+	if err := goose.Down(db, "."); err != nil {
+		t.Fatalf("downgrade completion migration: %v", err)
+	}
+	var newColumnCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema=current_schema()
+		  AND ((table_name='rentals' AND column_name IN ('completed_at','deposit_review_deadline_at'))
+		    OR (table_name='deposit_holds' AND column_name IN ('settlement_source','settled_by_user_id','settlement_reason_code','settlement_evidence_ref')))`,
+	).Scan(&newColumnCount); err != nil {
+		t.Fatalf("inspect downgraded columns: %v", err)
+	}
+	if newColumnCount != 0 {
+		t.Fatalf("expected completion migration down to remove all new columns, found %d", newColumnCount)
 	}
 }
 

@@ -900,7 +900,7 @@ function AdminAccountsTable({
     try {
       await action(account);
     } catch {
-      // Parent handler already reports the failure.
+      
     } finally {
       setBusyAccountId(null);
     }

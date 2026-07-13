@@ -6,6 +6,34 @@
 
 **Status:** Approved
 
+## P1.1 expiration, settlement, and completion
+
+```mermaid
+sequenceDiagram
+    participant Expiry as Expiration worker
+    participant Finalizer as Settlement finalizer
+    participant Admin as Current admin
+    participant DB as PostgreSQL
+
+    Expiry->>DB: lock rental then account
+    Expiry->>DB: ACTIVE -> EXPIRED, release account, set usage end/deadline
+    Note over Expiry,DB: no money is settled during expiration
+
+    alt admin release before/after deadline
+        Admin->>DB: revalidate and lock current ADMIN
+        Admin->>DB: lock rental/account/payment/hold/user
+        Admin->>DB: HELD -> RELEASED, wallet credit, ledger, audit, completion
+    else admin forfeit strictly before deadline
+        Admin->>DB: verify allow-listed reason and matching SECURITY_EVENT
+        Admin->>DB: HELD -> FORFEITED, ledger, audit, completion
+    else finalizer at or after deadline
+        Finalizer->>DB: bounded FOR UPDATE SKIP LOCKED batch
+        Finalizer->>DB: HELD -> RELEASED, wallet credit, ledger, system audit, completion
+    end
+```
+
+All branches use deterministic idempotency keys and one aggregate lock order. At exactly the deadline manual forfeit is rejected, so auto-release wins. Missing, unknown, or inconsistent positive-deposit state is skipped fail-closed. The finalizer is an explicit job function in Phase 1 and is not exposed through HTTP or enabled as a new production scheduler loop.
+
 ---
 
 # 1. Purpose
@@ -606,7 +634,7 @@ sequenceDiagram
 
 **Description** Публикация отзыва и выставление оценки аккаунту после успешного окончания аренды. База данных жёстко контролирует инвариант «один отзыв на одну аренду».
 
-**Current limitation** В текущем rental lifecycle оплаченная аренда истекает в `EXPIRED`; отдельный переход `EXPIRED -> COMPLETED` не подключён к API/worker flow.
+Paid rental expiration остаётся отдельным переходом `ACTIVE -> EXPIRED`. Settlement/finalizer затем выполняет `EXPIRED -> COMPLETED` только после отсутствия положительного депозита либо терминального состояния hold. `HELD` и любая неизвестная/несогласованная запись блокируют completion.
 
 **Flow** 1. Клиент отправляет POST-запрос на `/reviews` с указанием `rental_id`, `rating` (от 1 до 5) и текстового комментария.
 2. `Review Handler` пропускает данные через `validator.go` (проверка обязательных полей и диапазона оценки).

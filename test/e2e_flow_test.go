@@ -23,7 +23,6 @@ import (
 	"go.uber.org/zap"
 
 	"rent_game_accs/internal/account"
-	"rent_game_accs/internal/api"
 	"rent_game_accs/internal/auth"
 	"rent_game_accs/internal/payment"
 	pkg_postgres_pool "rent_game_accs/internal/pkg/repository/postgres/pool"
@@ -199,7 +198,7 @@ func TestE2E_RegistrationToRentalActivationFlow(t *testing.T) {
 	userRepo := user.NewPostgresRepository(pool)
 	rentalRepo := rental.NewPostgresRepository(pool)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -758,7 +757,7 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 	userRepo := user.NewPostgresRepository(pool)
 	rentalRepo := rental.NewPostgresRepository(pool)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -801,14 +800,14 @@ func TestE2E_ReadOnlyFinancialEndpoints(t *testing.T) {
 	insertAccount(7106, 2, 500)
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at)
+		INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at, completed_at)
 		VALUES
-			(7201, $1, 7101, 2, $3, $4, 500, 500, $5, $3, $3),
-			(7202, $1, 7102, 3, $3, $4, 500, 500, $5, $3, $3),
-			(7203, $1, 7103, 4, $3, $4, 500, 500, $5, $3, $3),
-			(7204, $1, 7104, 1, $3, $4, 500, 0, $5, $3, $3),
-			(7205, $2, 7105, 2, $3, $4, 500, 500, $5, $3, $3),
-			(7206, $1, 7106, 4, $3, $4, 500, 500, $5, $3, $3)`,
+			(7201, $1, 7101, 2, $3, $4, 500, 500, $5, $3, $3, NULL),
+			(7202, $1, 7102, 3, $3, $4, 500, 500, $5, $3, $3, NULL),
+			(7203, $1, 7103, 4, $3, $4, 500, 500, $5, $3, $3, $3),
+			(7204, $1, 7104, 1, $3, $4, 500, 0, $5, $3, $3, NULL),
+			(7205, $2, 7105, 2, $3, $4, 500, 500, $5, $3, $3, NULL),
+			(7206, $1, 7106, 4, $3, $4, 500, 500, $5, $3, $3, $3)`,
 		userID, otherUserID, now.Add(-2*time.Hour), now.Add(2*time.Hour), now.Add(30*time.Minute)); err != nil {
 		t.Fatalf("failed to insert rentals: %v", err)
 	}
@@ -1232,7 +1231,7 @@ func TestE2E_PayRentalWithBalanceEndpoint(t *testing.T) {
 	userRepo := user.NewPostgresRepository(pool)
 	rentalRepo := rental.NewPostgresRepository(pool)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -1374,7 +1373,7 @@ func TestE2E_AdminWalletRefundEndpoint(t *testing.T) {
 	userRepo := user.NewPostgresRepository(pool)
 	rentalRepo := rental.NewPostgresRepository(pool)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -1421,7 +1420,13 @@ func TestE2E_AdminWalletRefundEndpoint(t *testing.T) {
 	if _, err := paymentService.PayRentalWithBalance(context.Background(), renterID, 8501, "127.0.0.1", "test", time.Now().UTC()); err != nil {
 		t.Fatalf("failed to wallet pay refund rental: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE rentals SET status = 3, actual_finished_at = NOW(), updated_at = NOW() WHERE id = 8501`); err != nil {
+	if _, err := pool.Exec(ctx, `
+		UPDATE rentals
+		SET status = 3,
+			actual_finished_at = end_at,
+			deposit_review_deadline_at = end_at + INTERVAL '24 hours',
+			updated_at = NOW()
+		WHERE id = 8501`); err != nil {
 		t.Fatalf("failed to expire refund rental: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE accounts SET status = 2, updated_at = NOW() WHERE id = 8401`); err != nil {
@@ -1607,7 +1612,7 @@ func TestE2E_AdminRentalsFiltersEndpoint(t *testing.T) {
 	userRepo := user.NewPostgresRepository(pool)
 	rentalRepo := rental.NewPostgresRepository(pool)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -1849,7 +1854,7 @@ func TestE2E_AdminRentalDetailEndpoint(t *testing.T) {
 	userRepo := user.NewPostgresRepository(pool)
 	rentalRepo := rental.NewPostgresRepository(pool)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -1880,8 +1885,8 @@ func TestE2E_AdminRentalDetailEndpoint(t *testing.T) {
 			args: []any{[]byte("enc-pass"), now},
 		},
 		{
-			sql: `INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at, actual_finished_at)
-				VALUES (9901, $1, 9801, 4, $2, $3, 500, 700, $4, $2, $5, $5)`,
+			sql: `INSERT INTO rentals (id, user_id, account_id, status, start_at, end_at, rental_price, deposit_amount, payment_expires_at, created_at, updated_at, actual_finished_at, completed_at)
+				VALUES (9901, $1, 9801, 4, $2, $3, 500, 700, $4, $2, $5, $5, $5)`,
 			args: []any{renterID, now.Add(-4 * time.Hour), now.Add(-2 * time.Hour), now.Add(-3 * time.Hour), now},
 		},
 		{
@@ -2078,7 +2083,7 @@ func TestE2E_AdminBalanceAdjustmentEndpoint(t *testing.T) {
 	paymentHandler := payment.NewHandler(paymentService, logger)
 	accountRepo := account.NewPostgresRepository(pool, "super-secret-32-byte-key-for-aes")
 	rentalService := rental.NewService(rental.NewPostgresRepository(pool), accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)

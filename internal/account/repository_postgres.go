@@ -32,6 +32,31 @@ type Repository interface {
 	Decrypt(ciphertext []byte) (string, error)
 }
 
+type AdminRepository interface {
+	Repository
+	CreateAdminAccount(ctx context.Context, steamID64, login string, encryptedPassword []byte, hourlyPrice, depositAmount int64) (int64, error)
+	UpdateAdminPricing(ctx context.Context, id int64, hourlyPrice, depositAmount *int64) error
+}
+
+func (r *PostgresRepository) CreateAdminAccount(ctx context.Context, steamID64, login string, encryptedPassword []byte, hourlyPrice, depositAmount int64) (int64, error) {
+	db := database.GetTxOrPool(ctx, r.pool)
+	var id int64
+	err := db.QueryRow(ctx, `INSERT INTO accounts (steam_id64,login,encrypted_password,hourly_price,deposit_amount,status,steam_guard_enabled,inventory_verified,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,2,true,true,NOW(),NOW()) RETURNING id`, steamID64, login, encryptedPassword, hourlyPrice, depositAmount).Scan(&id)
+	return id, err
+}
+
+func (r *PostgresRepository) UpdateAdminPricing(ctx context.Context, id int64, hourlyPrice, depositAmount *int64) error {
+	db := database.GetTxOrPool(ctx, r.pool)
+	tag, err := db.Exec(ctx, `UPDATE accounts SET hourly_price=COALESCE($1,hourly_price), deposit_amount=COALESCE($2,deposit_amount), updated_at=NOW() WHERE id=$3 AND deleted_at IS NULL`, hourlyPrice, depositAmount, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAccountNotFound
+	}
+	return nil
+}
+
 type PostgresRepository struct {
 	pool          *pgxpool.Pool
 	encryptionKey []byte

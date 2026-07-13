@@ -15,7 +15,6 @@ import (
 	"go.uber.org/zap"
 
 	"rent_game_accs/internal/account"
-	"rent_game_accs/internal/api"
 	"rent_game_accs/internal/auth"
 	"rent_game_accs/internal/payment"
 	pkg_http_server "rent_game_accs/internal/pkg/transport/http/server"
@@ -54,7 +53,7 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 	userRepo := user.NewPostgresRepository(pool)
 	rentalRepo := rental.NewPostgresRepository(pool)
 	rentalService := rental.NewService(rentalRepo, accountRepo, userRepo, paymentRepo, txManager)
-	apiHandler := api.NewHandler(pool, rentalService, paymentService, accountRepo, nil, nil)
+	apiHandler := newAPIHandlerForE2E(pool, txManager, rentalService, paymentService, accountRepo, userRepo)
 
 	router := pkg_http_server.NewAPIVersionRouter(pkg_http_server.ApiVersion1)
 	rateLimiter := shared_middleware.NewRateLimiter(100.0, 200.0)
@@ -68,21 +67,17 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	// 1. Setup User
 	userID, accessToken := registerAndLoginE2EUser(t, ts, "adv_user@example.com", "super-secure-pass-123", "Adv", "User")
 
-	// Ensure we top up user balance if needed
 	_, err := pool.Exec(ctx, `UPDATE users SET balance = $1 WHERE id = $2`, 20000, userID)
 	if err != nil {
 		t.Fatalf("failed to top up user balance: %v", err)
 	}
 
-	// Helper function to create a new unique account, rental, and payment
 	createAccountAndRental := func(t *testing.T, start, end, payExpires time.Time) (int64, int64, int64) {
 		t.Helper()
 		accID := generateRandomID()
 
-		// Insert account
 		encPassword, err := accountRepo.Encrypt("steam_secure_password_adversarial")
 		if err != nil {
 			t.Fatalf("failed to encrypt password: %v", err)
@@ -102,7 +97,7 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 		}
 
 		rentalID := generateRandomID()
-		// Set created_at to 10 minutes before payExpires to satisfy check constraints
+
 		createdAt := payExpires.Add(-10 * time.Minute)
 		_, err = pool.Exec(ctx, `
 			INSERT INTO rentals (id, user_id, account_id, rental_price, deposit_amount, start_at, end_at, status, payment_expires_at, created_at, updated_at)
@@ -113,7 +108,6 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 			t.Fatalf("failed to insert rental: %v", err)
 		}
 
-		// Insert confirmed payment
 		paymentID := generateRandomID()
 		_, err = pool.Exec(ctx, `
 			INSERT INTO payments (id, rental_id, user_id, payment_type, provider, status, amount, currency, external_transaction_id, created_at, processed_at)
@@ -129,10 +123,9 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 
 	client := &http.Client{}
 
-	// --- TEST 1: Active Paid Rental with EXPIRED payment deadline allows credentials ---
 	t.Run("ActivePaidExpiredDeadlineAllowsCredentials", func(t *testing.T) {
 		now := time.Now().UTC()
-		// Start is 1 hour ago, end is 2 hours from now, payment_expires_at is 30 minutes ago (expired!)
+
 		_, rentalID, _ := createAccountAndRental(t, now.Add(-1*time.Hour), now.Add(2*time.Hour), now.Add(-30*time.Minute))
 
 		req, _ := http.NewRequest("GET", ts.URL+"/api/v1/me/rentals/"+strconv.FormatInt(rentalID, 10)+"/credentials", nil)
@@ -165,27 +158,23 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 		}
 	})
 
-	// --- TEST 2: Expired, Cancelled, and Refunded Rentals strictly deny credentials ---
 	t.Run("IneligibleRentalsDenyCredentials", func(t *testing.T) {
 		now := time.Now().UTC()
 
-		// Case A: Expired rental (end_at in past)
 		_, expiredRentalID, _ := createAccountAndRental(t, now.Add(-3*time.Hour), now.Add(-1*time.Hour), now.Add(-2*time.Hour))
 
-		// Case B: Cancelled rental (status = 5)
 		_, cancelledRentalID, _ := createAccountAndRental(t, now.Add(-1*time.Hour), now.Add(2*time.Hour), now.Add(30*time.Minute))
 		_, err = pool.Exec(ctx, `UPDATE rentals SET status = 5 WHERE id = $1`, cancelledRentalID)
 		if err != nil {
 			t.Fatalf("failed to cancel rental: %v", err)
 		}
 
-		// Case C: Refunded rental
 		accID, refundedRentalID, paymentID := createAccountAndRental(t, now.Add(-1*time.Hour), now.Add(2*time.Hour), now.Add(30*time.Minute))
 		_, err = pool.Exec(ctx, `UPDATE rentals SET status = 5 WHERE id = $1`, refundedRentalID)
 		if err != nil {
 			t.Fatalf("failed to refund rental: %v", err)
 		}
-		// insert refund record to represent refunded
+
 		refundIdempotency := "idempotency-key-" + strconv.FormatInt(refundedRentalID, 10)
 		refundCorrelation := "correlation-id-" + strconv.FormatInt(refundedRentalID, 10)
 		_, err = pool.Exec(ctx, `
@@ -215,7 +204,6 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 		}
 	})
 
-	// --- TEST 3: Cache-Control: no-store headers are present ---
 	t.Run("CacheControlHeadersArePresent", func(t *testing.T) {
 		now := time.Now().UTC()
 		_, rentalID, _ := createAccountAndRental(t, now.Add(-1*time.Hour), now.Add(2*time.Hour), now.Add(30*time.Minute))
@@ -248,9 +236,8 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 		}
 	})
 
-	// --- TEST 4: Client IP, User-Agent, and Account ID are correctly logged ---
 	t.Run("LogsIpUserAgentAndAccountID", func(t *testing.T) {
-		// Clean security events first
+
 		_, _ = pool.Exec(ctx, `DELETE FROM security_events`)
 
 		now := time.Now().UTC()
@@ -293,9 +280,8 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 		}
 	})
 
-	// --- TEST 5: Audit Failures Block Credential Retrieval ---
 	t.Run("AuditFailureBlocksCredentialRetrieval", func(t *testing.T) {
-		// Create a trigger that forces insert into security_events to fail for credential issuance (event_type = 7)
+
 		_, err := pool.Exec(ctx, `
 			CREATE OR REPLACE FUNCTION fail_credential_security_events() RETURNS trigger AS $$
 			BEGIN
@@ -334,7 +320,6 @@ func TestAdversarial_CredentialsSecurity(t *testing.T) {
 		}
 		defer res.Body.Close()
 
-		// The API should fail with 500 Internal Server Error because the DB event log failed
 		if res.StatusCode != http.StatusInternalServerError {
 			body, _ := io.ReadAll(res.Body)
 			t.Fatalf("expected status 500 Internal Server Error when audit fails, got %d. Body: %s", res.StatusCode, string(body))

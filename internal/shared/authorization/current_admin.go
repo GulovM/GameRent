@@ -62,10 +62,6 @@ func RequireCurrentAdmin(ctx context.Context, db database.DB, userID int64, forU
 	return nil
 }
 
-// RequireCurrentAdminForMutation must be called inside the same PostgreSQL
-// transaction as the privileged mutation. The transaction-scoped advisory
-// lock serializes admin financial and privilege mutations before actor rows are
-// locked, preventing cross-admin lock-order races.
 func RequireCurrentAdminForMutation(ctx context.Context, db database.DB, userID int64) error {
 	if _, ok := db.(pgx.Tx); !ok {
 		return ErrTransactionRequired
